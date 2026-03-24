@@ -1,7 +1,7 @@
 //! CEX Arbitrage Bot — Entry Point
 //!
-//! Phase 0 startup scaffold: loads config, initialises the logger, and exits.
-//! Runtime bot behavior (fetchers, engine, risk gate, notifiers) is Phase 1+.
+//! Phase 1 startup: loads config, initialises the logger, and runs a
+//! lightweight BBO verification fetch from Binance and ByBit.
 
 const std = @import("std");
 const cex = @import("cex_zig");
@@ -10,6 +10,7 @@ pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
     // Determine config path from args or default.
+    var run_verify = false;
     const config_path = blk: {
         var args = std.process.args();
         _ = args.next(); // skip argv[0]
@@ -19,6 +20,9 @@ pub fn main() !void {
                     std.debug.print("error: --config requires a path argument\n", .{});
                     std.process.exit(1);
                 };
+            }
+            if (std.mem.eql(u8, arg, "--verify-phase1")) {
+                run_verify = true;
             }
         }
         break :blk "config.toml";
@@ -48,8 +52,70 @@ pub fn main() !void {
         .config_path = config_path,
     });
 
-    // Phase 0: startup scaffold complete. Runtime loop is Phase 1+.
-    logger.info("phase 0 scaffold — no runtime loop. exiting.", .{});
+    if (run_verify) {
+        verifyPhase1(allocator, &config, &logger);
+    } else {
+        logger.info("phase 1 scaffold — pass --verify-phase1 to run live BBO verification.", .{});
+    }
+}
+
+/// Run live BBO fetches from Binance and ByBit and validate the results.
+fn verifyPhase1(allocator: std.mem.Allocator, config: *const cex.config.Config, logger: *cex.log.Logger) void {
+    const pair = if (config.pairs.len > 0) config.pairs.slice()[0] else cex.types.TokenPair{ .base = .BTC, .quote = .USDC };
+
+    logger.info("phase 1 verification: fetching live BBO data", .{
+        .timeout_ms = config.request_timeout_ms,
+    });
+
+    // Binance
+    {
+        var adapter = cex.gateway.binance.Adapter.init(allocator, config.request_timeout_ms);
+        defer adapter.deinit();
+
+        if (adapter.fetchBbo(pair)) |bbo| {
+            if (bbo.isValid()) {
+                logger.info("binance BBO verified", .{
+                    .bid_price = bbo.bid.price,
+                    .bid_size = bbo.bid.size,
+                    .ask_price = bbo.ask.price,
+                    .ask_size = bbo.ask.size,
+                    .fetched_at_us = bbo.fetched_at_us,
+                });
+            } else {
+                logger.warn("binance BBO invalid after fetch", .{});
+            }
+        } else |err| {
+            logger.warn("binance BBO fetch failed", .{
+                .@"error" = @errorName(err),
+            });
+        }
+    }
+
+    // ByBit
+    {
+        var adapter = cex.gateway.bybit.Adapter.init(allocator, config.request_timeout_ms);
+        defer adapter.deinit();
+
+        if (adapter.fetchBbo(pair)) |bbo| {
+            if (bbo.isValid()) {
+                logger.info("bybit BBO verified", .{
+                    .bid_price = bbo.bid.price,
+                    .bid_size = bbo.bid.size,
+                    .ask_price = bbo.ask.price,
+                    .ask_size = bbo.ask.size,
+                    .fetched_at_us = bbo.fetched_at_us,
+                });
+            } else {
+                logger.warn("bybit BBO invalid after fetch", .{});
+            }
+        } else |err| {
+            logger.warn("bybit BBO fetch failed", .{
+                .@"error" = @errorName(err),
+            });
+        }
+    }
+
+    logger.info("phase 1 verification complete", .{});
 }
 
 fn parseLogLevel(s: []const u8) cex.log.Level {
@@ -64,9 +130,12 @@ fn parseLogLevel(s: []const u8) cex.log.Level {
 // ---------------------------------------------------------------------------
 
 test "module linkage smoke test" {
-    // Verify all foundation modules are accessible through the library import.
     _ = cex.types.Exchange.binance;
     _ = cex.channel.BoundedChannel(u32, 4);
     _ = cex.log.Level.info;
     _ = cex.config.Config{};
+    _ = cex.http.HttpClient;
+    _ = cex.gateway.GatewayError;
+    _ = cex.gateway.binance.Adapter;
+    _ = cex.gateway.bybit.Adapter;
 }
