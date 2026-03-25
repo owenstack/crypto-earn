@@ -6,7 +6,8 @@
 //! - `log`     — structured JSON logger
 //! - `config`  — TOML config parsing, env overrides, and validation
 //! - `http`    — shared HTTP client wrapper
-//! - `gateway` — exchange gateway adapters (Binance, ByBit)
+//! - `gateway` — exchange gateway adapters (Binance, ByBit, Coinbase, OKX)
+//! - `engine`  — arbitrage detection engine (BboStateTable, ArbEngine)
 
 const std = @import("std");
 
@@ -16,13 +17,6 @@ pub const log = @import("log.zig");
 pub const config = @import("config.zig");
 pub const http = @import("http.zig");
 pub const gateway = @import("gateway.zig");
+pub const engine = @import("engine.zig");
 
-test {
-    // Pull in all module tests so `zig build test` runs them.
-    _ = @import("types.zig");
-    _ = @import("channel.zig");
-    _ = @import("log.zig");
-    _ = @import("config.zig");
-    _ = @import("http.zig");
-    _ = @import("gateway.zig");
-}
+

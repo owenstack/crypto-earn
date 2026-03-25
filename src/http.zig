@@ -6,7 +6,6 @@
 //! Phase 1 scope: HTTP fetch with timeout, JSON parsing, error surface.
 
 const std = @import("std");
-const testing = std.testing;
 
 /// Errors returned by `HttpClient.fetch`.
 pub const HttpError = error{
@@ -85,21 +84,4 @@ pub const HttpClient = struct {
     }
 };
 
-// ===========================================================================
-// Tests
-// ===========================================================================
 
-test "HttpClient init and deinit" {
-    var client = HttpClient.init(testing.allocator, 500);
-    defer client.deinit();
-
-    try testing.expectEqual(@as(u32, 500), client.timeout_ms);
-}
-
-test "HttpClient.fetch returns TransportError for invalid URL" {
-    var client = HttpClient.init(testing.allocator, 500);
-    defer client.deinit();
-
-    const result = client.fetch("not-a-url");
-    try testing.expectError(HttpError.TransportError, result);
-}

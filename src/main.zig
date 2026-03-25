@@ -1,7 +1,7 @@
 //! CEX Arbitrage Bot — Entry Point
 //!
-//! Phase 1 startup: loads config, initialises the logger, and runs a
-//! lightweight BBO verification fetch from Binance and ByBit.
+//! Phase 1/2 startup: loads config, initialises the logger, and runs
+//! verification modes for live BBO fetches and mock spread detection.
 
 const std = @import("std");
 const cex = @import("cex_zig");
@@ -9,24 +9,26 @@ const cex = @import("cex_zig");
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
-    // Determine config path from args or default.
+    // Determine config path and flags from args.
     var run_verify = false;
-    const config_path = blk: {
+    var run_verify_phase2 = false;
+    var config_path: []const u8 = "config.toml";
+    {
         var args = std.process.args();
         _ = args.next(); // skip argv[0]
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "--config")) {
-                break :blk args.next() orelse {
+                config_path = args.next() orelse {
                     std.debug.print("error: --config requires a path argument\n", .{});
                     std.process.exit(1);
                 };
-            }
-            if (std.mem.eql(u8, arg, "--verify-phase1")) {
+            } else if (std.mem.eql(u8, arg, "--verify-phase1")) {
                 run_verify = true;
+            } else if (std.mem.eql(u8, arg, "--verify-phase2-spread-detection")) {
+                run_verify_phase2 = true;
             }
         }
-        break :blk "config.toml";
-    };
+    }
 
     // Load and validate configuration.
     const config = cex.config.loadFromFile(allocator, config_path) catch |e| {
@@ -52,10 +54,12 @@ pub fn main() !void {
         .config_path = config_path,
     });
 
-    if (run_verify) {
+    if (run_verify_phase2) {
+        verifyPhase2SpreadDetection(&config, &logger);
+    } else if (run_verify) {
         verifyPhase1(allocator, &config, &logger);
     } else {
-        logger.info("phase 1 scaffold — pass --verify-phase1 to run live BBO verification.", .{});
+        logger.info("scaffold — pass --verify-phase1 or --verify-phase2-spread-detection", .{});
     }
 }
 
@@ -118,6 +122,74 @@ fn verifyPhase1(allocator: std.mem.Allocator, config: *const cex.config.Config, 
     logger.info("phase 1 verification complete", .{});
 }
 
+/// Run deterministic mock spread detection using fixture data.
+fn verifyPhase2SpreadDetection(config: *const cex.config.Config, logger: *cex.log.Logger) void {
+    const pair = cex.types.TokenPair{ .base = .BTC, .quote = .USDC };
+    var eng = cex.engine.ArbEngine.init(pair, config.min_profit_pct, config.max_notional_usd);
+
+    logger.info("phase 2 verification: mock spread detection", .{
+        .min_profit_pct = config.min_profit_pct,
+        .max_notional_usd = config.max_notional_usd,
+    });
+
+    // Fixture: Binance ask 82450, ByBit bid 82610 → ~0.194% spread
+    const binance_bbo = cex.types.BboUpdate{
+        .exchange = .binance,
+        .pair = pair,
+        .bid = .{ .price = 82_440.0, .size = 0.50 },
+        .ask = .{ .price = 82_450.0, .size = 0.30 },
+        .fetched_at_us = 1_000_000,
+    };
+    const bybit_bbo = cex.types.BboUpdate{
+        .exchange = .bybit,
+        .pair = pair,
+        .bid = .{ .price = 82_610.0, .size = 0.20 },
+        .ask = .{ .price = 82_620.0, .size = 0.15 },
+        .fetched_at_us = 1_000_001,
+    };
+
+    _ = eng.processBboUpdate(binance_bbo);
+    if (eng.processBboUpdate(bybit_bbo)) |opp| {
+        logger.info("spread detected", .{
+            .buy_exchange = opp.buy_exchange.label(),
+            .sell_exchange = opp.sell_exchange.label(),
+            .profit_pct = opp.profit_pct,
+            .notional_usd = opp.notional_usd,
+        });
+    } else {
+        logger.info("no spread above threshold", .{});
+    }
+
+    // Fixture: no-spread scenario
+    const coinbase_bbo = cex.types.BboUpdate{
+        .exchange = .coinbase,
+        .pair = pair,
+        .bid = .{ .price = 82_445.0, .size = 0.40 },
+        .ask = .{ .price = 82_455.0, .size = 0.25 },
+        .fetched_at_us = 1_000_002,
+    };
+    _ = eng.processBboUpdate(coinbase_bbo);
+
+    // Add OKX with highest bid → should become new best
+    const okx_bbo = cex.types.BboUpdate{
+        .exchange = .okx,
+        .pair = pair,
+        .bid = .{ .price = 82_700.0, .size = 0.10 },
+        .ask = .{ .price = 82_710.0, .size = 0.08 },
+        .fetched_at_us = 1_000_003,
+    };
+    if (eng.processBboUpdate(okx_bbo)) |opp| {
+        logger.info("best spread updated", .{
+            .buy_exchange = opp.buy_exchange.label(),
+            .sell_exchange = opp.sell_exchange.label(),
+            .profit_pct = opp.profit_pct,
+            .notional_usd = opp.notional_usd,
+        });
+    }
+
+    logger.info("phase 2 verification complete", .{});
+}
+
 fn parseLogLevel(s: []const u8) cex.log.Level {
     if (std.ascii.eqlIgnoreCase(s, "DEBUG")) return .debug;
     if (std.ascii.eqlIgnoreCase(s, "WARN")) return .warn;
@@ -125,17 +197,4 @@ fn parseLogLevel(s: []const u8) cex.log.Level {
     return .info;
 }
 
-// ---------------------------------------------------------------------------
-// Executable-level smoke test
-// ---------------------------------------------------------------------------
 
-test "module linkage smoke test" {
-    _ = cex.types.Exchange.binance;
-    _ = cex.channel.BoundedChannel(u32, 4);
-    _ = cex.log.Level.info;
-    _ = cex.config.Config{};
-    _ = cex.http.HttpClient;
-    _ = cex.gateway.GatewayError;
-    _ = cex.gateway.binance.Adapter;
-    _ = cex.gateway.bybit.Adapter;
-}

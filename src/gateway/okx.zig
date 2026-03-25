@@ -1,6 +1,6 @@
-//! ByBit exchange gateway adapter.
+//! OKX exchange gateway adapter.
 //!
-//! Fetches BBO data from the ByBit v5 REST API and normalizes into `BboUpdate`.
+//! Fetches BBO data from the OKX v5 REST API and normalizes into `BboUpdate`.
 
 const std = @import("std");
 const types = @import("../types.zig");
@@ -33,10 +33,10 @@ pub const Adapter = struct {
         };
     }
 
-    fn buildUrl(pair: types.TokenPair) ?[160]u8 {
-        var buf: [160]u8 = undefined;
+    fn buildUrl(pair: types.TokenPair) ?[128]u8 {
+        var buf: [128]u8 = undefined;
         const sym = pairToSymbol(pair) orelse return null;
-        const written = std.fmt.bufPrint(&buf, "https://api.bybit.com/v5/market/tickers?category=spot&symbol={s}", .{sym}) catch return null;
+        const written = std.fmt.bufPrint(&buf, "https://www.okx.com/api/v5/market/ticker?instId={s}", .{sym}) catch return null;
         @memset(buf[written.len..], 0);
         return buf;
     }
@@ -44,57 +44,55 @@ pub const Adapter = struct {
     pub fn pairToSymbol(pair: types.TokenPair) ?[]const u8 {
         return switch (pair.base) {
             .BTC => switch (pair.quote) {
-                .USDC => "BTCUSDC",
-                .USDT => "BTCUSDT",
+                .USDC => "BTC-USDC",
+                .USDT => "BTC-USDT",
             },
             .ETH => switch (pair.quote) {
-                .USDC => "ETHUSDC",
-                .USDT => "ETHUSDT",
+                .USDC => "ETH-USDC",
+                .USDT => "ETH-USDT",
             },
             .SOL => switch (pair.quote) {
-                .USDC => "SOLUSDC",
-                .USDT => "SOLUSDT",
+                .USDC => "SOL-USDC",
+                .USDT => "SOL-USDT",
             },
             .XRP => switch (pair.quote) {
-                .USDC => "XRPUSDC",
-                .USDT => "XRPUSDT",
+                .USDC => "XRP-USDC",
+                .USDT => "XRP-USDT",
             },
             .DOGE => switch (pair.quote) {
-                .USDC => "DOGEUSDC",
-                .USDT => "DOGEUSDT",
+                .USDC => "DOGE-USDC",
+                .USDT => "DOGE-USDT",
             },
         };
     }
 
     pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8, pair: types.TokenPair) !types.BboUpdate {
         const Ticker = struct {
-            bid1Price: []const u8,
-            bid1Size: []const u8,
-            ask1Price: []const u8,
-            ask1Size: []const u8,
+            bidPx: []const u8,
+            askPx: []const u8,
+            bidSz: []const u8,
+            askSz: []const u8,
         };
-        const Result = struct {
-            list: []const Ticker,
-        };
-        const ByBitResponse = struct {
-            retCode: i32,
-            result: Result,
+        const OkxResponse = struct {
+            code: []const u8,
+            data: []const Ticker,
         };
 
-        const parsed = std.json.parseFromSlice(ByBitResponse, allocator, body, .{
+        const parsed = std.json.parseFromSlice(OkxResponse, allocator, body, .{
             .ignore_unknown_fields = true,
         }) catch return error.ParseFailure;
         defer parsed.deinit();
 
-        if (parsed.value.retCode != 0) return error.ParseFailure;
-        if (parsed.value.result.list.len == 0) return error.ParseFailure;
+        const code = std.fmt.parseInt(i32, parsed.value.code, 10) catch return error.ParseFailure;
+        if (code != 0) return error.ParseFailure;
+        if (parsed.value.data.len == 0) return error.ParseFailure;
 
-        const ticker = parsed.value.result.list[0];
+        const ticker = parsed.value.data[0];
 
-        const bid_price = std.fmt.parseFloat(f64, ticker.bid1Price) catch return error.ParseFailure;
-        const bid_size = std.fmt.parseFloat(f64, ticker.bid1Size) catch return error.ParseFailure;
-        const ask_price = std.fmt.parseFloat(f64, ticker.ask1Price) catch return error.ParseFailure;
-        const ask_size = std.fmt.parseFloat(f64, ticker.ask1Size) catch return error.ParseFailure;
+        const bid_price = std.fmt.parseFloat(f64, ticker.bidPx) catch return error.ParseFailure;
+        const ask_price = std.fmt.parseFloat(f64, ticker.askPx) catch return error.ParseFailure;
+        const bid_size = std.fmt.parseFloat(f64, ticker.bidSz) catch return error.ParseFailure;
+        const ask_size = std.fmt.parseFloat(f64, ticker.askSz) catch return error.ParseFailure;
 
         const bid = types.PriceLevel{ .price = bid_price, .size = bid_size };
         const ask = types.PriceLevel{ .price = ask_price, .size = ask_size };
@@ -105,7 +103,7 @@ pub const Adapter = struct {
         const timestamp: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_us));
 
         return types.BboUpdate{
-            .exchange = .bybit,
+            .exchange = .okx,
             .pair = pair,
             .bid = bid,
             .ask = ask,

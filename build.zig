@@ -135,12 +135,40 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    // Phase 2 integration tests (tests/ directory).
+    // Each test file imports the cex_zig module and mock_data.
+    const test_files = [_][]const u8{
+        "tests/types.zig",
+        "tests/channel.zig",
+        "tests/log.zig",
+        "tests/config.zig",
+        "tests/http.zig",
+        "tests/adapters.zig",
+        "tests/engine.zig",
+        "tests/main.zig",
+    };
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    for (test_files) |test_file| {
+        const integration_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(test_file),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "cex_zig", .module = mod },
+                },
+            }),
+        });
+        const run_integration = b.addRunArtifact(integration_tests);
+        test_step.dependOn(&run_integration.step);
+    }
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

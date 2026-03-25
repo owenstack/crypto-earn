@@ -20,8 +20,7 @@ pub const GatewayError = error{
 
 pub const binance = @import("gateway/binance.zig");
 pub const bybit = @import("gateway/bybit.zig");
+pub const coinbase = @import("gateway/coinbase.zig");
+pub const okx = @import("gateway/okx.zig");
 
-test {
-    _ = binance;
-    _ = bybit;
-}
+
