@@ -19,6 +19,10 @@ function isAllowed(ctx: Context): boolean {
   return id !== undefined && ALLOWED_IDS.has(id);
 }
 
+export function isAllowedChatId(chatId: number): boolean {
+  return ALLOWED_IDS.has(chatId);
+}
+
 function guard(handler: (ctx: Context) => Promise<void>) {
   return async (ctx: Context) => {
     if (!isAllowed(ctx)) {

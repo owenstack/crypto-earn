@@ -39,7 +39,20 @@ pub fn build(b: *std.Build) void {
     // Tests
     const mod_tests = b.addTest(.{ .root_module = mod });
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
+
+    // Integration test suite (src/tests.zig) — needs sqlite3 + libc
+    const suite_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    suite_tests.linkLibC();
+    suite_tests.linkSystemLibrary("sqlite3");
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+    test_step.dependOn(&b.addRunArtifact(suite_tests).step);
 }
