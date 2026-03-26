@@ -49,7 +49,7 @@ Deliver only Phase 0 from the PRD: infrastructure + split architecture setup (zi
 
 **Verification**
 1. Zig build passes from zig/: zig build -Doptimize=ReleaseFast.
-2. TS build/typecheck passes from ts/: npm ci && npm run build && npm run typecheck.
+2. TS build/typecheck passes from ts/: bun ci && bun run build && bun run typecheck.
 3. IPC loopback test: TS client sends status request, receives response from Zig in expected envelope format.
 4. SQLite checks: PRAGMA journal_mode returns wal; concurrent Zig write + TS read test runs without lock failures.
 5. Telegram smoke: authorized chat can call status/portfolio/orders/config get; unauthorized chat is rejected.

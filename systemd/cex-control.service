@@ -1,0 +1,16 @@
+[Unit]
+Description=CEX Control Plane (Bun)
+After=network.target cex-engine.service
+Requires=cex-engine.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/cex-zig/ts
+EnvironmentFile=/opt/cex-zig/.env
+ExecStart=/root/.bun/bin/bun src/index.ts
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

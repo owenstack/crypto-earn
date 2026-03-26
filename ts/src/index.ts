@@ -1,41 +1,48 @@
 import { serve } from "bun";
-import index from "./index.html";
+import { IPCClient } from "./ipc/client";
+import { createBot } from "./telegram/bot";
+import { dashboardRoutes } from "./dashboard/server";
+import indexHtml from "./index.html";
+
+// 1. Initialize IPC Client to talk to Zig
+const ipc = new IPCClient();
+ipc.connect(); // Connects in background with auto-reconnect
+
+// 2. Initialize Telegram Bot (if token provided)
+if (Bun.env.TELEGRAM_BOT_TOKEN) {
+  const bot = createBot(ipc);
+  bot.start({
+    onStart: (botInfo) => {
+      console.log(`🤖 Telegram bot started as @${botInfo.username}`);
+    },
+  });
+} else {
+  console.warn("⚠️ TELEGRAM_BOT_TOKEN not set, skipping Telegram bot initialization.");
+}
+
+// 3. Initialize Web Server (API + Frontend)
+const apiRoutes = dashboardRoutes(ipc);
 
 const server = serve({
+  port: Bun.env.DASHBOARD_PORT || 3000,
   routes: {
-    // Serve index.html for all unmatched routes.
-    "/*": index,
-
-    "/api/hello": {
-      async GET(req) {
-        return Response.json({
-          message: "Hello, world!",
-          method: "GET",
-        });
-      },
-      async PUT(req) {
-        return Response.json({
-          message: "Hello, world!",
-          method: "PUT",
-        });
-      },
-    },
-
-    "/api/hello/:name": async req => {
-      const name = req.params.name;
-      return Response.json({
-        message: `Hello, ${name}!`,
-      });
-    },
+    // Spread the API routes object
+    ...apiRoutes,
+    
+    // Serve index.html for all unmatched routes (SPA fallback)
+    "/*": indexHtml,
   },
-
-  development: process.env.NODE_ENV !== "production" && {
-    // Enable browser hot reloading in development
+  development: Bun.env.NODE_ENV !== "production" && {
     hmr: true,
-
-    // Echo console logs from the browser to the server
-    console: true,
   },
 });
 
-console.log(`🚀 Server running at ${server.url}`);
+console.log(`🚀 Control Plane running at ${server.url}`);
+
+// Handle graceful shutdown
+process.on("SIGINT", () => {
+  console.log("Shutting down...");
+  ipc.disconnect();
+  server.stop();
+  process.exit(0);
+});

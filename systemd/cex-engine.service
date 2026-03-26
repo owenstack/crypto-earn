@@ -1,0 +1,31 @@
+[Unit]
+Description=CEX Trading Engine (Zig)
+After=network.target
+
+[Service]
+Type=simple
+User=cex-engine
+Group=cex-engine
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+MemoryDenyWriteExecute=yes
+ReadOnlyPaths=/opt/cex-zig /opt/cex-zig/zig
+ReadWritePaths=/opt/cex-zig/zig/data
+WorkingDirectory=/opt/cex-zig/zig
+EnvironmentFile=/opt/cex-zig/.env
+ExecStart=/opt/cex-zig/zig/zig-out/bin/cex-engine
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+[Install]
+WantedBy=multi-user.target
