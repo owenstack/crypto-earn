@@ -2,6 +2,7 @@ const std = @import("std");
 const log = @import("logger.zig");
 const db = @import("db.zig");
 const ipc = @import("ipc.zig");
+const scanner = @import("market_scanner.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -31,6 +32,16 @@ pub fn main() !void {
 
     try database.runMigrations();
     log.info("engine", "db ready", .{});
+
+    // Spawn market scanner thread
+    var scan = scanner.Scanner.init(allocator, &database, .{});
+    const scanner_thread = try std.Thread.spawn(.{}, scanner.Scanner.run, .{&scan});
+    defer {
+        scan.stop();
+        scanner_thread.join();
+        scan.deinit();
+    }
+    log.info("engine", "market scanner started", .{});
 
     // Start IPC server (blocks)
     try ipc.serve(allocator, socket_path, &database);

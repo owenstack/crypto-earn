@@ -23,9 +23,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Link SQLite3 system library + libc
+    // Link system libraries + libc
     exe.linkLibC();
     exe.linkSystemLibrary("sqlite3");
+    exe.linkSystemLibrary("secp256k1");
 
     b.installArtifact(exe);
 
@@ -50,6 +51,7 @@ pub fn build(b: *std.Build) void {
     });
     suite_tests.linkLibC();
     suite_tests.linkSystemLibrary("sqlite3");
+    suite_tests.linkSystemLibrary("secp256k1");
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);

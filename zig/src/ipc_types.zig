@@ -19,6 +19,13 @@ pub const T = struct {
     pub const logs = "logs";
     pub const logs_response = "logs.response";
     pub const err_response = "error.response";
+
+    // Phase 1: Market data messages
+    pub const market_list = "market.list";
+    pub const market_list_response = "market.list.response";
+    pub const orderbook_snapshot = "orderbook.snapshot";
+    pub const orderbook_snapshot_response = "orderbook.snapshot.response";
+    pub const price_update = "price.update";
 };
 
 /// Write a complete JSON-lines response envelope to `writer`.

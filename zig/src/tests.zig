@@ -4,6 +4,14 @@ const log = @import("logger.zig");
 const ipc_types = @import("ipc_types.zig");
 const db = @import("db.zig");
 
+// Phase 1 modules — import to run their inline tests
+const crypto = @import("crypto.zig");
+const http_client = @import("http_client.zig");
+const websocket = @import("websocket.zig");
+const gamma_api = @import("gamma_api.zig");
+const clob_orderbook = @import("clob_orderbook.zig");
+const market_scanner = @import("market_scanner.zig");
+
 // ─── Logger tests ───────────────────────────────────────────────────────────
 
 test "logger: init sets start time and uptimeMs returns non-negative" {
@@ -236,22 +244,18 @@ test "db: journalMode returns a non-empty string" {
 
 test "db: temp file DB gets WAL journal mode" {
     // WAL requires a real file — use a unique temp path
-    var rng = std.rand.DefaultPrng.init(blk: {
-        var seed: u64 = undefined;
-        std.os.getrandom(std.mem.asBytes(&seed)) catch break :blk 0;
-        break :blk seed;
-    });
-    const random = rng.random();
-    var path_buf: [128]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "/tmp/cex-test-wal-{d}.db", .{random.int(u32)});
+    var seed: u64 = 0;
+    std.posix.getrandom(std.mem.asBytes(&seed)) catch {
+        seed = @as(u64, @intCast(@max(std.time.timestamp(), 1)));
+    };
+    var rng = std.Random.DefaultPrng.init(seed);
+    var path_buf: [128:0]u8 = @splat(0);
+    const path = std.fmt.bufPrint(&path_buf, "/tmp/cex-test-wal-{d}.db", .{rng.random().int(u32)}) catch unreachable;
 
-    var database = try db.DB.open(path);
+    var database = try db.DB.open(&path_buf);
     defer {
         database.close();
         std.fs.cwd().deleteFile(path) catch {};
-        // Also clean up WAL/SHM files
-        std.fs.cwd().deleteFile(path ++ "-wal") catch {};
-        std.fs.cwd().deleteFile(path ++ "-shm") catch {};
     }
     var jm_buf: [16]u8 = undefined;
     const jm = database.journalMode(&jm_buf);
