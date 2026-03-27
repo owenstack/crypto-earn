@@ -92,7 +92,7 @@ export function Dashboard() {
             {portfolio?.positions?.length === 0 ? (
               <div className="text-muted-foreground text-sm py-4 text-center">No open positions</div>
             ) : (
-              <pre className="text-xs bg-muted p-4 rounded-md overflow-auto max-h-[400px]">
+              <pre className="text-xs bg-muted p-4 rounded-md overflow-auto max-h-100">
                 {JSON.stringify(portfolio?.positions, null, 2)}
               </pre>
             )}
@@ -107,7 +107,7 @@ export function Dashboard() {
             {orders?.orders?.length === 0 ? (
               <div className="text-muted-foreground text-sm py-4 text-center">No active orders</div>
             ) : (
-              <pre className="text-xs bg-muted p-4 rounded-md overflow-auto max-h-[400px]">
+              <pre className="text-xs bg-muted p-4 rounded-md overflow-auto max-h-100">
                 {JSON.stringify(orders?.orders, null, 2)}
               </pre>
             )}

@@ -179,4 +179,54 @@ describe("IPCClient", () => {
       expect(err).toBeInstanceOf(Error);
     }
   });
+
+  describe("Phase 2 message types", () => {
+    test("order.place request gets response", async () => {
+      const client = new IPCClient({
+        socketPath: SOCK_PATH,
+        requestTimeoutMs: 3000,
+      });
+      await client.connect();
+
+      const res = await client.request("order.place", {
+        market_id: "test-market",
+        side: "buy",
+        size: "10",
+        price: "0.50",
+        order_type: "limit",
+      });
+      expect(res.v).toBe(1);
+      expect(res.type).toBe("order.place.response");
+
+      client.disconnect();
+    });
+
+    test("halt request gets response", async () => {
+      const client = new IPCClient({
+        socketPath: SOCK_PATH,
+        requestTimeoutMs: 3000,
+      });
+      await client.connect();
+
+      const res = await client.request("halt");
+      expect(res.v).toBe(1);
+      expect(res.type).toBe("halt.response");
+
+      client.disconnect();
+    });
+
+    test("resume request gets response", async () => {
+      const client = new IPCClient({
+        socketPath: SOCK_PATH,
+        requestTimeoutMs: 3000,
+      });
+      await client.connect();
+
+      const res = await client.request("resume");
+      expect(res.v).toBe(1);
+      expect(res.type).toBe("resume.response");
+
+      client.disconnect();
+    });
+  });
 });

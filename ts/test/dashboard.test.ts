@@ -166,6 +166,18 @@ describe("dashboardRoutes", () => {
     });
   });
 
+  describe("Read-only enforcement", () => {
+    test("no routes expose POST, PUT, DELETE, or PATCH methods", () => {
+      const routes = dashboardRoutes(makeIpcMock() as any);
+      for (const [path, handlers] of Object.entries(routes)) {
+        const methods = Object.keys(handlers as Record<string, unknown>);
+        for (const method of methods) {
+          expect(["GET"]).toContain(method);
+        }
+      }
+    });
+  });
+
   describe("DB-dependent routes", () => {
     test("/api/portfolio returns positions from DB", async () => {
       const routes = dashboardRoutes(makeIpcMock() as any);

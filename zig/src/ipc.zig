@@ -4,14 +4,18 @@ const std = @import("std");
 const log = @import("logger.zig");
 const types = @import("ipc_types.zig");
 const db = @import("db.zig");
+const order_mgr = @import("order_manager.zig");
+const portfolio = @import("portfolio_tracker.zig");
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
     database: *db.DB,
+    order_manager: ?*order_mgr.OrderManager = null,
+    portfolio_tracker: ?*portfolio.PortfolioTracker = null,
 };
 
 /// Start listening; blocks until an unrecoverable error.
-pub fn serve(allocator: std.mem.Allocator, socket_path: []const u8, database: *db.DB) !void {
+pub fn serve(allocator: std.mem.Allocator, socket_path: []const u8, database: *db.DB, om: ?*order_mgr.OrderManager, pt: ?*portfolio.PortfolioTracker) !void {
     // Remove stale socket file from a prior run.
     std.fs.cwd().deleteFile(socket_path) catch {};
 
@@ -24,7 +28,7 @@ pub fn serve(allocator: std.mem.Allocator, socket_path: []const u8, database: *d
 
     log.info("ipc", "listening on {s}", .{socket_path});
 
-    var ctx = Context{ .allocator = allocator, .database = database };
+    var ctx = Context{ .allocator = allocator, .database = database, .order_manager = om, .portfolio_tracker = pt };
 
     while (true) {
         const conn = listener.accept() catch |e| {
@@ -112,9 +116,33 @@ fn dispatch(ctx: *Context, line: []const u8, writer: anytype) !void {
         ) catch "{}";
         try types.writeResponse(writer, req_id, types.T.status_response, payload);
     } else if (std.mem.eql(u8, msg_type, types.T.portfolio)) {
-        try types.writeResponse(writer, req_id, types.T.portfolio_response, "{\"positions\":[],\"note\":\"phase-0-stub\"}");
+        if (ctx.portfolio_tracker) |pt| {
+            var snap_buf: [8192]u8 = undefined;
+            const snap_json = pt.writeSnapshotJson(&snap_buf) catch |e| {
+                log.err("ipc", "failed to write portfolio snapshot: {s}", .{@errorName(e)});
+                var err_buf: [192]u8 = undefined;
+                const err_payload = std.fmt.bufPrint(&err_buf, "{{\"positions\":[],\"error\":\"snapshot_write_failed\",\"details\":\"{s}\"}}", .{@errorName(e)}) catch "{\"positions\":[],\"error\":\"snapshot_write_failed\"}";
+                try types.writeResponse(writer, req_id, types.T.portfolio_response, err_payload);
+                return;
+            };
+            try types.writeResponse(writer, req_id, types.T.portfolio_response, snap_json);
+        } else {
+            try types.writeResponse(writer, req_id, types.T.portfolio_response, "{\"positions\":[],\"note\":\"phase-0-stub\"}");
+        }
     } else if (std.mem.eql(u8, msg_type, types.T.orders)) {
-        try types.writeResponse(writer, req_id, types.T.orders_response, "{\"orders\":[],\"note\":\"phase-0-stub\"}");
+        if (ctx.portfolio_tracker) |pt| {
+            var orders_buf: [8192]u8 = undefined;
+            const orders_json = pt.writeOrdersJson(&orders_buf) catch |e| {
+                log.err("ipc", "failed to write open orders snapshot: {s}", .{@errorName(e)});
+                var err_buf: [192]u8 = undefined;
+                const err_payload = std.fmt.bufPrint(&err_buf, "{{\"orders\":[],\"error\":\"orders_write_failed\",\"details\":\"{s}\"}}", .{@errorName(e)}) catch "{\"orders\":[],\"error\":\"orders_write_failed\"}";
+                try types.writeResponse(writer, req_id, types.T.orders_response, err_payload);
+                return;
+            };
+            try types.writeResponse(writer, req_id, types.T.orders_response, orders_json);
+        } else {
+            try types.writeResponse(writer, req_id, types.T.orders_response, "{\"orders\":[],\"note\":\"phase-0-stub\"}");
+        }
     } else if (std.mem.eql(u8, msg_type, types.T.config_get)) {
         try types.writeResponse(writer, req_id, types.T.config_get_response, "{\"config\":{},\"note\":\"phase-0-stub\"}");
     } else if (std.mem.eql(u8, msg_type, types.T.logs)) {
@@ -125,6 +153,99 @@ fn dispatch(ctx: *Context, line: []const u8, writer: anytype) !void {
         try log.writeRecentLogs(payload.writer(alloc));
         try payload.append(alloc, '}');
         try types.writeResponse(writer, req_id, types.T.logs_response, payload.items);
+    } else if (std.mem.eql(u8, msg_type, types.T.order_place)) {
+        if (ctx.order_manager) |om| {
+            const payload_obj = if (root.get("payload")) |v| switch (v) {
+                .object => |o| o,
+                else => null,
+            } else null;
+            if (payload_obj) |pl| {
+                const market_id = if (pl.get("market_id")) |v| switch (v) {
+                    .string => |s| s,
+                    else => "",
+                } else "";
+                const side = if (pl.get("side")) |v| switch (v) {
+                    .string => |s| s,
+                    else => "",
+                } else "";
+                const size = if (pl.get("size")) |v| switch (v) {
+                    .string => |s| s,
+                    else => "",
+                } else "";
+                const price = if (pl.get("price")) |v| switch (v) {
+                    .string => |s| s,
+                    else => "",
+                } else "";
+                const otype = if (pl.get("order_type")) |v| switch (v) {
+                    .string => |s| s,
+                    else => "limit",
+                } else "limit";
+
+                const result = om.placeOrder(market_id, side, size, price, otype);
+                var p_buf: [256]u8 = undefined;
+                var owned_order_id: ?[]u8 = null;
+                defer if (owned_order_id) |id| om.allocator.free(id);
+                const resp_payload = switch (result) {
+                    .success => |s| blk: {
+                        owned_order_id = s.order_id;
+                        break :blk std.fmt.bufPrint(&p_buf, "{{\"order_id\":\"{s}\",\"status\":\"placed\"}}", .{s.order_id}) catch "{}";
+                    },
+                    .rejected => |r| std.fmt.bufPrint(&p_buf, "{{\"order_id\":\"\",\"status\":\"rejected\",\"reason\":\"{s}\"}}", .{r.reason}) catch "{}",
+                    .failed => |f| std.fmt.bufPrint(&p_buf, "{{\"order_id\":\"\",\"status\":\"failed\",\"reason\":\"{s}\"}}", .{f.reason}) catch "{}",
+                };
+                try types.writeResponse(writer, req_id, types.T.order_place_response, resp_payload);
+            } else {
+                try types.writeError(writer, req_id, "missing payload");
+            }
+        } else {
+            try types.writeError(writer, req_id, "order manager not available");
+        }
+    } else if (std.mem.eql(u8, msg_type, types.T.order_cancel)) {
+        if (ctx.order_manager) |om| {
+            const payload_obj = if (root.get("payload")) |v| switch (v) {
+                .object => |o| o,
+                else => null,
+            } else null;
+            if (payload_obj) |pl| {
+                const order_id = if (pl.get("order_id")) |v| switch (v) {
+                    .string => |s| s,
+                    else => "",
+                } else "";
+                const ok = om.cancelOrder(order_id);
+                var p_buf: [128]u8 = undefined;
+                const resp = std.fmt.bufPrint(&p_buf, "{{\"order_id\":\"{s}\",\"status\":\"{s}\"}}", .{ order_id, if (ok) "cancelled" else "failed" }) catch "{}";
+                try types.writeResponse(writer, req_id, types.T.order_cancel_response, resp);
+            } else {
+                try types.writeError(writer, req_id, "missing payload");
+            }
+        } else {
+            try types.writeError(writer, req_id, "order manager not available");
+        }
+    } else if (std.mem.eql(u8, msg_type, types.T.order_cancel_all)) {
+        if (ctx.order_manager) |om| {
+            const cancelled = om.cancelAll();
+            var p_buf: [64]u8 = undefined;
+            const resp = std.fmt.bufPrint(&p_buf, "{{\"cancelled_count\":{d}}}", .{cancelled}) catch "{}";
+            try types.writeResponse(writer, req_id, types.T.order_cancel_all_response, resp);
+        } else {
+            try types.writeError(writer, req_id, "order manager not available");
+        }
+    } else if (std.mem.eql(u8, msg_type, types.T.halt)) {
+        if (ctx.order_manager) |om| {
+            const cancelled = om.halt();
+            var p_buf: [64]u8 = undefined;
+            const resp = std.fmt.bufPrint(&p_buf, "{{\"status\":\"halted\",\"cancelled_orders\":{d}}}", .{cancelled}) catch "{}";
+            try types.writeResponse(writer, req_id, types.T.halt_response, resp);
+        } else {
+            try types.writeError(writer, req_id, "order manager not available");
+        }
+    } else if (std.mem.eql(u8, msg_type, types.T.@"resume")) {
+        if (ctx.order_manager) |om| {
+            om.@"resume"();
+            try types.writeResponse(writer, req_id, types.T.resume_response, "{\"status\":\"resumed\"}");
+        } else {
+            try types.writeError(writer, req_id, "order manager not available");
+        }
     } else {
         try types.writeError(writer, req_id, "unknown message type");
     }

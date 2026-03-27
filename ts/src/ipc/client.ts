@@ -2,8 +2,9 @@
  * UNIX socket IPC client with line-buffered JSON framing,
  * reconnect/back-off, per-request timeout, and correlation tracking.
  */
-import type { Envelope, RequestMessageType } from "./types";
+import type { Envelope, RequestMessageType, OrderPlaceResponsePayload, OrderCancelResponsePayload, OrderCancelAllResponsePayload, HaltResponsePayload, ResumeResponsePayload } from "./types";
 import { makeRequest } from "./types";
+import type { OrderPlaceRequestPayload, OrderCancelPayload } from "./types";
 
 export interface IPCClientOptions {
   socketPath?: string;
@@ -170,13 +171,15 @@ export class IPCClient {
   }
 
   /** Send a typed request and await the correlated response. */
-  async request<P = unknown>(type: RequestMessageType, payload?: P): Promise<Envelope<P>> {
+  async request<RES = unknown>(type: RequestMessageType): Promise<Envelope<RES>>;
+  async request<REQ, RES = unknown>(type: RequestMessageType, payload: REQ): Promise<Envelope<RES>>;
+  async request<REQ>(type: RequestMessageType, payload?: REQ): Promise<Envelope<unknown>> {
     if (!this.socket || !this._connected) throw new Error("IPC not connected");
 
     const req = payload === undefined ? makeRequest(type) : makeRequest(type, payload);
     const line = JSON.stringify(req) + "\n";
 
-    return new Promise<Envelope<P>>((resolve, reject) => {
+    return new Promise<Envelope<unknown>>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(req.id);
         reject(new Error(`IPC timeout: ${type}`));
@@ -195,5 +198,38 @@ export class IPCClient {
   disconnect() {
     (this.socket as unknown as { end(): void } | null)?.end();
     this._connected = false;
+  }
+
+  // Phase 2 typed helpers
+  async placeOrder(
+    market_id: string,
+    side: "buy" | "sell",
+    size: string,
+    price: string,
+    order_type: OrderPlaceRequestPayload["order_type"] = "limit",
+  ) {
+    return this.request<OrderPlaceRequestPayload, OrderPlaceResponsePayload>("order.place", {
+      market_id,
+      side,
+      size,
+      price,
+      order_type,
+    });
+  }
+
+  async cancelOrder(order_id: string) {
+    return this.request<OrderCancelPayload, OrderCancelResponsePayload>("order.cancel", { order_id });
+  }
+
+  async cancelAllOrders() {
+    return this.request<OrderCancelAllResponsePayload>("order.cancel_all");
+  }
+
+  async halt() {
+    return this.request<HaltResponsePayload>("halt");
+  }
+
+  async resume() {
+    return this.request<ResumeResponsePayload>("resume");
   }
 }

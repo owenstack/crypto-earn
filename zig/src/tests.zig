@@ -12,6 +12,11 @@ const gamma_api = @import("gamma_api.zig");
 const clob_orderbook = @import("clob_orderbook.zig");
 const market_scanner = @import("market_scanner.zig");
 
+// Phase 2 modules
+const risk_gate = @import("risk_gate.zig");
+const order_manager = @import("order_manager.zig");
+const portfolio_tracker = @import("portfolio_tracker.zig");
+
 // ─── Logger tests ───────────────────────────────────────────────────────────
 
 test "logger: init sets start time and uptimeMs returns non-negative" {
@@ -442,4 +447,331 @@ test "ipc: error response for unknown message type" {
 
     const obj = parsed.value.object;
     try testing.expectEqualStrings("error.response", obj.get("type").?.string);
+}
+
+// ─── Phase 2: Risk gate tests ───────────────────────────────────────────────
+
+test "risk_gate: passes valid order under all limits" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    const config = risk_gate.RiskConfig{
+        .max_position_usd = 500.0,
+        .max_portfolio_exposure_usd = 5000.0,
+        .max_daily_drawdown_usd = 200.0,
+        .max_open_orders = 20,
+        .allow_duplicate_positions = false,
+    };
+
+    const request = risk_gate.OrderRequest{
+        .market_id = "test-market",
+        .side = "buy",
+        .size = "10",
+        .price = "0.50",
+        .order_type = "limit",
+        .client_order_id = "test-order-1",
+    };
+
+    const result = risk_gate.validateOrder(request, &database, config);
+    try testing.expect(result == .pass);
+}
+
+test "risk_gate: rejects order exceeding max position" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    const config = risk_gate.RiskConfig{
+        .max_position_usd = 100.0,
+    };
+
+    const request = risk_gate.OrderRequest{
+        .market_id = "test-market",
+        .side = "buy",
+        .size = "500",
+        .price = "0.50",
+        .order_type = "limit",
+        .client_order_id = "test-order-2",
+    };
+
+    const result = risk_gate.validateOrder(request, &database, config);
+    switch (result) {
+        .reject => |r| {
+            try testing.expectEqual(risk_gate.RejectionReason.max_position_exceeded, r.reason);
+            try testing.expectEqualStrings("max_position_usd", r.check_name);
+        },
+        .pass => try testing.expect(false),
+    }
+}
+
+test "risk_gate: rejects above max position boundary" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    const config = risk_gate.RiskConfig{
+        .max_position_usd = 250.0,
+    };
+
+    // Notional = 500 * 0.55 = 275 > 250
+    const request = risk_gate.OrderRequest{
+        .market_id = "test-market",
+        .side = "buy",
+        .size = "500",
+        .price = "0.55",
+        .order_type = "limit",
+        .client_order_id = "test-order-boundary",
+    };
+
+    const result = risk_gate.validateOrder(request, &database, config);
+    try testing.expect(result == .reject);
+}
+
+test "risk_gate: rejects when max open orders reached" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    // Insert a market first (required by foreign key)
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
+
+    // Insert max_open_orders pending orders
+    const config = risk_gate.RiskConfig{
+        .max_open_orders = 2,
+    };
+
+    try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50");
+    try database.insertOrder("o2", "m1", "co2", "limit", "sell", "10", "0.50");
+
+    const request = risk_gate.OrderRequest{
+        .market_id = "m1",
+        .side = "buy",
+        .size = "10",
+        .price = "0.50",
+        .order_type = "limit",
+        .client_order_id = "test-order-3",
+    };
+
+    const result = risk_gate.validateOrder(request, &database, config);
+    switch (result) {
+        .reject => |r| {
+            try testing.expectEqual(risk_gate.RejectionReason.max_open_orders_exceeded, r.reason);
+        },
+        .pass => try testing.expect(false),
+    }
+}
+
+test "risk_gate: rejects duplicate position" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    // Insert a market and an open long position
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
+    try database.execZ("INSERT INTO positions(id,market_id,side,size,entry_price,status) VALUES('p1','m1','long','10','0.50','open');");
+
+    const config = risk_gate.RiskConfig{
+        .allow_duplicate_positions = false,
+    };
+
+    // Try to place another buy (long) on same market
+    const request = risk_gate.OrderRequest{
+        .market_id = "m1",
+        .side = "buy",
+        .size = "10",
+        .price = "0.50",
+        .order_type = "limit",
+        .client_order_id = "test-dup",
+    };
+
+    const result = risk_gate.validateOrder(request, &database, config);
+    switch (result) {
+        .reject => |r| {
+            try testing.expectEqual(risk_gate.RejectionReason.duplicate_position, r.reason);
+        },
+        .pass => try testing.expect(false),
+    }
+}
+
+test "risk_gate: allows duplicate when configured" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
+    try database.execZ("INSERT INTO positions(id,market_id,side,size,entry_price,status) VALUES('p1','m1','long','10','0.50','open');");
+
+    const config = risk_gate.RiskConfig{
+        .allow_duplicate_positions = true,
+    };
+
+    const request = risk_gate.OrderRequest{
+        .market_id = "m1",
+        .side = "buy",
+        .size = "10",
+        .price = "0.50",
+        .order_type = "limit",
+        .client_order_id = "test-dup-ok",
+    };
+
+    const result = risk_gate.validateOrder(request, &database, config);
+    try testing.expect(result == .pass);
+}
+
+test "risk_gate: rejection reason names are correct" {
+    try testing.expectEqualStrings("MaxPositionExceeded", risk_gate.rejectionReasonName(.max_position_exceeded));
+    try testing.expectEqualStrings("MaxPortfolioExposureExceeded", risk_gate.rejectionReasonName(.max_portfolio_exposure_exceeded));
+    try testing.expectEqualStrings("MaxDailyDrawdownExceeded", risk_gate.rejectionReasonName(.max_daily_drawdown_exceeded));
+    try testing.expectEqualStrings("MaxOpenOrdersExceeded", risk_gate.rejectionReasonName(.max_open_orders_exceeded));
+    try testing.expectEqualStrings("DuplicatePosition", risk_gate.rejectionReasonName(.duplicate_position));
+}
+
+// ─── Phase 2: Order manager tests ───────────────────────────────────────────
+
+test "order_manager: backoff schedule is 1s,2s,4s,...,60s capped" {
+    try testing.expectEqual(@as(u64, 1000), order_manager.OrderManager.backoffDelayMs(0));
+    try testing.expectEqual(@as(u64, 2000), order_manager.OrderManager.backoffDelayMs(1));
+    try testing.expectEqual(@as(u64, 4000), order_manager.OrderManager.backoffDelayMs(2));
+    try testing.expectEqual(@as(u64, 8000), order_manager.OrderManager.backoffDelayMs(3));
+    try testing.expectEqual(@as(u64, 16000), order_manager.OrderManager.backoffDelayMs(4));
+    try testing.expectEqual(@as(u64, 32000), order_manager.OrderManager.backoffDelayMs(5));
+    try testing.expectEqual(@as(u64, 60000), order_manager.OrderManager.backoffDelayMs(6)); // capped
+    try testing.expectEqual(@as(u64, 60000), order_manager.OrderManager.backoffDelayMs(7)); // stays capped
+}
+
+test "order_manager: halt blocks order placement" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    var om = order_manager.OrderManager.init(testing.allocator, &database, .{}, .{});
+
+    // Halt the engine
+    _ = om.halt();
+    try testing.expect(om.isHalted());
+
+    // Attempt to place order while halted
+    const result = om.placeOrder("m1", "buy", "10", "0.50", "limit");
+    switch (result) {
+        .rejected => |r| try testing.expectEqualStrings("engine_halted", r.reason),
+        else => try testing.expect(false),
+    }
+}
+
+test "order_manager: resume unblocks after halt" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    var om = order_manager.OrderManager.init(testing.allocator, &database, .{}, .{});
+    _ = om.halt();
+    try testing.expect(om.isHalted());
+
+    om.@"resume"();
+    try testing.expect(!om.isHalted());
+}
+
+test "order_manager: init defaults" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    var om = order_manager.OrderManager.init(testing.allocator, &database, .{}, .{});
+    try testing.expect(!om.isHalted());
+    try testing.expectEqual(@as(u32, 24), om.config.max_order_age_hours);
+    try testing.expectEqual(@as(u32, 5), om.config.stale_scan_interval_min);
+    try testing.expectEqual(@as(u32, 7), om.config.max_retry_attempts);
+}
+
+// ─── Phase 2: DB helper tests ───────────────────────────────────────────────
+
+test "db: migration 002 creates risk_events and balance_snapshots tables" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    // These should not error - tables exist
+    try database.execZ("SELECT count(*) FROM risk_events;");
+    try database.execZ("SELECT count(*) FROM balance_snapshots;");
+}
+
+test "db: insertOrder and queryOpenOrderCount" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
+
+    const count_before = try database.queryOpenOrderCount();
+    try testing.expectEqual(@as(u32, 0), count_before);
+
+    try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50");
+    const count_after = try database.queryOpenOrderCount();
+    try testing.expectEqual(@as(u32, 1), count_after);
+}
+
+test "db: updateOrderStatus" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
+    try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50");
+
+    try database.updateOrderStatus("o1", "filled");
+    const count = try database.queryOpenOrderCount();
+    try testing.expectEqual(@as(u32, 0), count); // filled orders not counted
+}
+
+test "db: recordRiskRejection persists to risk_events" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.recordRiskRejection("o1", "m1", "max_position_usd", "MaxPositionExceeded", "500.00", "750.00");
+
+    const sql = "SELECT count(*) FROM risk_events WHERE check_name='max_position_usd';" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expectEqual(@as(c_int, db.c.SQLITE_OK), db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null));
+    defer _ = db.c.sqlite3_finalize(stmt);
+
+    try testing.expectEqual(@as(c_int, db.c.SQLITE_ROW), db.c.sqlite3_step(stmt));
+    const count = db.c.sqlite3_column_int(stmt, 0);
+    try testing.expectEqual(@as(c_int, 1), count);
+}
+
+test "db: queryOpenExposureUsd returns 0 with no orders" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    const exposure = try database.queryOpenExposureUsd();
+    try testing.expectEqual(@as(f64, 0.0), exposure);
+}
+
+test "db: queryPositionByMarketDirection returns false with no positions" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    const has = try database.queryPositionByMarketDirection("m1", "long");
+    try testing.expect(!has);
+}
+
+// ─── Phase 2: IPC type constants ────────────────────────────────────────────
+
+test "ipc_types: Phase 2 type constants exist" {
+    try testing.expectEqualStrings("order.place", ipc_types.T.order_place);
+    try testing.expectEqualStrings("order.cancel", ipc_types.T.order_cancel);
+    try testing.expectEqualStrings("order.cancel_all", ipc_types.T.order_cancel_all);
+    try testing.expectEqualStrings("halt", ipc_types.T.halt);
+    try testing.expectEqualStrings("resume", ipc_types.T.@"resume");
+    try testing.expectEqualStrings("risk.check.response", ipc_types.T.risk_check_response);
+    try testing.expectEqualStrings("order.event", ipc_types.T.order_event);
+    try testing.expectEqualStrings("halt.response", ipc_types.T.halt_response);
+    try testing.expectEqualStrings("resume.response", ipc_types.T.resume_response);
+    try testing.expectEqualStrings("order.place.response", ipc_types.T.order_place_response);
+    try testing.expectEqualStrings("order.cancel.response", ipc_types.T.order_cancel_response);
+    try testing.expectEqualStrings("order.cancel_all.response", ipc_types.T.order_cancel_all_response);
 }

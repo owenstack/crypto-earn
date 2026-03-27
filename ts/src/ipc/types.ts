@@ -10,7 +10,12 @@ export type RequestMessageType =
   | "config.get"
   | "logs"
   | "market.list"
-  | "orderbook.snapshot";
+  | "orderbook.snapshot"
+  | "order.place"
+  | "order.cancel"
+  | "order.cancel_all"
+  | "halt"
+  | "resume";
 
 export type ResponseMessageType =
   | "heartbeat.response"
@@ -22,7 +27,16 @@ export type ResponseMessageType =
   | "error.response"
   | "market.list.response"
   | "orderbook.snapshot.response"
-  | "price.update";
+  | "price.update"
+  | "risk.check.response"
+  | "order.event"
+  | "portfolio.snapshot.response"
+  | "orders.open.response"
+  | "order.place.response"
+  | "order.cancel.response"
+  | "order.cancel_all.response"
+  | "halt.response"
+  | "resume.response";
 
 export type MessageType = RequestMessageType | ResponseMessageType;
 
@@ -91,6 +105,100 @@ export interface LogEntry {
   level: "DEBUG" | "INFO" | "WARN" | "ERROR";
   component: string;
   msg: string;
+}
+
+// Phase 2: Order/Risk payloads
+export interface OrderPlaceRequestPayload {
+  market_id: string;
+  side: "buy" | "sell";
+  size: string;
+  price: string;
+  order_type: "limit" | "market";
+}
+
+export interface OrderPlacePayload {
+  market_id: string;
+  side: "buy" | "sell";
+  size: string;
+  price: string;
+  order_type: "limit" | "market" | "GTC" | "FOK";
+}
+
+export interface OrderCancelPayload {
+  order_id: string;
+}
+
+export interface OrderPlaceResponsePayload {
+  order_id: string;
+  status: string;
+}
+
+export interface OrderCancelResponsePayload {
+  order_id: string;
+  status: string;
+}
+
+export interface OrderCancelAllResponsePayload {
+  cancelled_count: number;
+}
+
+export interface RiskCheckResponsePayload {
+  passed: boolean;
+  check_name?: string;
+  reason?: string;
+  limit_value?: string;
+  actual_value?: string;
+}
+
+export interface OrderEventPayload {
+  order_id: string;
+  market_id: string;
+  event_type: "placed" | "filled" | "partially_filled" | "cancelled" | "rejected";
+  side: string;
+  size: string;
+  price: string;
+  reason?: string;
+}
+
+export interface PortfolioSnapshotPayload {
+  positions: PositionInfo[];
+  total_exposure_usd: string;
+  unrealized_pnl: string;
+  realized_pnl_today: string;
+  usdc_balance: string;
+}
+
+export interface PositionInfo {
+  market_id: string;
+  side: "long" | "short";
+  size: string;
+  entry_price: string;
+  current_price: string;
+  unrealized_pnl: string;
+}
+
+export interface OrdersOpenPayload {
+  orders: OpenOrderInfo[];
+}
+
+export interface OpenOrderInfo {
+  id: string;
+  market_id: string;
+  side: string;
+  size: string;
+  price: string;
+  order_type: string;
+  status: string;
+  created_at: number;
+}
+
+export interface HaltResponsePayload {
+  status: "halted";
+  cancelled_orders: number;
+}
+
+export interface ResumeResponsePayload {
+  status: "resumed";
 }
 
 /** Build a request envelope with a random correlation ID. */

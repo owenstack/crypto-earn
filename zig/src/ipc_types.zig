@@ -26,6 +26,22 @@ pub const T = struct {
     pub const orderbook_snapshot = "orderbook.snapshot";
     pub const orderbook_snapshot_response = "orderbook.snapshot.response";
     pub const price_update = "price.update";
+
+    // Phase 2: Order/Risk/Control messages
+    pub const order_place = "order.place";
+    pub const order_cancel = "order.cancel";
+    pub const order_cancel_all = "order.cancel_all";
+    pub const halt = "halt";
+    pub const @"resume" = "resume";
+    pub const risk_check_response = "risk.check.response";
+    pub const order_event = "order.event";
+    pub const portfolio_snapshot_response = "portfolio.snapshot.response";
+    pub const orders_open_response = "orders.open.response";
+    pub const order_place_response = "order.place.response";
+    pub const order_cancel_response = "order.cancel.response";
+    pub const order_cancel_all_response = "order.cancel_all.response";
+    pub const halt_response = "halt.response";
+    pub const resume_response = "resume.response";
 };
 
 /// Write a complete JSON-lines response envelope to `writer`.
