@@ -111,10 +111,7 @@ fn stringifyArray(allocator: std.mem.Allocator, body: []const u8, key: []const u
         return error.ParseFailed;
     defer parsed.deinit();
     const arr = parsed.value.object.get(key) orelse return error.ParseFailed;
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    std.json.stringify(arr, .{}, buf.writer(allocator)) catch return error.ParseFailed;
-    return buf.toOwnedSlice(allocator);
+    return std.json.Stringify.valueAlloc(allocator, arr, .{}) catch error.ParseFailed;
 }
 
 /// Persist an order book snapshot to SQLite.

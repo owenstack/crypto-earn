@@ -4,6 +4,7 @@
  */
 import { Bot, Context } from "grammy";
 import type { IPCClient } from "../ipc/client";
+import type { Envelope, EventMessageType } from "../ipc/types";
 import type {
   StatusPayload,
   HeartbeatPayload,
@@ -48,6 +49,55 @@ function guard(handler: (ctx: Context) => Promise<void>) {
       await ctx.reply(`❌ Error: ${err instanceof Error ? err.message : String(err)}`);
     }
   };
+}
+
+// Phase 4: Event push notification support
+const DEDUP_MAX_SIZE = 500;
+const recentEventIds = new Set<string>();
+
+function dedup(eventId: string): boolean {
+  if (recentEventIds.has(eventId)) return true;
+  recentEventIds.add(eventId);
+  if (recentEventIds.size > DEDUP_MAX_SIZE) {
+    const first = recentEventIds.values().next().value;
+    if (first) recentEventIds.delete(first);
+  }
+  return false;
+}
+
+function escapeHtml(value: unknown): string {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function fmt(value: unknown, fallback = "unknown"): string {
+  if (value === undefined || value === null || value === "") return fallback;
+  return escapeHtml(value);
+}
+
+function formatEvent(env: Envelope): string | null {
+  const p = env.payload as Record<string, unknown>;
+  switch (env.type as EventMessageType) {
+    case "event.order.placed":
+      return `📝 <b>Order Placed</b>\n• ID: <code>${fmt(p.order_id)}</code>\n• Market: <code>${fmt(p.market_id)}</code>\n• Side: ${fmt(p.side)}\n• Size: ${fmt(p.size)} @ ${fmt(p.price)}`;
+    case "event.order.filled":
+      return `✅ <b>Order Filled</b>\n• ID: <code>${fmt(p.order_id)}</code>\n• Market: <code>${fmt(p.market_id)}</code>\n• Side: ${fmt(p.side)}\n• Size: ${fmt(p.size)} @ ${fmt(p.price)}`;
+    case "event.order.cancelled":
+      return `🗑️ <b>Order Cancelled</b>\n• ID: <code>${fmt(p.order_id)}</code>${p.market_id ? `\n• Market: <code>${fmt(p.market_id)}</code>` : ""}`;
+    case "event.order.rejected":
+      return `⚠️ <b>Order Rejected</b>\n• ID: <code>${fmt(p.order_id)}</code>\n• Market: <code>${fmt(p.market_id)}</code>\n• Reason: ${fmt(p.reason)}`;
+    case "event.risk.rejection":
+      return `🛡️ <b>Risk Rejection</b>\n• Order: <code>${fmt(p.order_id)}</code>\n• Market: <code>${fmt(p.market_id)}</code>\n• Check: ${fmt(p.check_name)}\n• Reason: ${fmt(p.reason)}`;
+    case "event.engine.halted":
+      return `🛑 <b>Engine HALTED</b>${p.cancelled_orders !== undefined ? `\n• Cancelled orders: ${fmt(p.cancelled_orders, "0")}` : ""}`;
+    case "event.engine.resumed":
+      return `✅ <b>Engine Resumed</b>`;
+    default:
+      return null;
+  }
 }
 
 export function createBot(ipc: IPCClient): Bot {
@@ -252,4 +302,27 @@ export function createBot(ipc: IPCClient): Bot {
   }));
 
   return bot;
+}
+
+/** Register event push notifications for the bot. Call after bot.start(). */
+export function registerEventPush(ipc: IPCClient, bot: InstanceType<typeof Bot>): void {
+  ipc.onEvent("*", async (env: Envelope) => {
+    if (dedup(env.id)) return;
+    const text = formatEvent(env);
+    if (!text) return;
+
+    const chatIds = Array.from(ALLOWED_IDS);
+    for (const chatId of chatIds) {
+      try {
+        await bot.api.sendMessage(chatId, text, { parse_mode: "HTML" });
+      } catch (err) {
+        console.error(JSON.stringify({
+          ts: Date.now(),
+          level: "WARN",
+          component: "telegram",
+          msg: `push notification failed for chat ${chatId}: ${err instanceof Error ? err.message : String(err)}`,
+        }));
+      }
+    }
+  });
 }

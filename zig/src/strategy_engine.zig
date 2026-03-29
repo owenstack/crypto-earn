@@ -103,8 +103,7 @@ pub const StrategyEngine = struct {
         external_prob: f64,
         market_mid: f64,
     ) ?Signal {
-        if (!self.isEnabled(.news_repricing)) return null;
-
+        // enable check should live at worker level
         const delta = @abs(external_prob - market_mid);
         if (delta < self.config.news_delta_threshold) return null;
 
@@ -151,8 +150,6 @@ pub const StrategyEngine = struct {
         best_bid: f64,
         best_ask: f64,
     ) LpResult {
-        if (!self.isEnabled(.liquidity_provision)) return .{ .signals = undefined, .count = 0 };
-
         const spread = best_ask - best_bid;
         if (spread < self.config.lp_min_spread) return .{ .signals = undefined, .count = 0 };
 

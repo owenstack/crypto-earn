@@ -51,6 +51,21 @@ pub const T = struct {
     pub const strategy_enable_response = "strategy.enable.response";
     pub const strategy_disable_response = "strategy.disable.response";
     pub const strategy_signal_event = "strategy.signal.event";
+
+    // Phase 4: Event subscription messages
+    pub const event_subscribe = "event.subscribe";
+    pub const event_subscribe_response = "event.subscribe.response";
+    pub const event_unsubscribe = "event.unsubscribe";
+    pub const event_unsubscribe_response = "event.unsubscribe.response";
+
+    // Phase 4: Push event types (server→client, no request id correlation)
+    pub const event_order_placed = "event.order.placed";
+    pub const event_order_filled = "event.order.filled";
+    pub const event_order_cancelled = "event.order.cancelled";
+    pub const event_order_rejected = "event.order.rejected";
+    pub const event_risk_rejection = "event.risk.rejection";
+    pub const event_engine_halted = "event.engine.halted";
+    pub const event_engine_resumed = "event.engine.resumed";
 };
 
 /// Write a complete JSON-lines response envelope to `writer`.
@@ -77,4 +92,23 @@ pub fn writeError(writer: anytype, req_id: []const u8, message: []const u8) !voi
         .{message},
     ) catch "{}";
     try writeResponse(writer, req_id, T.err_response, payload);
+}
+
+/// Write an event envelope (push, no request correlation).
+/// Uses a monotonic counter for event IDs.
+var event_counter = std.atomic.Value(u64).init(0);
+
+pub fn writeEvent(
+    writer: anytype,
+    event_type: []const u8,
+    payload_json: []const u8,
+) !void {
+    const event_seq = event_counter.fetchAdd(1, .monotonic) + 1;
+    var id_buf: [32]u8 = undefined;
+    const event_id = std.fmt.bufPrint(&id_buf, "evt-{d}", .{event_seq}) catch "evt-0";
+    const ts = std.time.milliTimestamp();
+    try writer.print(
+        "{{\"v\":{d},\"id\":\"{s}\",\"ts\":{d},\"type\":\"{s}\",\"payload\":{s}}}\n",
+        .{ VERSION, event_id, ts, event_type, payload_json },
+    );
 }

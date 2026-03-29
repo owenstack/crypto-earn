@@ -8,6 +8,83 @@ const order_mgr = @import("order_manager.zig");
 const portfolio = @import("portfolio_tracker.zig");
 const strategy = @import("strategy_engine.zig");
 
+const MAX_SUBSCRIBERS = 16;
+
+var subscribers: [MAX_SUBSCRIBERS]?std.net.Stream = .{null} ** MAX_SUBSCRIBERS;
+var subscriber_mutex: std.Thread.Mutex = .{};
+
+/// Register a client stream for event push delivery.
+fn addSubscriber(stream: std.net.Stream) bool {
+    subscriber_mutex.lock();
+    defer subscriber_mutex.unlock();
+    for (&subscribers) |*slot| {
+        if (slot.* == null) {
+            slot.* = stream;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Remove a client stream from event subscribers.
+fn removeSubscriber(stream: std.net.Stream) void {
+    subscriber_mutex.lock();
+    defer subscriber_mutex.unlock();
+    for (&subscribers) |*slot| {
+        if (slot.*) |s| {
+            if (s.handle == stream.handle) {
+                slot.* = null;
+                return;
+            }
+        }
+    }
+}
+
+/// Publish an event to all subscribers. Best-effort: write failures silently remove the subscriber.
+pub fn publishEvent(event_type: []const u8, payload_json: []const u8) void {
+    var active_streams: [MAX_SUBSCRIBERS]std.net.Stream = undefined;
+    var active_slots: [MAX_SUBSCRIBERS]usize = undefined;
+    var active_count: usize = 0;
+
+    subscriber_mutex.lock();
+    for (subscribers, 0..) |slot, slot_idx| {
+        if (slot) |stream| {
+            active_streams[active_count] = stream;
+            active_slots[active_count] = slot_idx;
+            active_count += 1;
+        }
+    }
+    subscriber_mutex.unlock();
+
+    for (active_streams[0..active_count], active_slots[0..active_count]) |stream, slot_idx| {
+        var buf: [8192]u8 = undefined;
+        var net_writer = stream.writer(&buf);
+        const writer = &net_writer.interface;
+
+        types.writeEvent(writer, event_type, payload_json) catch {
+            subscriber_mutex.lock();
+            if (subscribers[slot_idx]) |current| {
+                if (current.handle == stream.handle) {
+                    subscribers[slot_idx] = null;
+                }
+            }
+            subscriber_mutex.unlock();
+            continue;
+        };
+
+        writer.flush() catch {
+            subscriber_mutex.lock();
+            if (subscribers[slot_idx]) |current| {
+                if (current.handle == stream.handle) {
+                    subscribers[slot_idx] = null;
+                }
+            }
+            subscriber_mutex.unlock();
+            continue;
+        };
+    }
+}
+
 pub const Context = struct {
     allocator: std.mem.Allocator,
     database: *db.DB,
@@ -47,7 +124,10 @@ pub fn serve(allocator: std.mem.Allocator, socket_path: []const u8, database: *d
 }
 
 fn handleClient(conn: std.net.Server.Connection, ctx: *Context) void {
-    defer conn.stream.close();
+    defer {
+        removeSubscriber(conn.stream);
+        conn.stream.close();
+    }
 
     var reader_buf: [8192]u8 = undefined;
     var net_reader = conn.stream.reader(&reader_buf);
@@ -59,14 +139,14 @@ fn handleClient(conn: std.net.Server.Connection, ctx: *Context) void {
     while (true) {
         const line = reader.takeDelimiter('\n') catch break orelse break;
         if (line.len == 0) continue;
-        dispatch(ctx, line, writer) catch |e| {
+        dispatch(ctx, line, writer, conn.stream) catch |e| {
             log.warn("ipc", "dispatch error: {any}", .{e});
         };
         writer.flush() catch {};
     }
 }
 
-fn dispatch(ctx: *Context, line: []const u8, writer: anytype) !void {
+fn dispatch(ctx: *Context, line: []const u8, writer: anytype, stream: std.net.Stream) !void {
     const alloc = ctx.allocator;
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch {
@@ -255,14 +335,15 @@ fn dispatch(ctx: *Context, line: []const u8, writer: anytype) !void {
             const ns = se.getStats(.news_repricing);
             const ls = se.getStats(.liquidity_provision);
             var p: [1024]u8 = undefined;
-            const payload = std.fmt.bufPrint(&p,
+            const payload = std.fmt.bufPrint(
+                &p,
                 "{{\"strategies\":[" ++
-                "{{\"name\":\"news_repricing\",\"enabled\":{},\"stats\":{{\"signals_emitted\":{d},\"orders_accepted\":{d},\"orders_rejected\":{d},\"cancels\":{d}}}}}," ++
-                "{{\"name\":\"liquidity_provision\",\"enabled\":{},\"stats\":{{\"signals_emitted\":{d},\"orders_accepted\":{d},\"orders_rejected\":{d},\"cancels\":{d}}}}}" ++
-                "]}}",
+                    "{{\"name\":\"news_repricing\",\"enabled\":{},\"stats\":{{\"signals_emitted\":{d},\"orders_accepted\":{d},\"orders_rejected\":{d},\"cancels\":{d}}}}}," ++
+                    "{{\"name\":\"liquidity_provision\",\"enabled\":{},\"stats\":{{\"signals_emitted\":{d},\"orders_accepted\":{d},\"orders_rejected\":{d},\"cancels\":{d}}}}}" ++
+                    "]}}",
                 .{
                     news_enabled, ns.signals_emitted, ns.orders_accepted, ns.orders_rejected, ns.cancels,
-                    lp_enabled, ls.signals_emitted, ls.orders_accepted, ls.orders_rejected, ls.cancels,
+                    lp_enabled,   ls.signals_emitted, ls.orders_accepted, ls.orders_rejected, ls.cancels,
                 },
             ) catch "{}";
             try types.writeResponse(writer, req_id, types.T.strategy_list_response, payload);
@@ -331,6 +412,15 @@ fn dispatch(ctx: *Context, line: []const u8, writer: anytype) !void {
         } else {
             try types.writeError(writer, req_id, "strategy engine not available");
         }
+    } else if (std.mem.eql(u8, msg_type, types.T.event_subscribe)) {
+        if (addSubscriber(stream)) {
+            try types.writeResponse(writer, req_id, types.T.event_subscribe_response, "{\"status\":\"subscribed\"}");
+        } else {
+            try types.writeError(writer, req_id, "max subscribers reached");
+        }
+    } else if (std.mem.eql(u8, msg_type, types.T.event_unsubscribe)) {
+        removeSubscriber(stream);
+        try types.writeResponse(writer, req_id, types.T.event_unsubscribe_response, "{\"status\":\"unsubscribed\"}");
     } else {
         try types.writeError(writer, req_id, "unknown message type");
     }

@@ -1,6 +1,6 @@
 import { serve } from "bun";
 import { IPCClient } from "./ipc/client";
-import { createBot } from "./telegram/bot";
+import { createBot, registerEventPush } from "./telegram/bot";
 import { dashboardRoutes } from "./dashboard/server";
 import indexHtml from "./index.html";
 
@@ -12,8 +12,21 @@ ipc.connect(); // Connects in background with auto-reconnect
 if (Bun.env.TELEGRAM_BOT_TOKEN) {
   const bot = createBot(ipc);
   bot.start({
-    onStart: (botInfo) => {
+    onStart: async (botInfo) => {
       console.log(`🤖 Telegram bot started as @${botInfo.username}`);
+      // Subscribe to engine events for push notifications
+      try {
+        await ipc.subscribe();
+        try {
+          registerEventPush(ipc, bot);
+          console.log("📡 Event push notifications active");
+        } catch (pushErr) {
+          await ipc.unsubscribe();
+          throw pushErr;
+        }
+      } catch (err) {
+        console.warn(`⚠️ Event subscription failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
     },
   });
 } else {
@@ -40,8 +53,9 @@ const server = serve({
 console.log(`🚀 Control Plane running at ${server.url}`);
 
 // Handle graceful shutdown
-process.on("SIGINT", () => {
+process.on("SIGINT", async () => {
   console.log("Shutting down...");
+  try { await ipc.unsubscribe(); } catch { /* best effort */ }
   ipc.disconnect();
   server.stop();
   process.exit(0);

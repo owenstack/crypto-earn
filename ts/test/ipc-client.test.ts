@@ -269,6 +269,204 @@ describe("IPCClient", () => {
     });
   });
 
+  describe("Phase 4 event subscription", () => {
+    test("event.subscribe request gets response", async () => {
+      const client = new IPCClient({
+        socketPath: SOCK_PATH,
+        requestTimeoutMs: 3000,
+      });
+      await client.connect();
+
+      const res = await client.request("event.subscribe");
+      expect(res.v).toBe(1);
+      expect(res.type).toBe("event.subscribe.response");
+
+      client.disconnect();
+    });
+
+    test("event.unsubscribe request gets response", async () => {
+      const client = new IPCClient({
+        socketPath: SOCK_PATH,
+        requestTimeoutMs: 3000,
+      });
+      await client.connect();
+
+      const res = await client.request("event.unsubscribe");
+      expect(res.v).toBe(1);
+      expect(res.type).toBe("event.unsubscribe.response");
+
+      client.disconnect();
+    });
+
+    test("subscribe helper sets subscribed state", async () => {
+      // We need a server that replies with {"status":"subscribed"} for event.subscribe
+      const subSock = `/tmp/cex-test-sub-${Date.now()}.sock`;
+      const subServer = Bun.listen({
+        unix: subSock,
+        socket: {
+          data(socket, raw: Buffer) {
+            const text = raw.toString("utf8");
+            const lines = text.split("\n").filter(Boolean);
+            for (const line of lines) {
+              try {
+                const req = JSON.parse(line);
+                if (req.type === "event.subscribe") {
+                  socket.write(JSON.stringify({
+                    v: 1, id: req.id, ts: Date.now(),
+                    type: "event.subscribe.response",
+                    payload: { status: "subscribed" },
+                  }) + "\n");
+                } else if (req.type === "event.unsubscribe") {
+                  socket.write(JSON.stringify({
+                    v: 1, id: req.id, ts: Date.now(),
+                    type: "event.unsubscribe.response",
+                    payload: { status: "unsubscribed" },
+                  }) + "\n");
+                }
+              } catch {}
+            }
+          },
+          open() {},
+          close() {},
+          error() {},
+        },
+      });
+
+      try {
+        const client = new IPCClient({ socketPath: subSock, requestTimeoutMs: 3000 });
+        await client.connect();
+        await client.subscribe();
+        expect(client.subscribed).toBe(true);
+        await client.unsubscribe();
+        expect(client.subscribed).toBe(false);
+        client.disconnect();
+      } finally {
+        subServer.stop(true);
+        try { unlinkSync(subSock); } catch {}
+      }
+    });
+
+    test("onEvent receives pushed events", async () => {
+      const pushSock = `/tmp/cex-test-push-${Date.now()}.sock`;
+      let pushSocket: any = null;
+
+      const pushServer = Bun.listen({
+        unix: pushSock,
+        socket: {
+          data(socket, raw: Buffer) {
+            const text = raw.toString("utf8");
+            const lines = text.split("\n").filter(Boolean);
+            for (const line of lines) {
+              try {
+                const req = JSON.parse(line);
+                // Reply to subscribe
+                if (req.type === "event.subscribe") {
+                  socket.write(JSON.stringify({
+                    v: 1, id: req.id, ts: Date.now(),
+                    type: "event.subscribe.response",
+                    payload: { status: "subscribed" },
+                  }) + "\n");
+                  pushSocket = socket;
+                }
+              } catch {}
+            }
+          },
+          open() {},
+          close() {},
+          error() {},
+        },
+      });
+
+      try {
+        const client = new IPCClient({ socketPath: pushSock, requestTimeoutMs: 3000 });
+        await client.connect();
+        await client.subscribe();
+
+        const received: any[] = [];
+        client.onEvent("event.order.placed" as any, (env) => {
+          received.push(env);
+        });
+
+        // Push an event from server
+        if (pushSocket) {
+          pushSocket.write(JSON.stringify({
+            v: 1, id: "evt-1", ts: Date.now(),
+            type: "event.order.placed",
+            payload: { order_id: "o1", market_id: "m1", side: "buy", size: "10", price: "0.5" },
+          }) + "\n");
+        }
+
+        // Wait for event to arrive
+        await new Promise(resolve => setTimeout(resolve, 100));
+        expect(received.length).toBe(1);
+        expect(received[0].payload.order_id).toBe("o1");
+
+        client.disconnect();
+      } finally {
+        pushServer.stop(true);
+        try { unlinkSync(pushSock); } catch {}
+      }
+    });
+
+    test("wildcard onEvent receives all event types", async () => {
+      const wildSock = `/tmp/cex-test-wild-${Date.now()}.sock`;
+      let wildSocket: any = null;
+
+      const wildServer = Bun.listen({
+        unix: wildSock,
+        socket: {
+          data(socket, raw: Buffer) {
+            const text = raw.toString("utf8");
+            for (const line of text.split("\n").filter(Boolean)) {
+              try {
+                const req = JSON.parse(line);
+                if (req.type === "event.subscribe") {
+                  socket.write(JSON.stringify({
+                    v: 1, id: req.id, ts: Date.now(),
+                    type: "event.subscribe.response",
+                    payload: { status: "subscribed" },
+                  }) + "\n");
+                  wildSocket = socket;
+                }
+              } catch {}
+            }
+          },
+          open() {},
+          close() {},
+          error() {},
+        },
+      });
+
+      try {
+        const client = new IPCClient({ socketPath: wildSock, requestTimeoutMs: 3000 });
+        await client.connect();
+        await client.subscribe();
+
+        const received: any[] = [];
+        client.onEvent("*", (env) => {
+          received.push(env);
+        });
+
+        if (wildSocket) {
+          wildSocket.write(JSON.stringify({
+            v: 1, id: "evt-10", ts: Date.now(),
+            type: "event.engine.halted",
+            payload: { status: "halted", cancelled_orders: 3 },
+          }) + "\n");
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 100));
+        expect(received.length).toBe(1);
+        expect(received[0].type).toBe("event.engine.halted");
+
+        client.disconnect();
+      } finally {
+        wildServer.stop(true);
+        try { unlinkSync(wildSock); } catch {}
+      }
+    });
+  });
+
   describe("Phase 2 message types", () => {
     test("order.place request gets response", async () => {
       const client = new IPCClient({

@@ -21,6 +21,9 @@ const portfolio_tracker = @import("portfolio_tracker.zig");
 const strategy_engine = @import("strategy_engine.zig");
 const news_sources = @import("news_sources.zig");
 
+// Phase 4 modules
+const ipc = @import("ipc.zig");
+
 // ─── Logger tests ───────────────────────────────────────────────────────────
 
 test "logger: init sets start time and uptimeMs returns non-negative" {
@@ -1063,4 +1066,77 @@ test "news_sources: init and empty cache" {
 
     const est = nc.getEstimate("nonexistent");
     try testing.expect(est == null);
+}
+
+// ─── Phase 4: IPC event types and writeEvent ────────────────────────────────
+
+test "ipc_types: Phase 4 event type constants exist" {
+    try testing.expectEqualStrings("event.subscribe", ipc_types.T.event_subscribe);
+    try testing.expectEqualStrings("event.subscribe.response", ipc_types.T.event_subscribe_response);
+    try testing.expectEqualStrings("event.unsubscribe", ipc_types.T.event_unsubscribe);
+    try testing.expectEqualStrings("event.unsubscribe.response", ipc_types.T.event_unsubscribe_response);
+    try testing.expectEqualStrings("event.order.placed", ipc_types.T.event_order_placed);
+    try testing.expectEqualStrings("event.order.filled", ipc_types.T.event_order_filled);
+    try testing.expectEqualStrings("event.order.cancelled", ipc_types.T.event_order_cancelled);
+    try testing.expectEqualStrings("event.order.rejected", ipc_types.T.event_order_rejected);
+    try testing.expectEqualStrings("event.risk.rejection", ipc_types.T.event_risk_rejection);
+    try testing.expectEqualStrings("event.engine.halted", ipc_types.T.event_engine_halted);
+    try testing.expectEqualStrings("event.engine.resumed", ipc_types.T.event_engine_resumed);
+}
+
+test "ipc_types: writeEvent produces valid JSON-line with event id" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    const writer = buf.writer(testing.allocator);
+
+    try ipc_types.writeEvent(writer, "event.order.placed", "{\"order_id\":\"test-1\",\"market_id\":\"m1\"}");
+
+    const output = buf.items;
+    try testing.expect(output.len > 0);
+    try testing.expectEqual(@as(u8, '\n'), output[output.len - 1]);
+
+    const json_str = output[0 .. output.len - 1];
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json_str, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    try testing.expect(obj.get("v") != null);
+    try testing.expect(obj.get("id") != null);
+    try testing.expect(obj.get("ts") != null);
+    try testing.expect(obj.get("type") != null);
+    try testing.expect(obj.get("payload") != null);
+
+    // Event id should start with "evt-"
+    const id_str = obj.get("id").?.string;
+    try testing.expect(std.mem.startsWith(u8, id_str, "evt-"));
+
+    try testing.expectEqualStrings("event.order.placed", obj.get("type").?.string);
+    try testing.expect(obj.get("ts").?.integer > 0);
+
+    // Payload should have order_id
+    const pl = obj.get("payload").?.object;
+    try testing.expectEqualStrings("test-1", pl.get("order_id").?.string);
+}
+
+test "ipc_types: writeEvent generates sequential event ids" {
+    var buf1: std.ArrayList(u8) = .empty;
+    defer buf1.deinit(testing.allocator);
+    try ipc_types.writeEvent(buf1.writer(testing.allocator), "event.order.placed", "{}");
+
+    var buf2: std.ArrayList(u8) = .empty;
+    defer buf2.deinit(testing.allocator);
+    try ipc_types.writeEvent(buf2.writer(testing.allocator), "event.order.cancelled", "{}");
+
+    // Parse both and verify IDs are different
+    const json1 = buf1.items[0 .. buf1.items.len - 1];
+    const json2 = buf2.items[0 .. buf2.items.len - 1];
+
+    var p1 = try std.json.parseFromSlice(std.json.Value, testing.allocator, json1, .{});
+    defer p1.deinit();
+    var p2 = try std.json.parseFromSlice(std.json.Value, testing.allocator, json2, .{});
+    defer p2.deinit();
+
+    const id1 = p1.value.object.get("id").?.string;
+    const id2 = p2.value.object.get("id").?.string;
+    try testing.expect(!std.mem.eql(u8, id1, id2));
 }

@@ -60,3 +60,29 @@ describe("createBot", () => {
     }
   });
 });
+
+describe("Phase 4 event push notifications", () => {
+  test("registerEventPush is exported as a function", async () => {
+    const { registerEventPush } = await import(`../src/telegram/bot.ts?push_test=${Date.now()}`);
+    expect(registerEventPush).toBeDefined();
+    expect(typeof registerEventPush).toBe("function");
+  });
+
+  test("isAllowedChatId guards push delivery", async () => {
+    const original = Bun.env.TELEGRAM_ALLOWED_CHAT_IDS;
+    Bun.env.TELEGRAM_ALLOWED_CHAT_IDS = "111,222";
+
+    try {
+      const { isAllowedChatId } = await import(`../src/telegram/bot.ts?push_guard=${Date.now()}`);
+      expect(isAllowedChatId(111)).toBe(true);
+      expect(isAllowedChatId(222)).toBe(true);
+      expect(isAllowedChatId(999)).toBe(false);
+    } finally {
+      if (original) {
+        Bun.env.TELEGRAM_ALLOWED_CHAT_IDS = original;
+      } else {
+        delete Bun.env.TELEGRAM_ALLOWED_CHAT_IDS;
+      }
+    }
+  });
+});

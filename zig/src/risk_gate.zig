@@ -3,6 +3,8 @@
 const std = @import("std");
 const log = @import("logger.zig");
 const db = @import("db.zig");
+const ipc = @import("ipc.zig");
+const ipc_types = @import("ipc_types.zig");
 
 pub const RiskConfig = struct {
     max_position_usd: f64 = 500.0,
@@ -234,4 +236,27 @@ fn persistRejection(database: *db.DB, request: OrderRequest, rejection: Rejectio
     ) catch |e| {
         log.err("risk", "failed to persist risk rejection: {any}", .{e});
     };
+
+    // Publish risk rejection event
+    var evt_buf: [512]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&evt_buf);
+    const evt_payload_obj = .{
+        .order_id = request.client_order_id,
+        .market_id = request.market_id,
+        .side = request.side,
+        .check_name = rejection.check_name,
+        .reason = reason_name,
+        .limit_value = limit_str,
+        .actual_value = actual_str,
+    };
+    const evt_payload = std.json.Stringify.valueAlloc(fba.allocator(), evt_payload_obj, .{}) catch |e| {
+        log.err(
+            "risk",
+            "failed to serialize risk rejection event: err={s} order_id={s} market_id={s} side={s} check={s} reason={s}",
+            .{ @errorName(e), request.client_order_id, request.market_id, request.side, rejection.check_name, reason_name },
+        );
+        return;
+    };
+    defer fba.allocator().free(evt_payload);
+    ipc.publishEvent(ipc_types.T.event_risk_rejection, evt_payload);
 }

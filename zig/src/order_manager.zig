@@ -6,6 +6,8 @@ const db_mod = @import("db.zig");
 const http = @import("http_client.zig");
 const crypto = @import("crypto.zig");
 const risk = @import("risk_gate.zig");
+const ipc = @import("ipc.zig");
+const ipc_types = @import("ipc_types.zig");
 const c = db_mod.c;
 
 const CLOB_API_BASE = "https://clob.polymarket.com";
@@ -119,6 +121,19 @@ pub const OrderManager = struct {
             .reject => |rejection| {
                 const reason_name = risk.rejectionReasonName(rejection.reason);
                 log.warn("order_mgr", "risk gate rejected: {s}", .{reason_name});
+                // Publish risk rejection event
+                const rej_evt_payload = std.json.Stringify.valueAlloc(self.allocator, .{
+                    .order_id = client_order_id,
+                    .market_id = market_id,
+                    .side = side,
+                    .check_name = rejection.check_name,
+                    .reason = reason_name,
+                }, .{}) catch |e| {
+                    log.err("order_mgr", "failed to serialize risk rejection event: {s}", .{@errorName(e)});
+                    return .{ .rejected = .{ .reason = reason_name } };
+                };
+                defer self.allocator.free(rej_evt_payload);
+                ipc.publishEvent(ipc_types.T.event_risk_rejection, rej_evt_payload);
                 return .{ .rejected = .{ .reason = reason_name } };
             },
             .pass => {},
@@ -158,6 +173,24 @@ pub const OrderManager = struct {
         log.info("order_mgr", "order placed: {s} {s} {s}@{s} on {s}", .{
             order_type, side, size, price, market_id,
         });
+        // Publish order placed event
+        const evt_payload = std.json.Stringify.valueAlloc(self.allocator, .{
+            .order_id = client_order_id,
+            .market_id = market_id,
+            .side = side,
+            .size = size,
+            .price = price,
+            .order_type = order_type,
+        }, .{}) catch |e| {
+            log.err("order_mgr", "failed to serialize order placed event: {s}", .{@errorName(e)});
+            const order_id_owned = self.allocator.dupe(u8, client_order_id) catch {
+                log.err("order_mgr", "failed to allocate order_id result", .{});
+                return .{ .failed = .{ .reason = "oom" } };
+            };
+            return .{ .success = .{ .order_id = order_id_owned } };
+        };
+        defer self.allocator.free(evt_payload);
+        ipc.publishEvent(ipc_types.T.event_order_placed, evt_payload);
 
         const order_id_owned = self.allocator.dupe(u8, client_order_id) catch {
             log.err("order_mgr", "failed to allocate order_id result", .{});
@@ -181,6 +214,14 @@ pub const OrderManager = struct {
         };
 
         log.info("order_mgr", "order cancelled: {s}", .{order_id});
+        // Publish order cancelled event
+        var cancel_evt_buf: [256]u8 = undefined;
+        const cancel_evt_payload = std.fmt.bufPrint(
+            &cancel_evt_buf,
+            "{{\"order_id\":\"{s}\"}}",
+            .{order_id},
+        ) catch "{}";
+        ipc.publishEvent(ipc_types.T.event_order_cancelled, cancel_evt_payload);
         return true;
     }
 
@@ -331,6 +372,14 @@ pub const OrderManager = struct {
         self.halted.store(true, .seq_cst);
         const cancelled = self.cancelAll();
         log.info("order_mgr", "HALT: engine halted, all orders cancelled", .{});
+        // Publish engine halted event
+        var halt_evt_buf: [128]u8 = undefined;
+        const halt_evt_payload = std.fmt.bufPrint(
+            &halt_evt_buf,
+            "{{\"status\":\"halted\",\"cancelled_orders\":{d}}}",
+            .{cancelled},
+        ) catch "{}";
+        ipc.publishEvent(ipc_types.T.event_engine_halted, halt_evt_payload);
         return cancelled;
     }
 
@@ -338,6 +387,8 @@ pub const OrderManager = struct {
     pub fn @"resume"(self: *OrderManager) void {
         self.halted.store(false, .seq_cst);
         log.info("order_mgr", "RESUME: engine resumed", .{});
+        // Publish engine resumed event
+        ipc.publishEvent(ipc_types.T.event_engine_resumed, "{\"status\":\"resumed\"}");
     }
 
     /// Check if the engine is halted.
@@ -377,14 +428,11 @@ pub const OrderManager = struct {
             .client_order_id = client_order_id,
         };
 
-        var json_buf: std.ArrayList(u8) = .empty;
-        defer json_buf.deinit(self.allocator);
-
-        std.json.stringifyAlloc(self.allocator, order_payload, .{}) catch |e| {
+        const json_body = std.json.Stringify.valueAlloc(self.allocator, order_payload, .{}) catch |e| {
             log.err("order_mgr", "failed to stringify order JSON: {s}", .{@errorName(e)});
             return false;
         };
-        const json_body = json_buf.items;
+        defer self.allocator.free(json_body);
 
         const url = CLOB_API_BASE ++ "/order";
 

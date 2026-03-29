@@ -2,7 +2,7 @@
  * UNIX socket IPC client with line-buffered JSON framing,
  * reconnect/back-off, per-request timeout, and correlation tracking.
  */
-import type { Envelope, RequestMessageType, OrderPlaceResponsePayload, OrderCancelResponsePayload, OrderCancelAllResponsePayload, HaltResponsePayload, ResumeResponsePayload, StrategyListResponsePayload, StrategyEnableResponsePayload, StrategyDisableResponsePayload, StrategyEnableDisablePayload, StrategyName } from "./types";
+import type { Envelope, RequestMessageType, EventMessageType, OrderPlaceResponsePayload, OrderCancelResponsePayload, OrderCancelAllResponsePayload, HaltResponsePayload, ResumeResponsePayload, StrategyListResponsePayload, StrategyEnableResponsePayload, StrategyDisableResponsePayload, StrategyEnableDisablePayload, StrategyName, EventSubscribeResponsePayload, EventUnsubscribeResponsePayload } from "./types";
 import { makeRequest } from "./types";
 import type { OrderPlaceRequestPayload, OrderCancelPayload } from "./types";
 
@@ -16,6 +16,7 @@ export interface IPCClientOptions {
 
 type Resolver = (envelope: Envelope) => void;
 type Rejector  = (err: Error) => void;
+type EventHandler = (envelope: Envelope) => void;
 
 interface InitialConnectState {
   startedAt: number;
@@ -35,6 +36,9 @@ export class IPCClient {
   private lineBuffer = "";
   private reconnectDelay = 250;
   private _connected = false;
+  private eventHandlers = new Map<string, Set<EventHandler>>();
+  private _subscribed = false;
+  private _autoSubscribe = false;
 
   constructor(opts: IPCClientOptions = {}) {
     this.socketPath = opts.socketPath ?? Bun.env.IPC_SOCKET ?? "/tmp/cex-engine.sock";
@@ -94,6 +98,12 @@ export class IPCClient {
           onFirst?.();
           onFirst = undefined;
           onFirstErr = undefined;
+          // Auto-resubscribe to events on reconnect
+          if (self._autoSubscribe && !self._subscribed) {
+            self.subscribe().catch((err) => {
+              console.error(JSON.stringify({ ts: Date.now(), level: "WARN", component: "ipc", msg: `event resubscribe failed: ${err.message}` }));
+            });
+          }
         },
         data(_sock, raw: Buffer) {
           self.lineBuffer += raw.toString("utf8");
@@ -108,12 +118,16 @@ export class IPCClient {
                 clearTimeout(pending.timer);
                 self.pending.delete(env.id);
                 pending.resolve(env);
+              } else if (typeof env.type === "string" && env.type.startsWith("event.") && !env.type.endsWith(".response")) {
+                // Non-correlated event push — route to event handlers
+                self._dispatchEvent(env);
               }
             } catch { /* malformed – ignore */ }
           }
         },
         close() {
           self._connected = false;
+          self._subscribed = false;
           self.socket = null;
           // Reject all in-flight requests
           for (const [id, p] of self.pending) {
@@ -250,5 +264,58 @@ export class IPCClient {
       "strategy.disable",
       { name },
     );
+  }
+
+  /** Subscribe to event stream from Zig engine. */
+  async subscribe(): Promise<void> {
+    const res = await this.request<EventSubscribeResponsePayload>("event.subscribe");
+    if (res.payload.status === "subscribed") {
+      this._subscribed = true;
+      this._autoSubscribe = true;
+    } else {
+      throw new Error(`Subscription failed: ${res.payload.status}`);
+    }
+  }
+
+  /** Unsubscribe from event stream. */
+  async unsubscribe(): Promise<void> {
+    await this.request<EventUnsubscribeResponsePayload>("event.unsubscribe");
+    this._subscribed = false;
+    this._autoSubscribe = false;
+  }
+
+  /** Register a handler for a specific event type or '*' for all events. */
+  onEvent(eventType: EventMessageType | "*", handler: EventHandler): () => void {
+    if (!this.eventHandlers.has(eventType)) {
+      this.eventHandlers.set(eventType, new Set());
+    }
+    this.eventHandlers.get(eventType)!.add(handler);
+    return () => {
+      this.eventHandlers.get(eventType)?.delete(handler);
+    };
+  }
+
+  /** Remove all handlers for a specific event type. */
+  offEvent(eventType: EventMessageType | "*"): void {
+    this.eventHandlers.delete(eventType);
+  }
+
+  get subscribed() { return this._subscribed; }
+
+  private _dispatchEvent(env: Envelope): void {
+    // Dispatch to specific handlers
+    const specific = this.eventHandlers.get(env.type);
+    if (specific) {
+      for (const handler of specific) {
+        try { handler(env); } catch { /* swallow handler errors */ }
+      }
+    }
+    // Dispatch to wildcard handlers
+    const wildcard = this.eventHandlers.get("*");
+    if (wildcard) {
+      for (const handler of wildcard) {
+        try { handler(env); } catch { /* swallow handler errors */ }
+      }
+    }
   }
 }

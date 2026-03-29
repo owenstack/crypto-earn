@@ -18,7 +18,9 @@ export type RequestMessageType =
   | "resume"
   | "strategy.enable"
   | "strategy.disable"
-  | "strategy.list";
+  | "strategy.list"
+  | "event.subscribe"
+  | "event.unsubscribe";
 
 export type ResponseMessageType =
   | "heartbeat.response"
@@ -43,9 +45,21 @@ export type ResponseMessageType =
   | "strategy.enable.response"
   | "strategy.disable.response"
   | "strategy.list.response"
-  | "strategy.signal.event";
+  | "strategy.signal.event"
+  | "event.subscribe.response"
+  | "event.unsubscribe.response";
 
-export type MessageType = RequestMessageType | ResponseMessageType;
+export type EventMessageType =
+  | "event.order.placed"
+  | "event.order.filled"
+  | "event.order.partially_filled"
+  | "event.order.cancelled"
+  | "event.order.rejected"
+  | "event.risk.rejection"
+  | "event.engine.halted"
+  | "event.engine.resumed";
+
+export type MessageType = RequestMessageType | ResponseMessageType | EventMessageType;
 
 export interface Envelope<P = unknown> {
   v: typeof IPC_VERSION;
@@ -250,6 +264,48 @@ export interface StrategySignalEventPayload {
   price: number;
   size: number;
   confidence: number;
+}
+
+// Phase 4: Event subscription payloads
+export interface EventSubscribeResponsePayload {
+  status: "subscribed";
+}
+
+export interface EventUnsubscribeResponsePayload {
+  status: "unsubscribed";
+}
+
+export interface EventEnvelope<P = unknown> {
+  v: typeof IPC_VERSION;
+  id: string;       // server-generated event id (evt-NNN)
+  ts: number;
+  type: EventMessageType;
+  payload: P;
+}
+
+export interface OrderEventPushPayload {
+  order_id: string;
+  market_id: string;
+  side: string;
+  size: string;
+  price: string;
+  order_type?: string;
+  reason?: string;
+}
+
+export interface RiskRejectionEventPayload {
+  order_id: string;
+  market_id: string;
+  side: string;
+  check_name: string;
+  reason: string;
+  limit_value: string;
+  actual_value: string;
+}
+
+export interface EngineStateEventPayload {
+  status: "halted" | "resumed";
+  cancelled_orders?: number;
 }
 
 /** Build a request envelope with a random correlation ID. */
