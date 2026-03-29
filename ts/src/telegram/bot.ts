@@ -16,6 +16,7 @@ import type {
   OrderCancelAllResponsePayload,
   OrderPlaceRequestPayload,
   OrderCancelPayload,
+  StrategyListResponsePayload,
 } from "../ipc/types";
 
 const ALLOWED_IDS = new Set(
@@ -64,6 +65,7 @@ export function createBot(ipc: IPCClient): Bot {
       "/config — current config\n" +
       "/trade — place an order\n" +
       "/cancel — cancel an order\n" +
+      "/strategy — manage strategies\n" +
       "/halt — emergency stop\n" +
       "/resume — resume trading",
       { parse_mode: "Markdown" }
@@ -186,6 +188,49 @@ export function createBot(ipc: IPCClient): Bot {
       }
       const res = await ipc.request<OrderCancelPayload, OrderCancelResponsePayload>("order.cancel", { order_id });
       await ctx.reply(`🗑️ Order ${res.payload.order_id}: ${res.payload.status}`);
+    }
+  }));
+
+  bot.command("strategy", guard(async ctx => {
+    if (!ipc.connected) { await ctx.reply("🔴 Engine IPC offline."); return; }
+    const args = ctx.message?.text?.split(" ").slice(1) ?? [];
+    const subcommand = (args[0] ?? "").trim().toLowerCase();
+
+    if (subcommand === "list" || subcommand === "") {
+      const res = await ipc.strategyList();
+      const strategies = res.payload.strategies;
+      if (!strategies.length) {
+        await ctx.reply("📭 No strategies configured.");
+        return;
+      }
+      const lines = strategies.map(s =>
+        `• ${s.name}: ${s.enabled ? "✅ enabled" : "⏸️ disabled"}\n` +
+        `  signals=${s.stats.signals_emitted} accepted=${s.stats.orders_accepted} rejected=${s.stats.orders_rejected}`
+      );
+      await ctx.reply(`📊 Strategies\n\n${lines.join("\n")}`);
+    } else if (subcommand === "enable") {
+      const name = (args[1] ?? "").trim();
+      if (name !== "news_repricing" && name !== "liquidity_provision") {
+        await ctx.reply("Usage: /strategy enable <news_repricing|liquidity_provision>");
+        return;
+      }
+      const res = await ipc.strategyEnable(name);
+      await ctx.reply(`✅ Strategy \`${res.payload.name}\` enabled.`, { parse_mode: "Markdown" });
+    } else if (subcommand === "disable") {
+      const name = (args[1] ?? "").trim();
+      if (name !== "news_repricing" && name !== "liquidity_provision") {
+        await ctx.reply("Usage: /strategy disable <news_repricing|liquidity_provision>");
+        return;
+      }
+      const res = await ipc.strategyDisable(name);
+      await ctx.reply(`⏸️ Strategy \`${res.payload.name}\` disabled.`, { parse_mode: "Markdown" });
+    } else {
+      await ctx.reply(
+        "Usage:\n" +
+        "/strategy list — show all strategies\n" +
+        "/strategy enable <name> — enable a strategy\n" +
+        "/strategy disable <name> — disable a strategy"
+      );
     }
   }));
 

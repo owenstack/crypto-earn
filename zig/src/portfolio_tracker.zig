@@ -289,26 +289,31 @@ pub const PortfolioTracker = struct {
         const writer = fbs.writer();
         const snap = self.getSnapshot();
 
-        try writer.print("{{\"positions\":[", .{});
+        try writer.writeAll("{\"positions\":[");
         for (snap.positions, 0..) |pos, i| {
             if (i > 0) try writer.writeAll(",");
-            try writer.writeAll("{\"market_id\":\"");
-            try writeJsonEscapedString(writer, pos.market_id[0..pos.market_id_len]);
-            try writer.writeAll("\",\"side\":\"");
-            try writeJsonEscapedString(writer, pos.side[0..pos.side_len]);
-            try writer.print("\",\"size\":{d:.6},\"entry_price\":{d:.6},\"current_price\":{d:.6},\"unrealized_pnl\":{d:.6}}", .{
+            var num_buf: [128]u8 = undefined;
+            const num_str = std.fmt.bufPrint(&num_buf, "\",\"size\":{d:.6},\"entry_price\":{d:.6},\"current_price\":{d:.6},\"unrealized_pnl\":{d:.6}}}", .{
                 pos.size,
                 pos.entry_price,
                 pos.current_price,
                 pos.unrealized_pnl,
-            });
+            }) catch return error.Overflow;
+
+            try writer.writeAll("{\"market_id\":\"");
+            try writeJsonEscapedString(writer, pos.market_id[0..pos.market_id_len]);
+            try writer.writeAll("\",\"side\":\"");
+            try writeJsonEscapedString(writer, pos.side[0..pos.side_len]);
+            try writer.writeAll(num_str);
         }
-        try writer.print("],\"total_exposure_usd\":{d:.2},\"unrealized_pnl\":{d:.2},\"realized_pnl_today\":{d:.2},\"usdc_balance\":{d:.2}}}", .{
+        var summary_buf: [256]u8 = undefined;
+        const summary = std.fmt.bufPrint(&summary_buf, "],\"total_exposure_usd\":{d:.2},\"unrealized_pnl\":{d:.2},\"realized_pnl_today\":{d:.2},\"usdc_balance\":{d:.2}}}", .{
             snap.total_exposure_usd,
             snap.unrealized_pnl,
             snap.realized_pnl_today,
             snap.usdc_balance,
-        });
+        }) catch return error.Overflow;
+        try writer.writeAll(summary);
 
         return fbs.getWritten();
     }
@@ -332,8 +337,8 @@ pub const PortfolioTracker = struct {
 
         try writer.writeAll("{\"orders\":[");
         var i: usize = 0;
+        var skipped_orders: usize = 0;
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-            if (i > 0) try writer.writeAll(",");
             const id_raw = c.sqlite3_column_text(stmt, 0);
             const id: [*c]const u8 = @ptrCast(id_raw orelse @as([*c]const u8, ""));
             const mid_raw = c.sqlite3_column_text(stmt, 1);
@@ -350,22 +355,22 @@ pub const PortfolioTracker = struct {
             const status: [*c]const u8 = @ptrCast(status_raw orelse @as([*c]const u8, ""));
             const created = c.sqlite3_column_int64(stmt, 7);
 
-            try writer.writeAll("{\"id\":\"");
-            try writeJsonEscapedString(writer, std.mem.span(id));
-            try writer.writeAll("\",\"market_id\":\"");
-            try writeJsonEscapedString(writer, std.mem.span(mid));
-            try writer.writeAll("\",\"side\":\"");
-            try writeJsonEscapedString(writer, std.mem.span(side));
-            try writer.writeAll("\",\"size\":\"");
-            try writeJsonEscapedString(writer, std.mem.span(size));
-            try writer.writeAll("\",\"price\":\"");
-            try writeJsonEscapedString(writer, std.mem.span(price_col));
-            try writer.writeAll("\",\"order_type\":\"");
-            try writeJsonEscapedString(writer, std.mem.span(otype));
-            try writer.writeAll("\",\"status\":\"");
-            try writeJsonEscapedString(writer, std.mem.span(status));
-            try writer.print("\",\"created_at\":{d}}", .{created});
+            var order_buf: [1024]u8 = undefined;
+            var order_fbs = std.io.fixedBufferStream(&order_buf);
+            const order_writer = order_fbs.writer();
+
+            writeOrderJsonObject(order_writer, std.mem.span(id), std.mem.span(mid), std.mem.span(side), std.mem.span(size), std.mem.span(price_col), std.mem.span(otype), std.mem.span(status), created) catch |e| {
+                skipped_orders += 1;
+                log.err("portfolio", "skipping order during JSON serialization: id={s} err={s}", .{ std.mem.span(id), @errorName(e) });
+                continue;
+            };
+
+            if (i > 0) try writer.writeAll(",");
+            try writer.writeAll(order_fbs.getWritten());
             i += 1;
+        }
+        if (skipped_orders > 0) {
+            log.warn("portfolio", "writeOrdersJson skipped {d} orders due to serialization errors", .{skipped_orders});
         }
         try writer.writeAll("]}");
         return fbs.getWritten();
@@ -403,4 +408,35 @@ fn writeJsonEscapedString(writer: anytype, s: []const u8) !void {
             },
         }
     }
+}
+
+fn writeOrderJsonObject(
+    writer: anytype,
+    id: []const u8,
+    market_id: []const u8,
+    side: []const u8,
+    size: []const u8,
+    price: []const u8,
+    order_type: []const u8,
+    status: []const u8,
+    created_at: i64,
+) !void {
+    try writer.writeAll("{\"id\":\"");
+    try writeJsonEscapedString(writer, id);
+    try writer.writeAll("\",\"market_id\":\"");
+    try writeJsonEscapedString(writer, market_id);
+    try writer.writeAll("\",\"side\":\"");
+    try writeJsonEscapedString(writer, side);
+    try writer.writeAll("\",\"size\":\"");
+    try writeJsonEscapedString(writer, size);
+    try writer.writeAll("\",\"price\":\"");
+    try writeJsonEscapedString(writer, price);
+    try writer.writeAll("\",\"order_type\":\"");
+    try writeJsonEscapedString(writer, order_type);
+    try writer.writeAll("\",\"status\":\"");
+    try writeJsonEscapedString(writer, status);
+
+    var ca_buf: [32]u8 = undefined;
+    const ca_str = try std.fmt.bufPrint(&ca_buf, "\",\"created_at\":{d}}}", .{created_at});
+    try writer.writeAll(ca_str);
 }

@@ -88,6 +88,7 @@ pub const OrderManager = struct {
         size: []const u8,
         price: []const u8,
         order_type: []const u8,
+        strategy_origin: ?[]const u8,
     ) OrderResult {
         // Block if halted
         if (self.halted.load(.seq_cst)) {
@@ -123,6 +124,10 @@ pub const OrderManager = struct {
             .pass => {},
         }
 
+        if (strategy_origin) |so| {
+            log.info("order_mgr", "order from strategy: {s}", .{so});
+        }
+
         // Persist order as pending
         self.database.insertOrder(
             client_order_id,
@@ -132,6 +137,7 @@ pub const OrderManager = struct {
             side,
             size,
             price,
+            strategy_origin,
         ) catch |e| {
             log.err("order_mgr", "failed to persist order: {any}", .{e});
             return .{ .failed = .{ .reason = "db_error" } };
@@ -199,10 +205,10 @@ pub const OrderManager = struct {
         }
         defer _ = c.sqlite3_finalize(stmt);
 
-        var order_ids = std.ArrayList([]u8).init(self.allocator);
+        var order_ids: std.ArrayList([]u8) = .empty;
         defer {
             for (order_ids.items) |id| self.allocator.free(id);
-            order_ids.deinit();
+            order_ids.deinit(self.allocator);
         }
 
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
@@ -215,7 +221,7 @@ pub const OrderManager = struct {
                 log.err("order_mgr", "cancelAll failed to allocate order id copy", .{});
                 continue;
             };
-            order_ids.append(owned_id) catch {
+            order_ids.append(self.allocator, owned_id) catch {
                 self.allocator.free(owned_id);
                 log.err("order_mgr", "cancelAll failed to append order id", .{});
                 continue;
@@ -234,10 +240,11 @@ pub const OrderManager = struct {
                 continue;
             };
 
-            const update_sql = std.fmt.allocPrintZ(
+            const update_sql = std.fmt.allocPrintSentinel(
                 self.allocator,
                 "UPDATE orders SET status='cancelled', updated_at=unixepoch() WHERE id='{s}';",
                 .{escaped_order_id},
+                0,
             ) catch {
                 self.allocator.free(escaped_order_id);
                 log.err("order_mgr", "cancelAll failed to build UPDATE for order {s}", .{order_id});
@@ -297,10 +304,11 @@ pub const OrderManager = struct {
             };
             defer self.allocator.free(escaped_order_id);
 
-            const update_sql = std.fmt.allocPrintZ(
+            const update_sql = std.fmt.allocPrintSentinel(
                 self.allocator,
                 "UPDATE orders SET status='cancelled', updated_at=unixepoch() WHERE id='{s}';",
                 .{escaped_order_id},
+                0,
             ) catch {
                 log.err("order_mgr", "failed to build stale-order update SQL: {s}", .{order_id});
                 continue;
@@ -352,21 +360,31 @@ pub const OrderManager = struct {
         var client = http.HttpClient.init(self.allocator);
         defer client.deinit();
 
-        // Build order JSON payload
-        var json_buf: [1024]u8 = undefined;
-        var json_fbs = std.io.fixedBufferStream(&json_buf);
-        std.json.stringify(.{
+        // Build order JSON payload with proper escaping.
+        const order_payload = struct {
+            market: []const u8,
+            side: []const u8,
+            size: []const u8,
+            price: []const u8,
+            type: []const u8,
+            client_order_id: []const u8,
+        }{
             .market = market_id,
             .side = side,
             .size = size,
             .price = price,
             .type = order_type,
             .client_order_id = client_order_id,
-        }, .{}, json_fbs.writer()) catch |e| {
-            log.err("order_mgr", "failed to serialize order JSON: {s}", .{@errorName(e)});
+        };
+
+        var json_buf: std.ArrayList(u8) = .empty;
+        defer json_buf.deinit(self.allocator);
+
+        std.json.stringifyAlloc(self.allocator, order_payload, .{}) catch |e| {
+            log.err("order_mgr", "failed to stringify order JSON: {s}", .{@errorName(e)});
             return false;
         };
-        const json_body = json_fbs.getWritten();
+        const json_body = json_buf.items;
 
         const url = CLOB_API_BASE ++ "/order";
 
@@ -546,17 +564,17 @@ fn bytesToHex(bytes: []const u8, buf: []u8) []const u8 {
 }
 
 fn escapeSqlLiteral(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var out = std.ArrayList(u8).init(allocator);
-    defer out.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
 
     for (input) |ch| {
         if (ch == '\'') {
-            try out.append('\'');
-            try out.append('\'');
+            try out.append(allocator, '\'');
+            try out.append(allocator, '\'');
         } else {
-            try out.append(ch);
+            try out.append(allocator, ch);
         }
     }
 
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }

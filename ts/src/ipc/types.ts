@@ -15,7 +15,10 @@ export type RequestMessageType =
   | "order.cancel"
   | "order.cancel_all"
   | "halt"
-  | "resume";
+  | "resume"
+  | "strategy.enable"
+  | "strategy.disable"
+  | "strategy.list";
 
 export type ResponseMessageType =
   | "heartbeat.response"
@@ -36,7 +39,11 @@ export type ResponseMessageType =
   | "order.cancel.response"
   | "order.cancel_all.response"
   | "halt.response"
-  | "resume.response";
+  | "resume.response"
+  | "strategy.enable.response"
+  | "strategy.disable.response"
+  | "strategy.list.response"
+  | "strategy.signal.event";
 
 export type MessageType = RequestMessageType | ResponseMessageType;
 
@@ -199,6 +206,50 @@ export interface HaltResponsePayload {
 
 export interface ResumeResponsePayload {
   status: "resumed";
+}
+
+// Phase 3: Strategy payloads
+export type StrategyName = "news_repricing" | "liquidity_provision";
+
+export interface StrategyEnableDisablePayload {
+  name: StrategyName;
+}
+
+export interface StrategyEnableResponsePayload {
+  name: string;
+  enabled: true;
+}
+
+export interface StrategyDisableResponsePayload {
+  name: string;
+  enabled: false;
+}
+
+export interface StrategyStatsInfo {
+  signals_emitted: number;
+  orders_accepted: number;
+  orders_rejected: number;
+  cancels: number;
+  realized_pnl_estimate: number;
+}
+
+export interface StrategyInfo {
+  name: string;
+  enabled: boolean;
+  stats: StrategyStatsInfo;
+}
+
+export interface StrategyListResponsePayload {
+  strategies: StrategyInfo[];
+}
+
+export interface StrategySignalEventPayload {
+  strategy: string;
+  market_id: string;
+  direction: "buy" | "sell";
+  price: number;
+  size: number;
+  confidence: number;
 }
 
 /** Build a request envelope with a random correlation ID. */

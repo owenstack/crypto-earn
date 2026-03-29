@@ -31,6 +31,13 @@ const MIGRATION_002 =
     \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(2);
 ;
 
+/// Embedded Phase-3 migration (strategy engine tables).
+const MIGRATION_003 =
+    \\CREATE TABLE IF NOT EXISTS strategy_stats(id INTEGER PRIMARY KEY AUTOINCREMENT,strategy TEXT NOT NULL,signals_emitted INTEGER NOT NULL DEFAULT 0,orders_accepted INTEGER NOT NULL DEFAULT 0,orders_rejected INTEGER NOT NULL DEFAULT 0,cancels INTEGER NOT NULL DEFAULT 0,realized_pnl_estimate REAL NOT NULL DEFAULT 0.0,snapshot_at INTEGER NOT NULL DEFAULT(unixepoch()));
+    \\CREATE INDEX IF NOT EXISTS idx_strategy_stats_at ON strategy_stats(snapshot_at DESC);
+    \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(3);
+;
+
 pub const DB = struct {
     handle: *c.sqlite3,
 
@@ -80,6 +87,24 @@ pub const DB = struct {
             log.info("db", "applying migration 002", .{});
             try self.execZ(MIGRATION_002 ++ &[_:0]u8{});
         }
+
+        // Check if migration 003 has been applied.
+        if (!self.migrationApplied(3)) {
+            log.info("db", "applying migration 003", .{});
+            // Ignore only the duplicate-column case; surface all other ALTER failures.
+            self.execZ("ALTER TABLE orders ADD COLUMN strategy_origin TEXT DEFAULT NULL;" ++ &[_:0]u8{}) catch |err| {
+                const sqlite_err = std.mem.span(c.sqlite3_errmsg(self.handle));
+                const duplicate_col = std.mem.indexOf(u8, sqlite_err, "duplicate column name: strategy_origin") != null;
+
+                if (err == error.DBExecFailed and duplicate_col) {
+                    log.info("db", "orders.strategy_origin already exists; skipping ALTER TABLE", .{});
+                } else {
+                    log.err("db", "migration 003 ALTER TABLE failed: zig_err={s} sqlite_err={s}", .{ @errorName(err), sqlite_err });
+                    return err;
+                }
+            };
+            try self.execZ(MIGRATION_003 ++ &[_:0]u8{});
+        }
         log.info("db", "migrations complete", .{});
     }
 
@@ -110,8 +135,8 @@ pub const DB = struct {
         return step_rc == c.SQLITE_ROW;
     }
 
-    pub fn insertOrder(self: DB, id: []const u8, market_id: []const u8, client_order_id: []const u8, order_type: []const u8, side: []const u8, size: []const u8, price: []const u8) !void {
-        const sql = "INSERT INTO orders(id,market_id,client_order_id,type,side,size,price) VALUES(?,?,?,?,?,?,?);" ++ &[_:0]u8{};
+    pub fn insertOrder(self: DB, id: []const u8, market_id: []const u8, client_order_id: []const u8, order_type: []const u8, side: []const u8, size: []const u8, price: []const u8, strategy_origin: ?[]const u8) !void {
+        const sql = "INSERT INTO orders(id,market_id,client_order_id,type,side,size,price,strategy_origin) VALUES(?,?,?,?,?,?,?,?);" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
             log.err("db", "failed to prepare insertOrder", .{});
@@ -129,6 +154,18 @@ pub const DB = struct {
         {
             log.err("db", "failed to bind insertOrder parameters", .{});
             return error.DBExecFailed;
+        }
+
+        if (strategy_origin) |so| {
+            if (c.sqlite3_bind_text(stmt, 8, so.ptr, @intCast(so.len), null) != c.SQLITE_OK) {
+                log.err("db", "failed to bind insertOrder strategy_origin", .{});
+                return error.DBExecFailed;
+            }
+        } else {
+            if (c.sqlite3_bind_null(stmt, 8) != c.SQLITE_OK) {
+                log.err("db", "failed to bind insertOrder strategy_origin null", .{});
+                return error.DBExecFailed;
+            }
         }
 
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
@@ -279,6 +316,153 @@ pub const DB = struct {
             return error.DBExecFailed;
         }
         return c.sqlite3_column_double(stmt, 0);
+    }
+
+    pub fn insertStrategySignal(self: DB, market_id: []const u8, signal_type: []const u8, strength: f64, metadata: []const u8) !void {
+        const sql = "INSERT INTO strategy_signals(id,market_id,signal_type,strength,metadata) VALUES(hex(randomblob(16)),?,?,?,?);" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare insertStrategySignal", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 2, signal_type.ptr, @intCast(signal_type.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 3, strength) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 4, metadata.ptr, @intCast(metadata.len), null) != c.SQLITE_OK)
+        {
+            log.err("db", "failed to bind insertStrategySignal parameters", .{});
+            return error.DBExecFailed;
+        }
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
+            log.err("db", "failed to execute insertStrategySignal", .{});
+            return error.DBExecFailed;
+        }
+    }
+
+    pub const StrategyStatsRow = struct {
+        signals_emitted: i64,
+        orders_accepted: i64,
+        orders_rejected: i64,
+        cancels: i64,
+        realized_pnl_estimate: f64,
+        snapshot_at: i64,
+    };
+
+    pub fn queryStrategyStats(self: DB, strategy_name: []const u8) !?StrategyStatsRow {
+        const sql = "SELECT signals_emitted,orders_accepted,orders_rejected,cancels,realized_pnl_estimate,snapshot_at FROM strategy_stats WHERE strategy=? ORDER BY snapshot_at DESC LIMIT 1;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare queryStrategyStats", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, strategy_name.ptr, @intCast(strategy_name.len), null) != c.SQLITE_OK) {
+            log.err("db", "failed to bind queryStrategyStats parameters", .{});
+            return error.DBExecFailed;
+        }
+
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) {
+            const err_code = c.sqlite3_errcode(self.handle);
+            const err_msg = c.sqlite3_errmsg(self.handle);
+            log.err("db", "queryStrategyStats step failed: rc={d} err_code={d} err={s}", .{ rc, err_code, err_msg });
+            return error.DBExecFailed;
+        }
+
+        return StrategyStatsRow{
+            .signals_emitted = c.sqlite3_column_int64(stmt, 0),
+            .orders_accepted = c.sqlite3_column_int64(stmt, 1),
+            .orders_rejected = c.sqlite3_column_int64(stmt, 2),
+            .cancels = c.sqlite3_column_int64(stmt, 3),
+            .realized_pnl_estimate = c.sqlite3_column_double(stmt, 4),
+            .snapshot_at = c.sqlite3_column_int64(stmt, 5),
+        };
+    }
+
+    pub const SignalRow = struct {
+        id_buf: [64]u8,
+        id_len: usize,
+        market_id_buf: [64]u8,
+        market_id_len: usize,
+        strength: f64,
+        created_at: i64,
+    };
+
+    pub fn queryRecentSignalsByStrategy(self: DB, strategy_name: []const u8, limit: u32, out: []SignalRow) !usize {
+        const sql = "SELECT id,market_id,strength,created_at FROM strategy_signals WHERE signal_type=? ORDER BY created_at DESC LIMIT ?;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare queryRecentSignalsByStrategy", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, strategy_name.ptr, @intCast(strategy_name.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_int(stmt, 2, @intCast(limit)) != c.SQLITE_OK)
+        {
+            log.err("db", "failed to bind queryRecentSignalsByStrategy parameters", .{});
+            return error.DBExecFailed;
+        }
+
+        var count: usize = 0;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            if (count >= out.len) break;
+            var row: SignalRow = .{
+                .id_buf = undefined,
+                .id_len = 0,
+                .market_id_buf = undefined,
+                .market_id_len = 0,
+                .strength = c.sqlite3_column_double(stmt, 2),
+                .created_at = c.sqlite3_column_int64(stmt, 3),
+            };
+
+            const id_ptr = c.sqlite3_column_text(stmt, 0);
+            const id_span = if (id_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+            const id_len = @min(id_span.len, 64);
+            @memcpy(row.id_buf[0..id_len], id_span[0..id_len]);
+            row.id_len = id_len;
+
+            const mid_ptr = c.sqlite3_column_text(stmt, 1);
+            const mid_span = if (mid_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+            const mid_len = @min(mid_span.len, 64);
+            @memcpy(row.market_id_buf[0..mid_len], mid_span[0..mid_len]);
+            row.market_id_len = mid_len;
+
+            out[count] = row;
+            count += 1;
+        }
+        return count;
+    }
+
+    pub fn insertStrategyStats(self: DB, strategy: []const u8, signals: u64, accepted: u64, rejected: u64, cancels: u64, pnl: f64) !void {
+        const sql = "INSERT INTO strategy_stats(strategy,signals_emitted,orders_accepted,orders_rejected,cancels,realized_pnl_estimate) VALUES(?,?,?,?,?,?);" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare insertStrategyStats", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, strategy.ptr, @intCast(strategy.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_int64(stmt, 2, @intCast(signals)) != c.SQLITE_OK or
+            c.sqlite3_bind_int64(stmt, 3, @intCast(accepted)) != c.SQLITE_OK or
+            c.sqlite3_bind_int64(stmt, 4, @intCast(rejected)) != c.SQLITE_OK or
+            c.sqlite3_bind_int64(stmt, 5, @intCast(cancels)) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 6, pnl) != c.SQLITE_OK)
+        {
+            log.err("db", "failed to bind insertStrategyStats parameters", .{});
+            return error.DBExecFailed;
+        }
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
+            log.err("db", "failed to execute insertStrategyStats", .{});
+            return error.DBExecFailed;
+        }
     }
 
     /// Return journal_mode as a stack-allocated slice (for health check).

@@ -30,6 +30,7 @@ pub const WebSocketClient = struct {
     reconnect_delay_ms: u64,
     max_reconnect_delay_ms: u64,
     callback: ?PriceCallback,
+    should_stop: std.atomic.Value(bool),
 
     const INITIAL_RECONNECT_MS: u64 = 250;
     const MAX_RECONNECT_MS: u64 = 30_000;
@@ -42,7 +43,13 @@ pub const WebSocketClient = struct {
             .reconnect_delay_ms = INITIAL_RECONNECT_MS,
             .max_reconnect_delay_ms = MAX_RECONNECT_MS,
             .callback = null,
+            .should_stop = std.atomic.Value(bool).init(false),
         };
+    }
+
+    /// Request the poll/connect loop to stop.
+    pub fn stop(self: *WebSocketClient) void {
+        self.should_stop.store(true, .seq_cst);
     }
 
     pub fn deinit(self: *WebSocketClient) void {
@@ -80,7 +87,7 @@ pub const WebSocketClient = struct {
     /// On disconnect, reconnects with exponential backoff (250ms -> 30s).
     /// This should be called from a dedicated thread.
     pub fn connectAndRun(self: *WebSocketClient) void {
-        while (true) {
+        while (!self.should_stop.load(.seq_cst)) {
             self.state = .connecting;
             log.info("ws", "connecting to CLOB WebSocket...", .{});
 
@@ -88,11 +95,14 @@ pub const WebSocketClient = struct {
                 log.err("ws", "connection error: {}", .{e});
             };
 
+            if (self.should_stop.load(.seq_cst)) break;
+
             self.state = .disconnected;
             log.warn("ws", "disconnected, reconnecting in {d}ms", .{self.reconnect_delay_ms});
             std.Thread.sleep(self.reconnect_delay_ms * std.time.ns_per_ms);
             self.reconnect_delay_ms = @min(self.reconnect_delay_ms * 2, self.max_reconnect_delay_ms);
         }
+        self.state = .disconnected;
     }
 
     fn runConnection(self: *WebSocketClient) !void {
@@ -115,6 +125,52 @@ pub const WebSocketClient = struct {
         _ = client;
         _ = uri;
         return error.NotImplemented;
+    }
+
+    /// Poll-based fallback: fetch orderbook snapshots via REST and invoke callback.
+    /// This is used until native WebSocket support is added.
+    /// Blocks — call from a dedicated thread.
+    pub fn pollAndNotify(self: *WebSocketClient, poll_interval_ms: u64) void {
+        const http_mod = @import("http_client.zig");
+        const clob = @import("clob_orderbook.zig");
+
+        self.state = .connected;
+        log.info("ws", "starting REST poll fallback ({d}ms interval, {d} subscriptions)", .{ poll_interval_ms, self.subscriptions.items.len });
+
+        var client = http_mod.HttpClient.init(self.allocator);
+        defer client.deinit();
+
+        while (!self.should_stop.load(.seq_cst)) {
+            for (self.subscriptions.items) |asset_id| {
+                if (self.should_stop.load(.seq_cst)) break;
+
+                var ob = clob.fetchOrderbook(self.allocator, &client, asset_id) catch |e| {
+                    log.warn("ws", "poll fetch failed for {s}: {s}", .{ asset_id[0..@min(asset_id.len, 16)], @errorName(e) });
+                    continue;
+                };
+                defer ob.deinit(self.allocator);
+
+                if (self.callback) |cb| {
+                    var ts_buf: [32]u8 = undefined;
+                    const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch "0";
+                    cb(.{
+                        .asset_id = asset_id,
+                        .market = ob.market,
+                        .best_bid = ob.best_bid,
+                        .best_ask = ob.best_ask,
+                        .timestamp = ts_str,
+                        .event_type = "price_update",
+                    });
+                }
+            }
+
+            if (self.should_stop.load(.seq_cst)) break;
+
+            std.Thread.sleep(poll_interval_ms * std.time.ns_per_ms);
+        }
+
+        self.state = .disconnected;
+        log.info("ws", "REST poll fallback stopped", .{});
     }
 
     /// Reset reconnect delay on successful connection.

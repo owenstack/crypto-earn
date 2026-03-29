@@ -42,6 +42,15 @@ pub const T = struct {
     pub const order_cancel_all_response = "order.cancel_all.response";
     pub const halt_response = "halt.response";
     pub const resume_response = "resume.response";
+
+    // Phase 3: Strategy messages
+    pub const strategy_enable = "strategy.enable";
+    pub const strategy_disable = "strategy.disable";
+    pub const strategy_list = "strategy.list";
+    pub const strategy_list_response = "strategy.list.response";
+    pub const strategy_enable_response = "strategy.enable.response";
+    pub const strategy_disable_response = "strategy.disable.response";
+    pub const strategy_signal_event = "strategy.signal.event";
 };
 
 /// Write a complete JSON-lines response envelope to `writer`.

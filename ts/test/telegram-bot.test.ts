@@ -41,14 +41,14 @@ describe("createBot", () => {
     try {
       Bun.env.TELEGRAM_ALLOWED_CHAT_IDS = "123,456,789";
 
-      // Import fresh to pick up the new env var
-      const { isAllowedChatId } = await import("../src/telegram/bot.ts");
-      
+      // Import fresh to pick up the new env var using query param to bypass cache
+      const { isAllowedChatId } = await import(`../src/telegram/bot.ts?t=${Date.now()}`);
+
       // Test that allowed IDs are recognized
       expect(isAllowedChatId(123)).toBe(true);
       expect(isAllowedChatId(456)).toBe(true);
       expect(isAllowedChatId(789)).toBe(true);
-      
+
       // Test that disallowed ID is rejected
       expect(isAllowedChatId(999)).toBe(false);
     } finally {

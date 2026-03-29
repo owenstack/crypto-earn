@@ -120,11 +120,14 @@ describe("IPCClient", () => {
       // Disconnect while request is pending
       silentClient.disconnect();
 
-      // Wait for the close event to fire and reject pending requests
-      await new Promise(r => silentClient.on?.('close', r));
+      // Wait for the promise to reject (with timeout fallback)
+      const err = await Promise.race([
+        promise,
+        new Promise<Error>(resolve => setTimeout(() => resolve(new Error("timeout")), 1000)),
+      ]);
 
-      const err = await promise;
       expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).not.toBe("timeout");
     } finally {
       silentServer.stop(true);
       try { unlinkSync(silentSock); } catch {}
@@ -178,6 +181,92 @@ describe("IPCClient", () => {
     } catch (err) {
       expect(err).toBeInstanceOf(Error);
     }
+  });
+
+  describe("Phase 3 strategy message types", () => {
+    test("strategy.list request gets response", async () => {
+      const client = new IPCClient({
+        socketPath: SOCK_PATH,
+        requestTimeoutMs: 3000,
+      });
+      await client.connect();
+
+      const res = await client.request("strategy.list");
+      expect(res.v).toBe(1);
+      expect(res.type).toBe("strategy.list.response");
+
+      client.disconnect();
+    });
+
+    test("strategy.enable request gets response", async () => {
+      const client = new IPCClient({
+        socketPath: SOCK_PATH,
+        requestTimeoutMs: 3000,
+      });
+      await client.connect();
+
+      const res = await client.request("strategy.enable", { name: "news_repricing" });
+      expect(res.v).toBe(1);
+      expect(res.type).toBe("strategy.enable.response");
+
+      client.disconnect();
+    });
+
+    test("strategy.disable request gets response", async () => {
+      const client = new IPCClient({
+        socketPath: SOCK_PATH,
+        requestTimeoutMs: 3000,
+      });
+      await client.connect();
+
+      const res = await client.request("strategy.disable", { name: "liquidity_provision" });
+      expect(res.v).toBe(1);
+      expect(res.type).toBe("strategy.disable.response");
+
+      client.disconnect();
+    });
+
+    test("strategyList helper works", async () => {
+      const client = new IPCClient({
+        socketPath: SOCK_PATH,
+        requestTimeoutMs: 3000,
+      });
+      await client.connect();
+
+      const res = await client.strategyList();
+      expect(res.v).toBe(1);
+      expect(res.type).toBe("strategy.list.response");
+
+      client.disconnect();
+    });
+
+    test("strategyEnable helper works", async () => {
+      const client = new IPCClient({
+        socketPath: SOCK_PATH,
+        requestTimeoutMs: 3000,
+      });
+      await client.connect();
+
+      const res = await client.strategyEnable("news_repricing");
+      expect(res.v).toBe(1);
+      expect(res.type).toBe("strategy.enable.response");
+
+      client.disconnect();
+    });
+
+    test("strategyDisable helper works", async () => {
+      const client = new IPCClient({
+        socketPath: SOCK_PATH,
+        requestTimeoutMs: 3000,
+      });
+      await client.connect();
+
+      const res = await client.strategyDisable("liquidity_provision");
+      expect(res.v).toBe(1);
+      expect(res.type).toBe("strategy.disable.response");
+
+      client.disconnect();
+    });
   });
 
   describe("Phase 2 message types", () => {

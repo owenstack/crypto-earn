@@ -2,7 +2,7 @@
  * UNIX socket IPC client with line-buffered JSON framing,
  * reconnect/back-off, per-request timeout, and correlation tracking.
  */
-import type { Envelope, RequestMessageType, OrderPlaceResponsePayload, OrderCancelResponsePayload, OrderCancelAllResponsePayload, HaltResponsePayload, ResumeResponsePayload } from "./types";
+import type { Envelope, RequestMessageType, OrderPlaceResponsePayload, OrderCancelResponsePayload, OrderCancelAllResponsePayload, HaltResponsePayload, ResumeResponsePayload, StrategyListResponsePayload, StrategyEnableResponsePayload, StrategyDisableResponsePayload, StrategyEnableDisablePayload, StrategyName } from "./types";
 import { makeRequest } from "./types";
 import type { OrderPlaceRequestPayload, OrderCancelPayload } from "./types";
 
@@ -231,5 +231,24 @@ export class IPCClient {
 
   async resume() {
     return this.request<ResumeResponsePayload>("resume");
+  }
+
+  // Phase 3 strategy helpers
+  async strategyList() {
+    return this.request<StrategyListResponsePayload>("strategy.list");
+  }
+
+  async strategyEnable(name: StrategyName) {
+    return this.request<StrategyEnableDisablePayload, StrategyEnableResponsePayload>(
+      "strategy.enable",
+      { name },
+    );
+  }
+
+  async strategyDisable(name: StrategyName) {
+    return this.request<StrategyEnableDisablePayload, StrategyDisableResponsePayload>(
+      "strategy.disable",
+      { name },
+    );
   }
 }

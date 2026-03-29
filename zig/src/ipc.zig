@@ -6,16 +6,18 @@ const types = @import("ipc_types.zig");
 const db = @import("db.zig");
 const order_mgr = @import("order_manager.zig");
 const portfolio = @import("portfolio_tracker.zig");
+const strategy = @import("strategy_engine.zig");
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
     database: *db.DB,
     order_manager: ?*order_mgr.OrderManager = null,
     portfolio_tracker: ?*portfolio.PortfolioTracker = null,
+    strategy_engine: ?*strategy.StrategyEngine = null,
 };
 
 /// Start listening; blocks until an unrecoverable error.
-pub fn serve(allocator: std.mem.Allocator, socket_path: []const u8, database: *db.DB, om: ?*order_mgr.OrderManager, pt: ?*portfolio.PortfolioTracker) !void {
+pub fn serve(allocator: std.mem.Allocator, socket_path: []const u8, database: *db.DB, om: ?*order_mgr.OrderManager, pt: ?*portfolio.PortfolioTracker, se: ?*strategy.StrategyEngine) !void {
     // Remove stale socket file from a prior run.
     std.fs.cwd().deleteFile(socket_path) catch {};
 
@@ -28,7 +30,7 @@ pub fn serve(allocator: std.mem.Allocator, socket_path: []const u8, database: *d
 
     log.info("ipc", "listening on {s}", .{socket_path});
 
-    var ctx = Context{ .allocator = allocator, .database = database, .order_manager = om, .portfolio_tracker = pt };
+    var ctx = Context{ .allocator = allocator, .database = database, .order_manager = om, .portfolio_tracker = pt, .strategy_engine = se };
 
     while (true) {
         const conn = listener.accept() catch |e| {
@@ -181,7 +183,7 @@ fn dispatch(ctx: *Context, line: []const u8, writer: anytype) !void {
                     else => "limit",
                 } else "limit";
 
-                const result = om.placeOrder(market_id, side, size, price, otype);
+                const result = om.placeOrder(market_id, side, size, price, otype, null);
                 var p_buf: [256]u8 = undefined;
                 var owned_order_id: ?[]u8 = null;
                 defer if (owned_order_id) |id| om.allocator.free(id);
@@ -245,6 +247,89 @@ fn dispatch(ctx: *Context, line: []const u8, writer: anytype) !void {
             try types.writeResponse(writer, req_id, types.T.resume_response, "{\"status\":\"resumed\"}");
         } else {
             try types.writeError(writer, req_id, "order manager not available");
+        }
+    } else if (std.mem.eql(u8, msg_type, types.T.strategy_list)) {
+        if (ctx.strategy_engine) |se| {
+            const news_enabled = se.isEnabled(.news_repricing);
+            const lp_enabled = se.isEnabled(.liquidity_provision);
+            const ns = se.getStats(.news_repricing);
+            const ls = se.getStats(.liquidity_provision);
+            var p: [1024]u8 = undefined;
+            const payload = std.fmt.bufPrint(&p,
+                "{{\"strategies\":[" ++
+                "{{\"name\":\"news_repricing\",\"enabled\":{},\"stats\":{{\"signals_emitted\":{d},\"orders_accepted\":{d},\"orders_rejected\":{d},\"cancels\":{d}}}}}," ++
+                "{{\"name\":\"liquidity_provision\",\"enabled\":{},\"stats\":{{\"signals_emitted\":{d},\"orders_accepted\":{d},\"orders_rejected\":{d},\"cancels\":{d}}}}}" ++
+                "]}}",
+                .{
+                    news_enabled, ns.signals_emitted, ns.orders_accepted, ns.orders_rejected, ns.cancels,
+                    lp_enabled, ls.signals_emitted, ls.orders_accepted, ls.orders_rejected, ls.cancels,
+                },
+            ) catch "{}";
+            try types.writeResponse(writer, req_id, types.T.strategy_list_response, payload);
+        } else {
+            try types.writeError(writer, req_id, "strategy engine not available");
+        }
+    } else if (std.mem.eql(u8, msg_type, types.T.strategy_enable)) {
+        if (ctx.strategy_engine) |se| {
+            const payload_obj = if (root.get("payload")) |v| switch (v) {
+                .object => |o| o,
+                else => null,
+            } else null;
+            if (payload_obj) |pl| {
+                const name_str = if (pl.get("name")) |v| switch (v) {
+                    .string => |s| s,
+                    else => "",
+                } else "";
+                const strat_name: ?strategy.StrategyName = if (std.mem.eql(u8, name_str, "news_repricing"))
+                    .news_repricing
+                else if (std.mem.eql(u8, name_str, "liquidity_provision"))
+                    .liquidity_provision
+                else
+                    null;
+                if (strat_name) |sn| {
+                    se.enableStrategy(sn);
+                    var p: [128]u8 = undefined;
+                    const resp = std.fmt.bufPrint(&p, "{{\"name\":\"{s}\",\"enabled\":true}}", .{name_str}) catch "{}";
+                    try types.writeResponse(writer, req_id, types.T.strategy_enable_response, resp);
+                } else {
+                    try types.writeError(writer, req_id, "unknown strategy name");
+                }
+            } else {
+                try types.writeError(writer, req_id, "missing payload");
+            }
+        } else {
+            try types.writeError(writer, req_id, "strategy engine not available");
+        }
+    } else if (std.mem.eql(u8, msg_type, types.T.strategy_disable)) {
+        if (ctx.strategy_engine) |se| {
+            const payload_obj = if (root.get("payload")) |v| switch (v) {
+                .object => |o| o,
+                else => null,
+            } else null;
+            if (payload_obj) |pl| {
+                const name_str = if (pl.get("name")) |v| switch (v) {
+                    .string => |s| s,
+                    else => "",
+                } else "";
+                const strat_name: ?strategy.StrategyName = if (std.mem.eql(u8, name_str, "news_repricing"))
+                    .news_repricing
+                else if (std.mem.eql(u8, name_str, "liquidity_provision"))
+                    .liquidity_provision
+                else
+                    null;
+                if (strat_name) |sn| {
+                    se.disableStrategy(sn);
+                    var p: [128]u8 = undefined;
+                    const resp = std.fmt.bufPrint(&p, "{{\"name\":\"{s}\",\"enabled\":false}}", .{name_str}) catch "{}";
+                    try types.writeResponse(writer, req_id, types.T.strategy_disable_response, resp);
+                } else {
+                    try types.writeError(writer, req_id, "unknown strategy name");
+                }
+            } else {
+                try types.writeError(writer, req_id, "missing payload");
+            }
+        } else {
+            try types.writeError(writer, req_id, "strategy engine not available");
         }
     } else {
         try types.writeError(writer, req_id, "unknown message type");

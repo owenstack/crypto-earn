@@ -17,6 +17,10 @@ const risk_gate = @import("risk_gate.zig");
 const order_manager = @import("order_manager.zig");
 const portfolio_tracker = @import("portfolio_tracker.zig");
 
+// Phase 3 modules
+const strategy_engine = @import("strategy_engine.zig");
+const news_sources = @import("news_sources.zig");
+
 // ─── Logger tests ───────────────────────────────────────────────────────────
 
 test "logger: init sets start time and uptimeMs returns non-negative" {
@@ -541,8 +545,8 @@ test "risk_gate: rejects when max open orders reached" {
         .max_open_orders = 2,
     };
 
-    try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50");
-    try database.insertOrder("o2", "m1", "co2", "limit", "sell", "10", "0.50");
+    try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50", null);
+    try database.insertOrder("o2", "m1", "co2", "limit", "sell", "10", "0.50", null);
 
     const request = risk_gate.OrderRequest{
         .market_id = "m1",
@@ -652,7 +656,7 @@ test "order_manager: halt blocks order placement" {
     try testing.expect(om.isHalted());
 
     // Attempt to place order while halted
-    const result = om.placeOrder("m1", "buy", "10", "0.50", "limit");
+    const result = om.placeOrder("m1", "buy", "10", "0.50", "limit", null);
     switch (result) {
         .rejected => |r| try testing.expectEqualStrings("engine_halted", r.reason),
         else => try testing.expect(false),
@@ -706,7 +710,7 @@ test "db: insertOrder and queryOpenOrderCount" {
     const count_before = try database.queryOpenOrderCount();
     try testing.expectEqual(@as(u32, 0), count_before);
 
-    try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50");
+    try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50", null);
     const count_after = try database.queryOpenOrderCount();
     try testing.expectEqual(@as(u32, 1), count_after);
 }
@@ -717,7 +721,7 @@ test "db: updateOrderStatus" {
     try database.runMigrations();
 
     try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
-    try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50");
+    try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50", null);
 
     try database.updateOrderStatus("o1", "filled");
     const count = try database.queryOpenOrderCount();
@@ -774,4 +778,289 @@ test "ipc_types: Phase 2 type constants exist" {
     try testing.expectEqualStrings("order.place.response", ipc_types.T.order_place_response);
     try testing.expectEqualStrings("order.cancel.response", ipc_types.T.order_cancel_response);
     try testing.expectEqualStrings("order.cancel_all.response", ipc_types.T.order_cancel_all_response);
+}
+
+// ─── Phase 3: Strategy engine tests ─────────────────────────────────────────
+
+test "strategy_engine: init defaults" {
+    var se = strategy_engine.StrategyEngine.init(.{});
+    try testing.expect(!se.isEnabled(.news_repricing));
+    try testing.expect(!se.isEnabled(.liquidity_provision));
+    try testing.expectEqual(@as(u64, 0), se.news_stats.signals_emitted);
+    try testing.expectEqual(@as(u64, 0), se.lp_stats.signals_emitted);
+    try testing.expectEqual(@as(usize, 0), se.active_order_count);
+}
+
+test "strategy_engine: enable and disable" {
+    var se = strategy_engine.StrategyEngine.init(.{});
+    try testing.expect(!se.isEnabled(.news_repricing));
+
+    se.enableStrategy(.news_repricing);
+    try testing.expect(se.isEnabled(.news_repricing));
+    try testing.expect(!se.isEnabled(.liquidity_provision));
+
+    se.enableStrategy(.liquidity_provision);
+    try testing.expect(se.isEnabled(.liquidity_provision));
+
+    se.disableStrategy(.news_repricing);
+    try testing.expect(!se.isEnabled(.news_repricing));
+    try testing.expect(se.isEnabled(.liquidity_provision));
+}
+
+test "strategy_engine: news repricing triggers on sufficient delta" {
+    var se = strategy_engine.StrategyEngine.init(.{
+        .news_delta_threshold = 0.05,
+        .news_confidence_min = 0.3,
+        .news_order_size = 10.0,
+    });
+
+    // Delta = |0.70 - 0.50| = 0.20, well above threshold
+    const signal = se.evaluateNewsRepricing("test-market", 0.70, 0.50);
+    try testing.expect(signal != null);
+    const s = signal.?;
+    try testing.expectEqual(strategy_engine.StrategyName.news_repricing, s.strategy);
+    try testing.expectEqual(strategy_engine.SignalDirection.buy, s.direction);
+    try testing.expectEqual(@as(f64, 0.70), s.price);
+    try testing.expectEqual(@as(f64, 10.0), s.size);
+    try testing.expect(s.confidence >= 0.3);
+    try testing.expect(s.confidence <= 1.0);
+    try testing.expectEqual(@as(u64, 1), se.news_stats.signals_emitted);
+}
+
+test "strategy_engine: news repricing returns null when delta below threshold" {
+    var se = strategy_engine.StrategyEngine.init(.{
+        .news_delta_threshold = 0.05,
+    });
+
+    // Delta = |0.52 - 0.50| = 0.02, below threshold
+    const signal = se.evaluateNewsRepricing("test-market", 0.52, 0.50);
+    try testing.expect(signal == null);
+    try testing.expectEqual(@as(u64, 0), se.news_stats.signals_emitted);
+}
+
+test "strategy_engine: news repricing sell direction" {
+    var se = strategy_engine.StrategyEngine.init(.{
+        .news_delta_threshold = 0.05,
+        .news_confidence_min = 0.1,
+    });
+
+    // external_prob < market_mid => sell signal
+    const signal = se.evaluateNewsRepricing("test-market", 0.30, 0.50);
+    try testing.expect(signal != null);
+    try testing.expectEqual(strategy_engine.SignalDirection.sell, signal.?.direction);
+}
+
+test "strategy_engine: news repricing confidence bounds" {
+    var se = strategy_engine.StrategyEngine.init(.{
+        .news_delta_threshold = 0.01,
+        .news_confidence_min = 0.0,
+    });
+
+    // Delta = 0.30 => confidence = min(1.0, 0.30/0.2) = 1.0 (capped)
+    const sig1 = se.evaluateNewsRepricing("m1", 0.80, 0.50);
+    try testing.expect(sig1 != null);
+    try testing.expectEqual(@as(f64, 1.0), sig1.?.confidence);
+
+    // Delta = 0.05 => confidence = min(1.0, 0.05/0.2) = 0.25
+    const sig2 = se.evaluateNewsRepricing("m2", 0.55, 0.50);
+    try testing.expect(sig2 != null);
+    try testing.expectApproxEqAbs(@as(f64, 0.25), sig2.?.confidence, 1e-9);
+}
+
+test "strategy_engine: LP emits paired signals when spread wide" {
+    var se = strategy_engine.StrategyEngine.init(.{
+        .lp_min_spread = 0.04,
+        .lp_order_size = 5.0,
+    });
+
+    // Spread = 0.60 - 0.40 = 0.20, well above min_spread
+    const result = se.evaluateLiquidityProvision("test-market", 0.40, 0.60);
+    try testing.expectEqual(@as(u8, 2), result.count);
+    try testing.expectEqual(strategy_engine.SignalDirection.buy, result.signals[0].direction);
+    try testing.expectEqual(strategy_engine.SignalDirection.sell, result.signals[1].direction);
+    try testing.expectEqual(@as(f64, 5.0), result.signals[0].size);
+    // bid = 0.40 + 0.20 * 0.25 = 0.45
+    try testing.expectApproxEqAbs(@as(f64, 0.45), result.signals[0].price, 1e-9);
+    // ask = 0.60 - 0.20 * 0.25 = 0.55
+    try testing.expectApproxEqAbs(@as(f64, 0.55), result.signals[1].price, 1e-9);
+    try testing.expectEqual(@as(u64, 2), se.lp_stats.signals_emitted);
+}
+
+test "strategy_engine: LP returns no signals when spread narrow" {
+    var se = strategy_engine.StrategyEngine.init(.{
+        .lp_min_spread = 0.04,
+    });
+
+    // Spread = 0.51 - 0.49 = 0.02, below min_spread
+    const result = se.evaluateLiquidityProvision("test-market", 0.49, 0.51);
+    try testing.expectEqual(@as(u8, 0), result.count);
+    try testing.expectEqual(@as(u64, 0), se.lp_stats.signals_emitted);
+}
+
+test "strategy_engine: order tracking and untracking" {
+    var se = strategy_engine.StrategyEngine.init(.{});
+
+    se.trackOrder("order-1", "market-1", .news_repricing, .buy, 0.65);
+    try testing.expectEqual(@as(usize, 1), se.active_order_count);
+
+    se.trackOrder("order-2", "market-1", .liquidity_provision, .sell, 0.55);
+    try testing.expectEqual(@as(usize, 2), se.active_order_count);
+
+    se.untrackOrder("order-1");
+    try testing.expectEqual(@as(usize, 1), se.active_order_count);
+
+    se.untrackOrder("order-2");
+    try testing.expectEqual(@as(usize, 0), se.active_order_count);
+}
+
+test "strategy_engine: repricing cancel-on-collapse" {
+    var se = strategy_engine.StrategyEngine.init(.{
+        .news_delta_threshold = 0.05,
+    });
+
+    se.trackOrder("order-1", "market-1", .news_repricing, .buy, 0.65);
+    se.trackOrder("order-2", "market-2", .news_repricing, .sell, 0.35);
+
+    // current_delta for market-1 is 0.02, below threshold => should find order-1
+    const collapsed = se.findCollapsedEdgeOrders("market-1", 0.02);
+    try testing.expectEqual(@as(usize, 1), collapsed.count);
+    try testing.expectEqualStrings("order-1", collapsed.order_ids[0][0..collapsed.order_id_lens[0]]);
+
+    // current_delta = 0.10, above threshold => no collapsed orders
+    const no_collapse = se.findCollapsedEdgeOrders("market-1", 0.10);
+    try testing.expectEqual(@as(usize, 0), no_collapse.count);
+}
+
+test "strategy_engine: LP pair lifecycle" {
+    var se = strategy_engine.StrategyEngine.init(.{
+        .lp_exit_spread = 0.02,
+    });
+
+    se.trackOrder("bid-1", "m1", .liquidity_provision, .buy, 0.45);
+    se.trackOrder("ask-1", "m1", .liquidity_provision, .sell, 0.55);
+
+    // Find indices and link them
+    var bid_idx: ?usize = null;
+    var ask_idx: ?usize = null;
+    for (se.active_orders, 0..) |slot, i| {
+        if (slot) |order| {
+            if (std.mem.eql(u8, order.order_id[0..order.order_id_len], "bid-1")) bid_idx = i;
+            if (std.mem.eql(u8, order.order_id[0..order.order_id_len], "ask-1")) ask_idx = i;
+        }
+    }
+    try testing.expect(bid_idx != null);
+    try testing.expect(ask_idx != null);
+    se.linkPair(bid_idx.?, ask_idx.?);
+
+    // Find paired order for bid-1
+    const paired = se.findPairedOrder("bid-1");
+    try testing.expect(paired != null);
+    try testing.expectEqualStrings("ask-1", paired.?);
+
+    // Should cancel LP pair when spread narrows
+    try testing.expect(se.shouldCancelLpPair(0.495, 0.505)); // spread = 0.01 < 0.02
+    try testing.expect(!se.shouldCancelLpPair(0.40, 0.60)); // spread = 0.20 > 0.02
+}
+
+test "strategy_engine: halt suppresses evaluation gating" {
+    // Verify that the enable/disable gating works (halt integration is at worker level)
+    var se = strategy_engine.StrategyEngine.init(.{
+        .news_delta_threshold = 0.05,
+    });
+
+    // When not enabled, evaluator still produces signals (enable check is at worker level)
+    const signal = se.evaluateNewsRepricing("m1", 0.70, 0.50);
+    try testing.expect(signal != null);
+
+    // isEnabled returns false by default
+    try testing.expect(!se.isEnabled(.news_repricing));
+}
+
+test "strategy_engine: stats tracking" {
+    var se = strategy_engine.StrategyEngine.init(.{});
+
+    // Initial stats are zero
+    const ns = se.getStats(.news_repricing);
+    try testing.expectEqual(@as(u64, 0), ns.signals_emitted);
+    try testing.expectEqual(@as(u64, 0), ns.orders_accepted);
+
+    // After signals
+    _ = se.evaluateNewsRepricing("m1", 0.80, 0.50);
+    const ns2 = se.getStats(.news_repricing);
+    try testing.expectEqual(@as(u64, 1), ns2.signals_emitted);
+}
+
+// ─── Phase 3: IPC type constants ────────────────────────────────────────────
+
+test "ipc_types: Phase 3 strategy type constants exist" {
+    try testing.expectEqualStrings("strategy.enable", ipc_types.T.strategy_enable);
+    try testing.expectEqualStrings("strategy.disable", ipc_types.T.strategy_disable);
+    try testing.expectEqualStrings("strategy.list", ipc_types.T.strategy_list);
+    try testing.expectEqualStrings("strategy.list.response", ipc_types.T.strategy_list_response);
+    try testing.expectEqualStrings("strategy.enable.response", ipc_types.T.strategy_enable_response);
+    try testing.expectEqualStrings("strategy.disable.response", ipc_types.T.strategy_disable_response);
+    try testing.expectEqualStrings("strategy.signal.event", ipc_types.T.strategy_signal_event);
+}
+
+// ─── Phase 3: DB strategy helpers ───────────────────────────────────────────
+
+test "db: migration 003 creates strategy_stats table" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("SELECT count(*) FROM strategy_stats;");
+}
+
+test "db: insertStrategySignal and queryRecentSignalsByStrategy" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
+    try database.insertStrategySignal("m1", "news_repricing", 0.75, "test metadata");
+
+    var out: [10]db.DB.SignalRow = undefined;
+    const count = try database.queryRecentSignalsByStrategy("news_repricing", 10, &out);
+    try testing.expectEqual(@as(usize, 1), count);
+    try testing.expectApproxEqAbs(@as(f64, 0.75), out[0].strength, 1e-9);
+}
+
+test "db: insertStrategyStats and queryStrategyStats" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.insertStrategyStats("news_repricing", 10, 8, 2, 1, 15.50);
+
+    const stats = try database.queryStrategyStats("news_repricing");
+    try testing.expect(stats != null);
+    const s = stats.?;
+    try testing.expectEqual(@as(i64, 10), s.signals_emitted);
+    try testing.expectEqual(@as(i64, 8), s.orders_accepted);
+    try testing.expectEqual(@as(i64, 2), s.orders_rejected);
+    try testing.expectEqual(@as(i64, 1), s.cancels);
+    try testing.expectApproxEqAbs(@as(f64, 15.50), s.realized_pnl_estimate, 1e-9);
+}
+
+test "db: insertOrder with strategy_origin" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
+    try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50", "news_repricing");
+
+    const count = try database.queryOpenOrderCount();
+    try testing.expectEqual(@as(u32, 1), count);
+}
+
+// ─── Phase 3: News sources tests ────────────────────────────────────────────
+
+test "news_sources: init and empty cache" {
+    var nc = news_sources.NewsClient.init(testing.allocator, .{});
+    try testing.expectEqual(@as(usize, 0), nc.cached_count);
+
+    const est = nc.getEstimate("nonexistent");
+    try testing.expect(est == null);
 }
