@@ -20,7 +20,10 @@ export type RequestMessageType =
   | "strategy.disable"
   | "strategy.list"
   | "event.subscribe"
-  | "event.unsubscribe";
+  | "event.unsubscribe"
+  | "config.set"
+  | "pause"
+  | "pnl.query";
 
 export type ResponseMessageType =
   | "heartbeat.response"
@@ -47,7 +50,10 @@ export type ResponseMessageType =
   | "strategy.list.response"
   | "strategy.signal.event"
   | "event.subscribe.response"
-  | "event.unsubscribe.response";
+  | "event.unsubscribe.response"
+  | "config.set.response"
+  | "pause.response"
+  | "pnl.response";
 
 export type EventMessageType =
   | "event.order.placed"
@@ -306,6 +312,42 @@ export interface RiskRejectionEventPayload {
 export interface EngineStateEventPayload {
   status: "halted" | "resumed";
   cancelled_orders?: number;
+}
+
+// Phase 5: Config/Pause/P&L payloads
+export interface ConfigSetRequestPayload {
+  key: string;
+  value: string;
+}
+
+export interface ConfigSetResponsePayload {
+  key: string;
+  old_value: string | null;
+  new_value: string;
+}
+
+export interface PauseRequestPayload {
+  action: "pause";
+}
+
+export interface PauseResponsePayload {
+  status: "paused";
+}
+
+export type PnlWindow = "today" | "7d" | "30d" | "all";
+
+export interface PnlQueryRequestPayload {
+  window: PnlWindow;
+}
+
+export interface PnlResponsePayload {
+  window: string;
+  realized_pnl: string;
+  unrealized_pnl: string;
+  win_count: number;
+  loss_count: number;
+  avg_win: string;
+  avg_loss: string;
 }
 
 /** Build a request envelope with a random correlation ID. */

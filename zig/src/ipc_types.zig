@@ -66,6 +66,17 @@ pub const T = struct {
     pub const event_risk_rejection = "event.risk.rejection";
     pub const event_engine_halted = "event.engine.halted";
     pub const event_engine_resumed = "event.engine.resumed";
+
+    // Phase 5: Config/Pause/P&L messages
+    pub const config_set = "config.set";
+    pub const config_set_response = "config.set.response";
+    // pause is a temporary trading suspend: strategy/order placement is paused,
+    // open orders are preserved, and resume is the corresponding unpause command.
+    // Use pause for short-lived intervention; use halt for emergency stop/cancel-all.
+    pub const pause = "pause";
+    pub const pause_response = "pause.response";
+    pub const pnl_query = "pnl.query";
+    pub const pnl_response = "pnl.response";
 };
 
 /// Write a complete JSON-lines response envelope to `writer`.

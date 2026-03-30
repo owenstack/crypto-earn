@@ -38,6 +38,13 @@ const MIGRATION_003 =
     \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(3);
 ;
 
+/// Embedded Phase-5 migration (runtime config table).
+const MIGRATION_004 =
+    \\CREATE TABLE IF NOT EXISTS runtime_config(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL DEFAULT(unixepoch()));
+    \\CREATE INDEX IF NOT EXISTS idx_runtime_config_key ON runtime_config(key);
+    \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(4);
+;
+
 pub const DB = struct {
     handle: *c.sqlite3,
 
@@ -104,6 +111,11 @@ pub const DB = struct {
                 }
             };
             try self.execZ(MIGRATION_003 ++ &[_:0]u8{});
+        }
+        // Check if migration 004 has been applied.
+        if (!self.migrationApplied(4)) {
+            log.info("db", "applying migration 004", .{});
+            try self.execZ(MIGRATION_004 ++ &[_:0]u8{});
         }
         log.info("db", "migrations complete", .{});
     }
@@ -463,6 +475,165 @@ pub const DB = struct {
             log.err("db", "failed to execute insertStrategyStats", .{});
             return error.DBExecFailed;
         }
+    }
+
+    pub fn getConfig(self: DB, key: []const u8, buf: []u8) ?[]u8 {
+        const sql = "SELECT value FROM runtime_config WHERE key=?;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return null;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), null) != c.SQLITE_OK) return null;
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        const val_ptr = c.sqlite3_column_text(stmt, 0);
+        const val = if (val_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else return null;
+        if (val.len > buf.len) return null;
+        @memcpy(buf[0..val.len], val[0..val.len]);
+        return buf[0..val.len];
+    }
+
+    pub fn getAllConfig(self: DB, alloc: std.mem.Allocator) ![]u8 {
+        const sql = "SELECT key,value FROM runtime_config ORDER BY key;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare getAllConfig", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(alloc);
+        try out.append(alloc, '{');
+        var first = true;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const key_ptr = c.sqlite3_column_text(stmt, 0);
+            const key = if (key_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else continue;
+            const val_ptr = c.sqlite3_column_text(stmt, 1);
+            const val = if (val_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else continue;
+            if (!first) try out.append(alloc, ',');
+            first = false;
+            try out.append(alloc, '"');
+            try out.appendSlice(alloc, key);
+            try out.appendSlice(alloc, "\":\"");
+            try out.appendSlice(alloc, val);
+            try out.append(alloc, '"');
+        }
+        try out.append(alloc, '}');
+        return out.toOwnedSlice(alloc);
+    }
+
+    pub fn setConfig(self: DB, key: []const u8, value: []const u8, old_buf: []u8) !?[]u8 {
+        try self.execZ("BEGIN IMMEDIATE;" ++ &[_:0]u8{});
+        errdefer {
+            self.execZ("ROLLBACK;" ++ &[_:0]u8{}) catch |e| {
+                log.err("db", "failed to rollback setConfig transaction: {s}", .{@errorName(e)});
+            };
+        }
+
+        // Read previous value inside the same transaction to avoid stale audit data.
+        const old_value = self.getConfig(key, old_buf);
+
+        // Upsert the config value
+        const upsert_sql = "INSERT INTO runtime_config(key,value,updated_at) VALUES(?,?,unixepoch()) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, upsert_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare setConfig", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 2, value.ptr, @intCast(value.len), null) != c.SQLITE_OK)
+        {
+            log.err("db", "failed to bind setConfig parameters", .{});
+            return error.DBExecFailed;
+        }
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
+            log.err("db", "failed to execute setConfig", .{});
+            return error.DBExecFailed;
+        }
+
+        // Write audit entry in the same transaction as the upsert.
+        try self.insertConfigChange(key, old_value, value);
+        try self.execZ("COMMIT;" ++ &[_:0]u8{});
+
+        return old_value;
+    }
+
+    fn insertConfigChange(self: DB, key: []const u8, old_value: ?[]const u8, new_value: []const u8) !void {
+        const sql = "INSERT INTO config_changes(id,key,old_value,new_value,changed_by) VALUES(hex(randomblob(16)),?,?,?,'telegram');" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare insertConfigChange", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), null) != c.SQLITE_OK) return error.DBExecFailed;
+        if (old_value) |ov| {
+            if (c.sqlite3_bind_text(stmt, 2, ov.ptr, @intCast(ov.len), null) != c.SQLITE_OK) return error.DBExecFailed;
+        } else {
+            if (c.sqlite3_bind_null(stmt, 2) != c.SQLITE_OK) return error.DBExecFailed;
+        }
+        if (c.sqlite3_bind_text(stmt, 3, new_value.ptr, @intCast(new_value.len), null) != c.SQLITE_OK) return error.DBExecFailed;
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
+            log.err("db", "failed to execute insertConfigChange", .{});
+            return error.DBExecFailed;
+        }
+    }
+
+    pub const PnlResult = struct {
+        realized_pnl: f64,
+        win_count: i64,
+        loss_count: i64,
+        avg_win: f64,
+        avg_loss: f64,
+    };
+
+    pub fn queryPnl(self: DB, window: []const u8) !PnlResult {
+        // Determine the time filter based on window
+        const time_filter: []const u8 = if (std.mem.eql(u8, window, "today"))
+            " AND p.updated_at >= unixepoch('now','start of day')"
+        else if (std.mem.eql(u8, window, "7d"))
+            " AND p.updated_at >= unixepoch('now','-7 days')"
+        else if (std.mem.eql(u8, window, "30d"))
+            " AND p.updated_at >= unixepoch('now','-30 days')"
+        else
+            ""; // "all" — no filter
+
+        // Build SQL for realized P&L from closed positions
+        var sql_buf: [512]u8 = undefined;
+        const sql = std.fmt.bufPrint(
+            &sql_buf,
+            "SELECT COALESCE(SUM(CAST(pnl AS REAL)),0.0)," ++
+                "COALESCE(SUM(CASE WHEN CAST(pnl AS REAL)>0 THEN 1 ELSE 0 END),0)," ++
+                "COALESCE(SUM(CASE WHEN CAST(pnl AS REAL)<0 THEN 1 ELSE 0 END),0)," ++
+                "COALESCE(AVG(CASE WHEN CAST(pnl AS REAL)>0 THEN CAST(pnl AS REAL) END),0.0)," ++
+                "COALESCE(AVG(CASE WHEN CAST(pnl AS REAL)<0 THEN CAST(pnl AS REAL) END),0.0)" ++
+                " FROM positions p WHERE p.status='closed'{s};" ++
+                &[_:0]u8{},
+            .{time_filter},
+        ) catch return error.DBExecFailed;
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare queryPnl", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) {
+            return PnlResult{ .realized_pnl = 0, .win_count = 0, .loss_count = 0, .avg_win = 0, .avg_loss = 0 };
+        }
+
+        return PnlResult{
+            .realized_pnl = c.sqlite3_column_double(stmt, 0),
+            .win_count = c.sqlite3_column_int64(stmt, 1),
+            .loss_count = c.sqlite3_column_int64(stmt, 2),
+            .avg_win = c.sqlite3_column_double(stmt, 3),
+            .avg_loss = c.sqlite3_column_double(stmt, 4),
+        };
     }
 
     /// Return journal_mode as a stack-allocated slice (for health check).

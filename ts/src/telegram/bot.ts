@@ -18,6 +18,11 @@ import type {
   OrderPlaceRequestPayload,
   OrderCancelPayload,
   StrategyListResponsePayload,
+  ConfigSetResponsePayload,
+  PauseResponsePayload,
+  PnlResponsePayload,
+  PnlWindow,
+  ConfigPayload,
 } from "../ipc/types";
 
 const ALLOWED_IDS = new Set(
@@ -112,10 +117,12 @@ export function createBot(ipc: IPCClient): Bot {
       "/status — engine status\n" +
       "/portfolio — open positions\n" +
       "/orders — open orders\n" +
-      "/config — current config\n" +
+      "/config — get or set config\n" +
       "/trade — place an order\n" +
       "/cancel — cancel an order\n" +
       "/strategy — manage strategies\n" +
+      "/pnl — profit & loss report\n" +
+      "/pause — pause strategy evaluation\n" +
       "/halt — emergency stop\n" +
       "/resume — resume trading",
       { parse_mode: "Markdown" }
@@ -162,8 +169,30 @@ export function createBot(ipc: IPCClient): Bot {
 
   bot.command("config", guard(async ctx => {
     if (!ipc.connected) { await ctx.reply("🔴 Engine IPC offline."); return; }
-    const res = await ipc.request("config.get");
-    await ctx.reply(`⚙️ Config:\n\`\`\`json\n${JSON.stringify(res.payload, null, 2)}\n\`\`\``, { parse_mode: "Markdown" });
+    const args = ctx.message?.text?.split(" ").slice(1) ?? [];
+    const subcommand = (args[0] ?? "").trim().toLowerCase();
+
+    if (subcommand === "set") {
+      const key = (args[1] ?? "").trim();
+      const value = args.slice(2).join(" ").trim();
+      if (!key || !value) {
+        await ctx.reply("Usage: /config set <key> <value>");
+        return;
+      }
+      const res = await ipc.configSet(key, value);
+      const p = res.payload;
+      await ctx.reply(
+        `⚙️ Config updated\n` +
+        `• Key: \`${p.key}\`\n` +
+        `• Old: \`${p.old_value ?? "null"}\`\n` +
+        `• New: \`${p.new_value}\``,
+        { parse_mode: "Markdown" }
+      );
+    } else {
+      // Default: get all config
+      const res = await ipc.request("config.get");
+      await ctx.reply(`⚙️ Config:\n\`\`\`json\n${JSON.stringify(res.payload, null, 2)}\n\`\`\``, { parse_mode: "Markdown" });
+    }
   }));
 
   bot.command("trade", guard(async ctx => {
@@ -284,6 +313,40 @@ export function createBot(ipc: IPCClient): Bot {
     }
   }));
 
+  bot.command("pause", guard(async ctx => {
+    if (!ipc.connected) { await ctx.reply("🔴 Engine IPC offline."); return; }
+    const res = await ipc.pause();
+    await ctx.reply(`⏸️ Engine ${res.payload.status}. Open orders preserved.\nUse /resume to resume trading.`);
+  }));
+
+  bot.command("pnl", guard(async ctx => {
+    if (!ipc.connected) { await ctx.reply("🔴 Engine IPC offline."); return; }
+    const args = ctx.message?.text?.split(" ").slice(1) ?? [];
+    const windowArg = (args[0] ?? "today").trim().toLowerCase();
+
+    const validWindows: PnlWindow[] = ["today", "7d", "30d", "all"];
+    if (!validWindows.includes(windowArg as PnlWindow)) {
+      await ctx.reply("Usage: /pnl [today|7d|30d|all]");
+      return;
+    }
+
+    const window = windowArg as PnlWindow;
+    const res = await ipc.pnl(window);
+    const p = res.payload;
+    await ctx.reply(
+      `📊 *P&L — ${p.window}*\n` +
+      "```\n" +
+      `Realized P&L:  ${p.realized_pnl}\n` +
+      `Unrealized:    ${p.unrealized_pnl}\n` +
+      `Wins:          ${p.win_count}\n` +
+      `Losses:        ${p.loss_count}\n` +
+      `Avg Win:       ${p.avg_win}\n` +
+      `Avg Loss:      ${p.avg_loss}\n` +
+      "```",
+      { parse_mode: "Markdown" }
+    );
+  }));
+
   bot.command("halt", guard(async ctx => {
     if (!ipc.connected) { await ctx.reply("🔴 Engine IPC offline."); return; }
     const res = await ipc.request<HaltResponsePayload>("halt");
@@ -298,7 +361,7 @@ export function createBot(ipc: IPCClient): Bot {
   bot.command("resume", guard(async ctx => {
     if (!ipc.connected) { await ctx.reply("🔴 Engine IPC offline."); return; }
     const res = await ipc.request<ResumeResponsePayload>("resume");
-    await ctx.reply(`✅ Engine ${res.payload.status}.`);
+    await ctx.reply(`✅ Engine ${res.payload.status}. Trading and strategy evaluation active.`);
   }));
 
   return bot;

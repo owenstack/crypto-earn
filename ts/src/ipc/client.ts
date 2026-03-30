@@ -2,7 +2,7 @@
  * UNIX socket IPC client with line-buffered JSON framing,
  * reconnect/back-off, per-request timeout, and correlation tracking.
  */
-import type { Envelope, RequestMessageType, EventMessageType, OrderPlaceResponsePayload, OrderCancelResponsePayload, OrderCancelAllResponsePayload, HaltResponsePayload, ResumeResponsePayload, StrategyListResponsePayload, StrategyEnableResponsePayload, StrategyDisableResponsePayload, StrategyEnableDisablePayload, StrategyName, EventSubscribeResponsePayload, EventUnsubscribeResponsePayload } from "./types";
+import type { Envelope, RequestMessageType, EventMessageType, OrderPlaceResponsePayload, OrderCancelResponsePayload, OrderCancelAllResponsePayload, HaltResponsePayload, ResumeResponsePayload, StrategyListResponsePayload, StrategyEnableResponsePayload, StrategyDisableResponsePayload, StrategyEnableDisablePayload, StrategyName, EventSubscribeResponsePayload, EventUnsubscribeResponsePayload, ConfigSetRequestPayload, ConfigSetResponsePayload, PauseResponsePayload, PnlQueryRequestPayload, PnlResponsePayload, PnlWindow } from "./types";
 import { makeRequest } from "./types";
 import type { OrderPlaceRequestPayload, OrderCancelPayload } from "./types";
 
@@ -264,6 +264,19 @@ export class IPCClient {
       "strategy.disable",
       { name },
     );
+  }
+
+  // Phase 5 control helpers
+  async configSet(key: string, value: string) {
+    return this.request<ConfigSetRequestPayload, ConfigSetResponsePayload>("config.set", { key, value });
+  }
+
+  async pause() {
+    return this.request<PauseResponsePayload>("pause");
+  }
+
+  async pnl(window: PnlWindow) {
+    return this.request<PnlQueryRequestPayload, PnlResponsePayload>("pnl.query", { window });
   }
 
   /** Subscribe to event stream from Zig engine. */

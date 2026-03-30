@@ -63,6 +63,7 @@ pub const OrderManager = struct {
     risk_config: risk.RiskConfig,
     config: OrderManagerConfig,
     halted: std.atomic.Value(bool),
+    paused: std.atomic.Value(bool),
     should_stop: std.atomic.Value(bool),
 
     pub fn init(
@@ -77,6 +78,7 @@ pub const OrderManager = struct {
             .risk_config = risk_config,
             .config = config,
             .halted = std.atomic.Value(bool).init(false),
+            .paused = std.atomic.Value(bool).init(false),
             .should_stop = std.atomic.Value(bool).init(false),
         };
     }
@@ -96,6 +98,12 @@ pub const OrderManager = struct {
         if (self.halted.load(.seq_cst)) {
             log.warn("order_mgr", "order rejected: engine is halted", .{});
             return .{ .rejected = .{ .reason = "engine_halted" } };
+        }
+
+        // Block if paused
+        if (self.paused.load(.seq_cst)) {
+            log.warn("order_mgr", "order rejected: engine is PAUSED", .{});
+            return .{ .rejected = .{ .reason = "engine_paused" } };
         }
 
         // Generate client order ID
@@ -386,9 +394,25 @@ pub const OrderManager = struct {
     /// Resume from halt state.
     pub fn @"resume"(self: *OrderManager) void {
         self.halted.store(false, .seq_cst);
+        self.paused.store(false, .seq_cst);
         log.info("order_mgr", "RESUME: engine resumed", .{});
         // Publish engine resumed event
         ipc.publishEvent(ipc_types.T.event_engine_resumed, "{\"status\":\"resumed\"}");
+    }
+
+    /// Pause strategy evaluation without cancelling orders.
+    pub fn setPaused(self: *OrderManager, value: bool) void {
+        self.paused.store(value, .seq_cst);
+        if (value) {
+            log.info("order_mgr", "PAUSE: strategy evaluation paused, open orders preserved", .{});
+        } else {
+            log.info("order_mgr", "UNPAUSE: strategy evaluation resumed", .{});
+        }
+    }
+
+    /// Check if the engine is paused.
+    pub fn isPaused(self: *OrderManager) bool {
+        return self.paused.load(.seq_cst);
     }
 
     /// Check if the engine is halted.

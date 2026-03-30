@@ -226,7 +226,14 @@ fn dispatch(ctx: *Context, line: []const u8, writer: anytype, stream: std.net.St
             try types.writeResponse(writer, req_id, types.T.orders_response, "{\"orders\":[],\"note\":\"phase-0-stub\"}");
         }
     } else if (std.mem.eql(u8, msg_type, types.T.config_get)) {
-        try types.writeResponse(writer, req_id, types.T.config_get_response, "{\"config\":{},\"note\":\"phase-0-stub\"}");
+        const config_json = ctx.database.getAllConfig(alloc) catch {
+            try types.writeResponse(writer, req_id, types.T.config_get_response, "{\"config\":{}}");
+            return;
+        };
+        defer alloc.free(config_json);
+        var p: [4096]u8 = undefined;
+        const payload = std.fmt.bufPrint(&p, "{{\"config\":{s}}}", .{config_json}) catch "{\"config\":{}}";
+        try types.writeResponse(writer, req_id, types.T.config_get_response, payload);
     } else if (std.mem.eql(u8, msg_type, types.T.logs)) {
         // Build payload: {"logs": [...]}
         var payload: std.ArrayList(u8) = .empty;
@@ -324,6 +331,9 @@ fn dispatch(ctx: *Context, line: []const u8, writer: anytype, stream: std.net.St
     } else if (std.mem.eql(u8, msg_type, types.T.@"resume")) {
         if (ctx.order_manager) |om| {
             om.@"resume"();
+            if (ctx.strategy_engine) |se| {
+                se.paused.store(false, .seq_cst);
+            }
             try types.writeResponse(writer, req_id, types.T.resume_response, "{\"status\":\"resumed\"}");
         } else {
             try types.writeError(writer, req_id, "order manager not available");
@@ -421,6 +431,75 @@ fn dispatch(ctx: *Context, line: []const u8, writer: anytype, stream: std.net.St
     } else if (std.mem.eql(u8, msg_type, types.T.event_unsubscribe)) {
         removeSubscriber(stream);
         try types.writeResponse(writer, req_id, types.T.event_unsubscribe_response, "{\"status\":\"unsubscribed\"}");
+    } else if (std.mem.eql(u8, msg_type, types.T.config_set)) {
+        const payload_obj = if (root.get("payload")) |v| switch (v) {
+            .object => |o| o,
+            else => null,
+        } else null;
+        if (payload_obj) |pl| {
+            const key = if (pl.get("key")) |v| switch (v) {
+                .string => |s| s,
+                else => "",
+            } else "";
+            const value = if (pl.get("value")) |v| switch (v) {
+                .string => |s| s,
+                else => "",
+            } else "";
+            if (key.len == 0 or value.len == 0) {
+                try types.writeError(writer, req_id, "key and value are required");
+            } else {
+                var old_buf: [256]u8 = undefined;
+                const old_value = ctx.database.setConfig(key, value, &old_buf) catch {
+                    try types.writeError(writer, req_id, "config write failed");
+                    return;
+                };
+                const payload = std.json.Stringify.valueAlloc(alloc, .{
+                    .key = key,
+                    .old_value = old_value,
+                    .new_value = value,
+                }, .{}) catch {
+                    try types.writeError(writer, req_id, "config response serialization failed");
+                    return;
+                };
+                defer alloc.free(payload);
+                try types.writeResponse(writer, req_id, types.T.config_set_response, payload);
+            }
+        } else {
+            try types.writeError(writer, req_id, "missing payload");
+        }
+    } else if (std.mem.eql(u8, msg_type, types.T.pause)) {
+        if (ctx.order_manager) |om| {
+            om.setPaused(true);
+            if (ctx.strategy_engine) |se| {
+                se.paused.store(true, .seq_cst);
+            }
+            try types.writeResponse(writer, req_id, types.T.pause_response, "{\"status\":\"paused\"}");
+        } else {
+            try types.writeError(writer, req_id, "order manager not available");
+        }
+    } else if (std.mem.eql(u8, msg_type, types.T.pnl_query)) {
+        const payload_obj = if (root.get("payload")) |v| switch (v) {
+            .object => |o| o,
+            else => null,
+        } else null;
+        const window = if (payload_obj) |pl|
+            if (pl.get("window")) |v| switch (v) {
+                .string => |s| s,
+                else => "today",
+            } else "today"
+        else
+            "today";
+        const pnl_result = ctx.database.queryPnl(window) catch {
+            try types.writeError(writer, req_id, "pnl query failed");
+            return;
+        };
+        var p: [512]u8 = undefined;
+        const payload = std.fmt.bufPrint(
+            &p,
+            "{{\"window\":\"{s}\",\"realized_pnl\":\"{d:.2}\",\"unrealized_pnl\":\"0.00\",\"win_count\":{d},\"loss_count\":{d},\"avg_win\":\"{d:.2}\",\"avg_loss\":\"{d:.2}\"}}",
+            .{ window, pnl_result.realized_pnl, pnl_result.win_count, pnl_result.loss_count, pnl_result.avg_win, pnl_result.avg_loss },
+        ) catch "{}";
+        try types.writeResponse(writer, req_id, types.T.pnl_response, payload);
     } else {
         try types.writeError(writer, req_id, "unknown message type");
     }

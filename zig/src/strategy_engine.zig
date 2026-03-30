@@ -53,6 +53,7 @@ pub const StrategyEngine = struct {
     config: StrategyConfig,
     news_enabled: std.atomic.Value(bool),
     lp_enabled: std.atomic.Value(bool),
+    paused: std.atomic.Value(bool),
     state_mu: std.Thread.Mutex,
     news_stats: StrategyStats,
     lp_stats: StrategyStats,
@@ -64,6 +65,7 @@ pub const StrategyEngine = struct {
             .config = config,
             .news_enabled = std.atomic.Value(bool).init(false),
             .lp_enabled = std.atomic.Value(bool).init(false),
+            .paused = std.atomic.Value(bool).init(false),
             .state_mu = .{},
             .news_stats = .{},
             .lp_stats = .{},
@@ -103,6 +105,7 @@ pub const StrategyEngine = struct {
         external_prob: f64,
         market_mid: f64,
     ) ?Signal {
+        if (self.paused.load(.seq_cst)) return null;
         // enable check should live at worker level
         const delta = @abs(external_prob - market_mid);
         if (delta < self.config.news_delta_threshold) return null;
@@ -150,6 +153,7 @@ pub const StrategyEngine = struct {
         best_bid: f64,
         best_ask: f64,
     ) LpResult {
+        if (self.paused.load(.seq_cst)) return .{ .signals = undefined, .count = 0 };
         const spread = best_ask - best_bid;
         if (spread < self.config.lp_min_spread) return .{ .signals = undefined, .count = 0 };
 

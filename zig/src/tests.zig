@@ -1140,3 +1140,159 @@ test "ipc_types: writeEvent generates sequential event ids" {
     const id2 = p2.value.object.get("id").?.string;
     try testing.expect(!std.mem.eql(u8, id1, id2));
 }
+
+// ─── Phase 5: IPC type constants ────────────────────────────────────────────
+
+test "ipc_types: Phase 5 config/pause/pnl type constants exist" {
+    try testing.expectEqualStrings("config.set", ipc_types.T.config_set);
+    try testing.expectEqualStrings("config.set.response", ipc_types.T.config_set_response);
+    try testing.expectEqualStrings("pause", ipc_types.T.pause);
+    try testing.expectEqualStrings("pause.response", ipc_types.T.pause_response);
+    try testing.expectEqualStrings("pnl.query", ipc_types.T.pnl_query);
+    try testing.expectEqualStrings("pnl.response", ipc_types.T.pnl_response);
+}
+
+// ─── Phase 5: DB config persistence ─────────────────────────────────────────
+
+test "db: migration 004 creates runtime_config table" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("SELECT count(*) FROM runtime_config;");
+}
+
+test "db: setConfig and getConfig round-trip" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    var old_buf: [256]u8 = undefined;
+    const old = try database.setConfig("max_position_usd", "500", &old_buf);
+    try testing.expect(old == null);
+
+    var val_buf: [256]u8 = undefined;
+    const val = database.getConfig("max_position_usd", &val_buf);
+    try testing.expect(val != null);
+    try testing.expectEqualStrings("500", val.?);
+}
+
+test "db: setConfig returns old value on update" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    var old1: [256]u8 = undefined;
+    _ = try database.setConfig("key1", "value1", &old1);
+
+    var old2: [256]u8 = undefined;
+    const prev = try database.setConfig("key1", "value2", &old2);
+    try testing.expect(prev != null);
+    try testing.expectEqualStrings("value1", prev.?);
+
+    var val_buf: [256]u8 = undefined;
+    const current = database.getConfig("key1", &val_buf);
+    try testing.expect(current != null);
+    try testing.expectEqualStrings("value2", current.?);
+}
+
+test "db: getConfig returns null when buffer too small" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    var old: [256]u8 = undefined;
+    _ = try database.setConfig("long_key", "abcdefghij", &old);
+
+    var tiny_buf: [4]u8 = undefined;
+    const val = database.getConfig("long_key", &tiny_buf);
+    try testing.expect(val == null);
+}
+
+test "db: setConfig writes audit entry" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    var old: [256]u8 = undefined;
+    _ = try database.setConfig("test_key", "test_value", &old);
+
+    // Verify audit entry exists
+    const sql = "SELECT count(*) FROM config_changes WHERE key='test_key';" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(stmt);
+    try testing.expect(db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW);
+    try testing.expect(db.c.sqlite3_column_int(stmt, 0) > 0);
+}
+
+test "db: getAllConfig returns valid JSON" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    var old: [256]u8 = undefined;
+    _ = try database.setConfig("k1", "v1", &old);
+    _ = try database.setConfig("k2", "v2", &old);
+
+    const json = try database.getAllConfig(testing.allocator);
+    defer testing.allocator.free(json);
+
+    // Parse as JSON
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value == .object);
+    try testing.expectEqualStrings("v1", parsed.value.object.get("k1").?.string);
+    try testing.expectEqualStrings("v2", parsed.value.object.get("k2").?.string);
+}
+
+// ─── Phase 5: P&L query ────────────────────────────────────────────────────
+
+test "db: queryPnl returns zero result on empty db" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    const result = try database.queryPnl("today");
+    try testing.expectApproxEqAbs(@as(f64, 0.0), result.realized_pnl, 1e-9);
+    try testing.expectEqual(@as(i64, 0), result.win_count);
+    try testing.expectEqual(@as(i64, 0), result.loss_count);
+}
+
+test "db: queryPnl with all windows" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    // All window types should succeed
+    _ = try database.queryPnl("today");
+    _ = try database.queryPnl("7d");
+    _ = try database.queryPnl("30d");
+    _ = try database.queryPnl("all");
+}
+
+// ─── Phase 5: Strategy engine paused state ──────────────────────────────────
+
+test "strategy_engine: paused state blocks signal generation" {
+    var se = strategy_engine.StrategyEngine.init(.{
+        .news_delta_threshold = 0.05,
+        .lp_min_spread = 0.04,
+    });
+
+    // Not paused — signals generated
+    const signal1 = se.evaluateNewsRepricing("m1", 0.80, 0.50);
+    try testing.expect(signal1 != null);
+
+    // Pause — no signals
+    se.paused.store(true, .seq_cst);
+    const signal2 = se.evaluateNewsRepricing("m1", 0.80, 0.50);
+    try testing.expect(signal2 == null);
+
+    const lp = se.evaluateLiquidityProvision("m1", 0.40, 0.60);
+    try testing.expectEqual(@as(usize, 0), lp.count);
+
+    // Unpause — signals resume
+    se.paused.store(false, .seq_cst);
+    const signal3 = se.evaluateNewsRepricing("m1", 0.80, 0.50);
+    try testing.expect(signal3 != null);
+}

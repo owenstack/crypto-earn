@@ -467,6 +467,92 @@ describe("IPCClient", () => {
     });
   });
 
+  describe("Phase 5 control messages", () => {
+    test("config.set request gets response", async () => {
+      const client = new IPCClient({
+        socketPath: SOCK_PATH,
+        requestTimeoutMs: 3000,
+      });
+      await client.connect();
+
+      const res = await client.request("config.set", { key: "max_position_usd", value: "250" });
+      expect(res.v).toBe(1);
+      expect(res.type).toBe("config.set.response");
+
+      client.disconnect();
+    });
+
+    test("pause request gets response", async () => {
+      const client = new IPCClient({
+        socketPath: SOCK_PATH,
+        requestTimeoutMs: 3000,
+      });
+      await client.connect();
+
+      const res = await client.request("pause");
+      expect(res.v).toBe(1);
+      expect(res.type).toBe("pause.response");
+
+      client.disconnect();
+    });
+
+    test("pnl.query request gets response", async () => {
+      const client = new IPCClient({
+        socketPath: SOCK_PATH,
+        requestTimeoutMs: 3000,
+      });
+      await client.connect();
+
+      const res = await client.request("pnl.query", { window: "today" });
+      expect(res.v).toBe(1);
+      expect(res.type).toBe("pnl.query.response");
+
+      client.disconnect();
+    });
+
+    test("configSet helper works", async () => {
+      const client = new IPCClient({
+        socketPath: SOCK_PATH,
+        requestTimeoutMs: 3000,
+      });
+      await client.connect();
+
+      const res = await client.configSet("max_position_usd", "250");
+      expect(res.v).toBe(1);
+      expect(res.type).toBe("config.set.response");
+
+      client.disconnect();
+    });
+
+    test("pause helper works", async () => {
+      const client = new IPCClient({
+        socketPath: SOCK_PATH,
+        requestTimeoutMs: 3000,
+      });
+      await client.connect();
+
+      const res = await client.pause();
+      expect(res.v).toBe(1);
+      expect(res.type).toBe("pause.response");
+
+      client.disconnect();
+    });
+
+    test("pnl helper works", async () => {
+      const client = new IPCClient({
+        socketPath: SOCK_PATH,
+        requestTimeoutMs: 3000,
+      });
+      await client.connect();
+
+      const res = await client.pnl("7d");
+      expect(res.v).toBe(1);
+      expect(res.type).toBe("pnl.query.response");
+
+      client.disconnect();
+    });
+  });
+
   describe("Phase 2 message types", () => {
     test("order.place request gets response", async () => {
       const client = new IPCClient({

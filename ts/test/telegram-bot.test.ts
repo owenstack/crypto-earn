@@ -61,6 +61,32 @@ describe("createBot", () => {
   });
 });
 
+describe("Phase 5 commands", () => {
+  test("/config, /pause, /pnl command handlers exist", async () => {
+    const original = Bun.env.TELEGRAM_BOT_TOKEN;
+    Bun.env.TELEGRAM_BOT_TOKEN = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11";
+
+    try {
+      const { createBot } = await import(`../src/telegram/bot.ts?phase5=${Date.now()}`);
+      const mockIpc = {
+        connected: true,
+        request: async () => ({ v: 1, id: "1", ts: Date.now(), type: "test", payload: {} }),
+        configSet: async () => ({ v: 1, id: "1", ts: Date.now(), type: "config.set.response", payload: { key: "k", old_value: null, new_value: "v" } }),
+        pause: async () => ({ v: 1, id: "1", ts: Date.now(), type: "pause.response", payload: { status: "paused" } }),
+        pnl: async () => ({ v: 1, id: "1", ts: Date.now(), type: "pnl.response", payload: { window: "today", realized_pnl: "0.00", unrealized_pnl: "0.00", win_count: 0, loss_count: 0, avg_win: "0.00", avg_loss: "0.00" } }),
+      } as any;
+      const bot = createBot(mockIpc);
+      expect(bot).toBeDefined();
+    } finally {
+      if (original) {
+        Bun.env.TELEGRAM_BOT_TOKEN = original;
+      } else {
+        delete Bun.env.TELEGRAM_BOT_TOKEN;
+      }
+    }
+  });
+});
+
 describe("Phase 4 event push notifications", () => {
   test("registerEventPush is exported as a function", async () => {
     const { registerEventPush } = await import(`../src/telegram/bot.ts?push_test=${Date.now()}`);

@@ -43,3 +43,23 @@ describe("makeRequest", () => {
     expect(env.ts).toBeLessThanOrEqual(after);
   });
 });
+
+describe("Phase 5 message types", () => {
+  test("config.set request envelope", () => {
+    const env = makeRequest("config.set", { key: "max_position_usd", value: "250" });
+    expect(env.type).toBe("config.set");
+    expect(env.payload).toEqual({ key: "max_position_usd", value: "250" });
+  });
+
+  test("pause request envelope", () => {
+    const env = makeRequest("pause");
+    expect(env.type).toBe("pause");
+    expect(env.payload).toEqual({});
+  });
+
+  test("pnl.query request envelope", () => {
+    const env = makeRequest("pnl.query", { window: "7d" });
+    expect(env.type).toBe("pnl.query");
+    expect(env.payload).toEqual({ window: "7d" });
+  });
+});
