@@ -92,6 +92,7 @@ describe("dashboardRoutes", () => {
     expect(paths).toContain("/api/logs");
     expect(paths).toContain("/api/heartbeat");
     expect(paths).toContain("/api/config");
+    expect(paths).toContain("/api/markets");
   });
 
   describe("Bearer auth", () => {
@@ -202,6 +203,59 @@ describe("dashboardRoutes", () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(Array.isArray(body.logs)).toBe(true);
+    });
+  });
+
+  describe("/api/markets (Phase 6)", () => {
+    test("unauthenticated request returns 401", async () => {
+      const routes = dashboardRoutes(makeIpcMock() as any);
+      const res = await routes["/api/markets"].GET(unauthedReq("/api/markets"));
+      expect(res.status).toBe(401);
+    });
+
+    test("wrong token returns 401", async () => {
+      const routes = dashboardRoutes(makeIpcMock() as any);
+      const res = await routes["/api/markets"].GET(badAuthReq("/api/markets"));
+      expect(res.status).toBe(401);
+    });
+
+    test("returns markets when IPC connected", async () => {
+      const mock = {
+        ...makeIpcMock(true),
+        async request(_type: string) {
+          return {
+            v: 1 as const,
+            id: "mock-id",
+            ts: Date.now(),
+            type: "market.list.response",
+            payload: { markets: [{ id: "m1", question: "Test?", best_bid: 0.45, best_ask: 0.55, active: true }] },
+          };
+        },
+      };
+      const routes = dashboardRoutes(mock as any);
+      const res = await routes["/api/markets"].GET(authedReq("/api/markets"));
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(Array.isArray(body.markets)).toBe(true);
+      expect(body.markets.length).toBe(1);
+    });
+
+    test("returns empty markets when IPC disconnected", async () => {
+      const routes = dashboardRoutes(makeIpcMock(false) as any);
+      const res = await routes["/api/markets"].GET(authedReq("/api/markets"));
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.markets).toEqual([]);
+    });
+  });
+
+  describe("Cache-Control headers", () => {
+    test("all routes return no-store", async () => {
+      const routes = dashboardRoutes(makeIpcMock() as any);
+      for (const [path, handlers] of Object.entries(routes)) {
+        const res = await (handlers as any).GET(authedReq(path));
+        expect(res.headers.get("Cache-Control")).toBe("no-store");
+      }
     });
   });
 });

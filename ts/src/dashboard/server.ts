@@ -76,5 +76,14 @@ export function dashboardRoutes(ipc: IPCClient) {
         return json(res?.payload ?? { config: {} });
       },
     },
+
+    "/api/markets": {
+      async GET(req: Request) {
+        if (!bearerAuth(req)) return unauthorized();
+        if (!ipc.connected) return json({ markets: [] });
+        const res = await ipc.request("market.list").catch(() => null);
+        return json(res?.payload ?? { markets: [] });
+      },
+    },
   } as const;
 }
