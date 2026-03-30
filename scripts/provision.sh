@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 ENGINE_USER="cex-engine"
 ENGINE_GROUP="cex-engine"
@@ -10,17 +10,26 @@ if [ -z "$NOLOGIN_SHELL" ]; then
 fi
 
 echo "--- Installing Zig 0.15.2 ---"
-curl -fsSL https://bun.sh/install | bash
-export PATH="$HOME/.bun/bin:$PATH"
-tar xf zig-linux-x86_64-0.15.2.tar.xz
-sudo mv zig-linux-x86_64-0.15.2 /usr/local/zig
+echo "--- Installing Zig 0.15.2 ---"
+ARCH=$(uname -m)
+case "$ARCH" in
+  x86_64)  ZIG_ARCH="x86_64" ;;
+  aarch64) ZIG_ARCH="aarch64" ;;
+  *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
+esac
+ZIG_TARBALL="zig-linux-${ZIG_ARCH}-0.15.2.tar.xz"
+ZIG_URL="https://ziglang.org/download/0.15.2/${ZIG_TARBALL}"
+
+curl -fsSL "$ZIG_URL" -o "$ZIG_TARBALL"
+tar xf "$ZIG_TARBALL"
+sudo rm -rf /usr/local/zig
+sudo mv "zig-linux-${ZIG_ARCH}-0.15.2" /usr/local/zig
 sudo ln -sf /usr/local/zig/zig /usr/local/bin/zig
-zig version
+rm -f "$ZIG_TARBALL"
 
 echo "--- Installing Bun ---"
 curl -fsSL https://bun.sh/install | bash
 export PATH="$HOME/.bun/bin:$PATH"
-bun --version
 
 echo "--- Installing OS Deps ---"
 if [ -f /etc/debian_version ]; then
@@ -54,6 +63,21 @@ if [ -d "$APP_DIR" ]; then
   sudo chown -R "$ENGINE_USER:$ENGINE_GROUP" "$APP_DIR"
 else
   echo "--- Skipping ownership fix: $APP_DIR does not exist yet ---"
+fi
+
+echo "--- Verifying prerequisites ---"
+fail=0
+for cmd in zig bun sqlite3; do
+  if command -v "$cmd" &>/dev/null; then
+    echo "    OK   $cmd ($(command -v "$cmd"))"
+  else
+    echo "    FAIL $cmd not found" >&2
+    fail=1
+  fi
+done
+if [ "$fail" -ne 0 ]; then
+  echo "ERROR: One or more prerequisites are missing. Check output above." >&2
+  exit 1
 fi
 
 echo "--- Setup Complete ---"

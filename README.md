@@ -18,8 +18,13 @@ infrastructure/ — Terraform (Phase 2+)
 | Phase | Scope |
 |-------|-------|
 | **0** | Infrastructure, split architecture, SQLite WAL, IPC transport, read-only control plane |
-| 1 | Strategy signals, risk gate, order execution (CLOB signing) |
-| 2 | Multi-exchange, advanced risk, backtesting |
+| **1** | Strategy signals, risk gate, order execution (CLOB signing) |
+| **2** | Multi-exchange, advanced risk, backtesting |
+| **3** | Paper-trading simulation, P&L tracking |
+| **4** | Live execution hardening, circuit breakers |
+| **5** | Observability, metrics, alerting |
+| **6** | Performance tuning, latency profiling |
+| **7** | Deployment automation, systemd hardening, e2e validation |
 
 ## Prerequisites
 
@@ -80,6 +85,90 @@ cd zig && zig build run
 cd ts && bun run dev
 ```
 
+## EC2 Deployment (systemd)
+
+### Prerequisites
+
+- EC2 instance (Ubuntu 22.04+ recommended)
+- SSH access with sudo privileges
+
+### First-time setup
+
+```sh
+# Clone to /opt/cex-zig
+sudo git clone <repo-url> /opt/cex-zig
+cd /opt/cex-zig
+
+# Provision: installs deps, creates cex-engine user, installs systemd units
+sudo scripts/provision.sh
+
+# Configure environment
+sudo cp .env.example .env
+sudo nano .env  # Set real values
+sudo chown cex-engine:cex-engine .env
+sudo chmod 0640 .env
+```
+
+### Deploy
+
+```sh
+scripts/deploy.sh --restart-services
+```
+
+### Verify
+
+```sh
+scripts/verify.sh
+```
+
+## Operational Commands
+
+```sh
+# Start / stop / restart services
+sudo systemctl start cex-engine cex-control
+sudo systemctl stop cex-engine cex-control
+sudo systemctl restart cex-engine cex-control
+
+# Status
+sudo systemctl status cex-engine cex-control
+
+# Logs (follow)
+sudo journalctl -u cex-engine -f
+sudo journalctl -u cex-control -f
+
+# Run database migrations (DB_PATH is required)
+# Option 1: pass DB_PATH as a CLI argument
+scripts/migrate.sh /opt/cex-zig/zig/data/cex.db
+
+# Option 2: export DB_PATH in the environment
+export DB_PATH=/opt/cex-zig/zig/data/cex.db
+scripts/migrate.sh
+
+# Post-deploy validation (end-to-end)
+scripts/e2e-test.sh
+
+# Latency profiling
+scripts/latency-profile.sh
+```
+
+## Rollback
+
+1. Stop services: `sudo systemctl stop cex-engine cex-control`
+2. Checkout previous tag/commit: `git checkout <previous-tag>`
+3. Rebuild: `cd zig && zig build -Doptimize=ReleaseFast`
+4. Restart: `sudo systemctl start cex-engine cex-control`
+
+> **Note:** Migration rollback is not automated. SQLite — restore from backup if needed.
+
+## Security Model
+
+- **Dashboard is read-only** — no write or trade endpoints are exposed.
+- **Telegram is the control surface** — place orders, halt/resume, strategy control all go through the Telegram bot.
+- **Unprivileged execution** — services run as the `cex-engine` user with systemd sandboxing (`ProtectSystem`, `PrivateTmp`, `NoNewPrivileges`, etc.).
+- **Firewall** — recommended: allow only SSH + dashboard port; block all other inbound traffic.
+- **Dashboard auth** — restrict access with `DASHBOARD_SECRET` Bearer token authentication.
+- **`.env` permissions** — file should be owned by `cex-engine:cex-engine` with mode `0640`.
+
 ## IPC Protocol
 
 JSON-lines over UNIX domain socket (`IPC_SOCKET`).
@@ -93,13 +182,8 @@ Supported types (Phase 0): `heartbeat`, `status`, `portfolio`, `orders`, `config
 
 ## Verification
 
+Run the unified verification script to check the build, typecheck, tests, and service health:
+
 ```sh
-# 1. Zig build
-cd zig && zig build -Doptimize=ReleaseFast
-
-# 2. TS typecheck
-cd ts && bun run typecheck
-
-# 3. Contract tests
-cd ts && bun test src/ipc/
+scripts/verify.sh
 ```
