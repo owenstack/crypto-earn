@@ -1,19 +1,20 @@
+
 [Unit]
 Description=CEX Control Plane (Bun)
 After=network.target cex-engine.service
 Requires=cex-engine.service
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
 
 [Service]
 Type=simple
-
 # Run as dedicated service user, not root
 User=cex-engine
 Group=cex-engine
-
 WorkingDirectory=/opt/cex-zig/ts
 EnvironmentFile=/opt/cex-zig/.env
 ExecStart=/usr/local/bin/bun src/index.ts
-
 # Sandboxing / hardening
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -25,17 +26,12 @@ ProtectKernelModules=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
 AmbientCapabilities=
-
 # Filesystem access
 ReadOnlyPaths=/opt/cex-zig /opt/cex-zig/ts
 ReadWritePaths=/opt/cex-zig/zig/data
-
-# Restart policy (bounded)
+# Restart policy
 Restart=on-failure
 RestartSec=5
-StartLimitBurst=3
-StartLimitIntervalSec=60
-
 # Timeout policies
 TimeoutStartSec=30
 TimeoutStopSec=15
