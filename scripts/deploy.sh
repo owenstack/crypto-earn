@@ -50,16 +50,40 @@ elif [[ -f "$DIR/.env" ]]; then
 fi
 bash "$DIR/scripts/migrate.sh"
 
-# --- Step 4: Service install ---
-echo "==> Step 4: Service install"
+# --- Step 4: Sync to /opt/cex-zig ---
+echo "==> Step 4: Syncing files to /opt/cex-zig"
+# Stop services before sync if they are active
+for unit in cex-engine cex-control; do
+  if systemctl is-active --quiet "$unit.service"; then
+    echo "    STOP $unit"
+    sudo systemctl stop "$unit.service"
+  fi
+done
+
+sudo mkdir -p /opt/cex-zig /opt/cex-zig/db
+sudo rsync -av --exclude='.git' --exclude='node_modules' "$DIR/" /opt/cex-zig/
+
+# Ensure .env exists in /opt/cex-zig
+if [[ ! -f /opt/cex-zig/.env ]]; then
+  echo "    COPY .env.example -> /opt/cex-zig/.env"
+  sudo cp /opt/cex-zig/.env.example /opt/cex-zig/.env
+  # Update DB_PATH in .env to an absolute path in /opt/cex-zig/db
+  sudo sed -i "s|DB_PATH=.*|DB_PATH=/opt/cex-zig/db/cex.sqlite3|" /opt/cex-zig/.env
+fi
+
+# Fix ownership
+sudo chown -R cex-engine:cex-engine /opt/cex-zig
+
+# --- Step 5: Service install ---
+echo "==> Step 5: Service install"
 if [[ "$RESTART_SERVICES" == true ]]; then
   bash "$DIR/scripts/install-services.sh" --restart
 else
   bash "$DIR/scripts/install-services.sh"
 fi
 
-# --- Step 5: Smoke checks ---
-echo "==> Step 5: Post-start smoke checks"
+# --- Step 6: Smoke checks ---
+echo "==> Step 6: Post-start smoke checks"
 all_ok=true
 for unit in cex-engine cex-control; do
   if systemctl is-active --quiet "$unit.service"; then

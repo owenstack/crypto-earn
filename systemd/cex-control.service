@@ -27,8 +27,8 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
 AmbientCapabilities=
 # Filesystem access
-ReadOnlyPaths=/opt/cex-zig /opt/cex-zig/ts
-ReadWritePaths=/opt/cex-zig/zig/data
+ReadOnlyPaths=/opt/cex-zig
+ReadWritePaths=/opt/cex-zig/db /opt/cex-zig/zig/data
 # Restart policy
 Restart=on-failure
 RestartSec=5
