@@ -50,8 +50,14 @@ pub fn main() !void {
     var pt = portfolio.PortfolioTracker.init(allocator, &database, .{});
     log.info("engine", "portfolio tracker ready", .{});
 
+    // Initialize WebSocket client for real-time CLOB updates
+    var ws_client = ws.WebSocketClient.init(allocator);
+    ws_client.setCallback(&wsPriceCallback);
+    log.info("engine", "websocket client ready", .{});
+
     // Spawn market scanner thread
     var scan = scanner.Scanner.init(allocator, &database, .{});
+    scan.setWebSocketClient(&ws_client);
     const scanner_thread = try std.Thread.spawn(.{}, scanner.Scanner.run, .{&scan});
     defer {
         scan.stop();
@@ -59,6 +65,15 @@ pub fn main() !void {
         scan.deinit();
     }
     log.info("engine", "market scanner started", .{});
+
+    // Spawn WebSocket thread for real-time orderbook feeds
+    const ws_thread = try std.Thread.spawn(.{}, ws.WebSocketClient.connectAndRun, .{&ws_client});
+    defer {
+        ws_client.stop();
+        ws_thread.join();
+        ws_client.deinit();
+    }
+    log.info("engine", "websocket feed started", .{});
 
     // Spawn stale order scan ticker
     om.should_stop.store(false, .seq_cst);
@@ -104,8 +119,8 @@ const StrategyWorkerCtx = struct {
 /// Strategy worker: periodically evaluates enabled strategies and dispatches signals.
 /// Respects halt state — blocks dispatch when engine is halted.
 fn strategyWorker(ctx: *StrategyWorkerCtx) void {
-    const eval_interval_ns: u64 = 30 * std.time.ns_per_s;
-    log.info("strategy_worker", "strategy evaluation loop started (30s interval)", .{});
+    const eval_interval_ns: u64 = 5 * std.time.ns_per_s;
+    log.info("strategy_worker", "strategy evaluation loop started (5s interval)", .{});
 
     while (!ctx.should_stop.load(.seq_cst)) {
         std.Thread.sleep(eval_interval_ns);
@@ -188,7 +203,7 @@ fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
                         break;
                     } else {
                         log.err("strategy_worker", "cancelOrder failed for {s} (attempt {d}/{d})", .{ s.order_id, attempt + 1, max_retries });
-                        std.time.sleep(100_000_000 * (attempt + 1)); // Exponential backoff: 100ms, 200ms, 300ms
+                        std.Thread.sleep(100_000_000 * (attempt + 1)); // Exponential backoff: 100ms, 200ms, 300ms
                     }
                 }
                 if (cancelled) {
@@ -245,6 +260,16 @@ fn queryLastMid(database: *db.DB, market_id: []const u8) ?f64 {
     if (db.c.sqlite3_column_type(stmt, 0) == db.c.SQLITE_NULL) return null;
     const mid = db.c.sqlite3_column_double(stmt, 0);
     return mid;
+}
+
+/// Callback for real-time WebSocket price updates.
+fn wsPriceCallback(update: ws.PriceUpdate) void {
+    log.debug("ws_feed", "{s} {s}: bid={s} ask={s}", .{
+        update.event_type,
+        update.asset_id[0..@min(update.asset_id.len, 16)],
+        update.best_bid,
+        update.best_ask,
+    });
 }
 
 fn priceToImpliedProb(mid_price: f64) f64 {

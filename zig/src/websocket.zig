@@ -1,9 +1,22 @@
 //! WebSocket client with auto-reconnect and subscription management.
-//! Connects to Polymarket CLOB WebSocket for real-time price feeds.
+//! Connects to Polymarket CLOB WebSocket for real-time orderbook feeds.
 const std = @import("std");
 const log = @import("logger.zig");
+const ws_lib = @import("websocket");
 
-pub const WS_ENDPOINT = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+pub const WS_HOST = "ws-subscriptions-clob.polymarket.com";
+pub const WS_PATH = "/ws/market";
+
+pub const EventType = enum {
+    book,
+    price_change,
+    last_trade_price,
+    tick_size_change,
+    best_bid_ask,
+    new_market,
+    market_resolved,
+    unknown,
+};
 
 pub const PriceUpdate = struct {
     asset_id: []const u8,
@@ -47,7 +60,6 @@ pub const WebSocketClient = struct {
         };
     }
 
-    /// Request the poll/connect loop to stop.
     pub fn stop(self: *WebSocketClient) void {
         self.should_stop.store(true, .seq_cst);
     }
@@ -65,6 +77,10 @@ pub const WebSocketClient = struct {
 
     /// Add a subscription for an asset_id. Will be sent when connected.
     pub fn subscribe(self: *WebSocketClient, asset_id: []const u8) !void {
+        // Avoid duplicate subscriptions
+        for (self.subscriptions.items) |existing| {
+            if (std.mem.eql(u8, existing, asset_id)) return;
+        }
         const copy = try self.allocator.dupe(u8, asset_id);
         try self.subscriptions.append(self.allocator, copy);
         log.info("ws", "subscribed to {s}", .{asset_id[0..@min(asset_id.len, 20)]});
@@ -83,16 +99,24 @@ pub const WebSocketClient = struct {
         return fbs.getWritten();
     }
 
+    /// Build a dynamic subscribe message for a single asset_id.
+    fn buildDynamicSubscribe(buf: []u8, asset_id: []const u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const writer = fbs.writer();
+        try writer.print("{{\"assets_ids\":[\"{s}\"],\"operation\":\"subscribe\"}}", .{asset_id});
+        return fbs.getWritten();
+    }
+
     /// Connect and run the WebSocket read loop. Blocks.
     /// On disconnect, reconnects with exponential backoff (250ms -> 30s).
-    /// This remains internal until native WebSocket upgrade support is implemented.
-    fn connectAndRun(self: *WebSocketClient) void {
+    /// Call from a dedicated thread.
+    pub fn connectAndRun(self: *WebSocketClient) void {
         while (!self.should_stop.load(.seq_cst)) {
             self.state = .connecting;
-            log.info("ws", "connecting to CLOB WebSocket...", .{});
+            log.info("ws", "connecting to Polymarket CLOB WebSocket...", .{});
 
             self.runConnection() catch |e| {
-                log.err("ws", "connection error: {}", .{e});
+                log.err("ws", "connection error: {s}", .{@errorName(e)});
             };
 
             if (self.should_stop.load(.seq_cst)) break;
@@ -106,72 +130,73 @@ pub const WebSocketClient = struct {
     }
 
     fn runConnection(self: *WebSocketClient) !void {
-        var client = std.http.Client{ .allocator = self.allocator };
+        var client = try ws_lib.Client.init(self.allocator, .{
+            .host = WS_HOST,
+            .port = 443,
+            .tls = true,
+        });
         defer client.deinit();
 
-        const uri = try std.Uri.parse(WS_ENDPOINT);
-        try self.performUpgrade_unimplemented(&client, uri);
+        try client.handshake(WS_PATH, .{
+            .timeout_ms = 10_000,
+            .headers = "Host: " ++ WS_HOST ++ "\r\n",
+        });
 
-        // Successful upgrade path: transition state first, then reset backoff.
         self.state = .connected;
         self.resetBackoff();
+        log.info("ws", "connected, sending subscriptions ({d} assets)", .{self.subscriptions.items.len});
 
-        // Stub: actual WebSocket read/serve loop will be filled in once we
-        // validate the std.http.Client WebSocket API surface.
-    }
-
-    // TODO(ws): implement RFC 6455 handshake.
-    fn performUpgrade_unimplemented(self: *WebSocketClient, client: *std.http.Client, uri: std.Uri) !void {
-        _ = self;
-        _ = client;
-        _ = uri;
-        return error.NotImplemented;
-    }
-
-    /// Poll-based fallback: fetch orderbook snapshots via REST and invoke callback.
-    /// This is used until native WebSocket support is added.
-    /// Blocks — call from a dedicated thread.
-    pub fn pollAndNotify(self: *WebSocketClient, poll_interval_ms: u64) void {
-        const http_mod = @import("http_client.zig");
-        const clob = @import("clob_orderbook.zig");
-
-        self.state = .connected;
-        log.info("ws", "starting REST poll fallback ({d}ms interval, {d} subscriptions)", .{ poll_interval_ms, self.subscriptions.items.len });
-
-        var client = http_mod.HttpClient.init(self.allocator);
-        defer client.deinit();
-
-        while (!self.should_stop.load(.seq_cst)) {
-            for (self.subscriptions.items) |asset_id| {
-                if (self.should_stop.load(.seq_cst)) break;
-
-                var ob = clob.fetchOrderbook(self.allocator, &client, asset_id) catch |e| {
-                    log.warn("ws", "poll fetch failed for {s}: {s}", .{ asset_id[0..@min(asset_id.len, 16)], @errorName(e) });
-                    continue;
-                };
-                defer ob.deinit(self.allocator);
-
-                if (self.callback) |cb| {
-                    var ts_buf: [32]u8 = undefined;
-                    const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch "0";
-                    cb(.{
-                        .asset_id = asset_id,
-                        .market = ob.market,
-                        .best_bid = ob.best_bid,
-                        .best_ask = ob.best_ask,
-                        .timestamp = ts_str,
-                        .event_type = "price_update",
-                    });
-                }
-            }
-
-            if (self.should_stop.load(.seq_cst)) break;
-
-            std.Thread.sleep(poll_interval_ms * std.time.ns_per_ms);
+        // Send initial subscription for all tracked assets
+        if (self.subscriptions.items.len > 0) {
+            var sub_buf: [65536]u8 = undefined;
+            const sub_msg = self.buildSubscriptionMessage(&sub_buf) catch |e| {
+                log.err("ws", "failed to build subscription message: {s}", .{@errorName(e)});
+                return e;
+            };
+            // websocket.zig client.write takes []u8 (mutable for masking)
+            var mut_buf: [65536]u8 = undefined;
+            const len = sub_msg.len;
+            @memcpy(mut_buf[0..len], sub_msg);
+            client.write(mut_buf[0..len]) catch |e| {
+                log.err("ws", "failed to send subscription: {s}", .{@errorName(e)});
+                return e;
+            };
+            log.info("ws", "subscription message sent", .{});
         }
 
-        self.state = .disconnected;
-        log.info("ws", "REST poll fallback stopped", .{});
+        // Read loop — blocks until disconnect or error
+        var handler = Handler{ .ws_client = self };
+        try client.readLoop(&handler);
+    }
+
+    /// Parse incoming WebSocket message and invoke callback.
+    fn handleMessage(self: *WebSocketClient, data: []const u8) void {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, data, .{}) catch {
+            log.warn("ws", "failed to parse WS message", .{});
+            return;
+        };
+        defer parsed.deinit();
+
+        const root = switch (parsed.value) {
+            .object => |obj| obj,
+            else => return,
+        };
+
+        const event_type_str = if (root.get("event_type")) |v| switch (v) {
+            .string => |s| s,
+            else => "unknown",
+        } else "unknown";
+
+        const event = parseEventType(event_type_str);
+
+        switch (event) {
+            .book => handleBookEvent(self, root),
+            .price_change => handlePriceChangeEvent(self, root),
+            .last_trade_price => handleLastTradeEvent(self, root),
+            .best_bid_ask => handleBestBidAskEvent(self, root),
+            .tick_size_change => handleTickSizeChangeEvent(self, root),
+            .unknown, .new_market, .market_resolved => {},
+        }
     }
 
     /// Reset reconnect delay on successful connection.
@@ -180,34 +205,221 @@ pub const WebSocketClient = struct {
     }
 };
 
+/// Handler for incoming WebSocket messages from the karlseguin/websocket.zig read loop.
+const Handler = struct {
+    ws_client: *WebSocketClient,
+
+    pub fn serverMessage(self: *Handler, data: []u8) !void {
+        self.ws_client.handleMessage(data);
+    }
+
+    pub fn close(_: *Handler) void {}
+};
+
+fn parseEventType(s: []const u8) EventType {
+    if (std.mem.eql(u8, s, "book")) return .book;
+    if (std.mem.eql(u8, s, "price_change")) return .price_change;
+    if (std.mem.eql(u8, s, "last_trade_price")) return .last_trade_price;
+    if (std.mem.eql(u8, s, "tick_size_change")) return .tick_size_change;
+    if (std.mem.eql(u8, s, "best_bid_ask")) return .best_bid_ask;
+    if (std.mem.eql(u8, s, "new_market")) return .new_market;
+    if (std.mem.eql(u8, s, "market_resolved")) return .market_resolved;
+    return .unknown;
+}
+
+fn jsonStr(obj: std.json.ObjectMap, key: []const u8) []const u8 {
+    return if (obj.get(key)) |v| switch (v) {
+        .string => |s| s,
+        else => "",
+    } else "";
+}
+
+fn handleBookEvent(self: *WebSocketClient, root: std.json.ObjectMap) void {
+    // Full orderbook snapshot: has bids[], asks[], market, asset_id, timestamp
+    const asset_id = jsonStr(root, "asset_id");
+    const market = jsonStr(root, "market");
+    const timestamp = jsonStr(root, "timestamp");
+
+    // Extract best bid/ask from the bids/asks arrays
+    var best_bid: []const u8 = "0";
+    var best_ask: []const u8 = "0";
+
+    if (root.get("bids")) |bids_val| {
+        if (bids_val == .array and bids_val.array.items.len > 0) {
+            if (bids_val.array.items[0] == .object) {
+                best_bid = jsonStr(bids_val.array.items[0].object, "price");
+            }
+        }
+    }
+    if (root.get("asks")) |asks_val| {
+        if (asks_val == .array and asks_val.array.items.len > 0) {
+            if (asks_val.array.items[0] == .object) {
+                best_ask = jsonStr(asks_val.array.items[0].object, "price");
+            }
+        }
+    }
+
+    if (self.callback) |cb| {
+        cb(.{
+            .asset_id = asset_id,
+            .market = market,
+            .best_bid = best_bid,
+            .best_ask = best_ask,
+            .timestamp = timestamp,
+            .event_type = "book",
+        });
+    }
+}
+
+fn handlePriceChangeEvent(self: *WebSocketClient, root: std.json.ObjectMap) void {
+    const asset_id = jsonStr(root, "asset_id");
+    const market = jsonStr(root, "market");
+    const timestamp = jsonStr(root, "timestamp");
+
+    // price_change events include price_changes[] with best_bid, best_ask
+    if (root.get("changes")) |changes_val| {
+        if (changes_val == .array) {
+            for (changes_val.array.items) |change| {
+                if (change == .object) {
+                    const best_bid = jsonStr(change.object, "best_bid");
+                    const best_ask = jsonStr(change.object, "best_ask");
+
+                    if (self.callback) |cb| {
+                        // Use JSON timestamp if present, else heap-allocate
+                        var ts_heap: ?[]u8 = null;
+                        const ts_final = if (timestamp.len > 0) timestamp else blk: {
+                            var ts_buf: [32]u8 = undefined;
+                            const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch "0";
+                            ts_heap = self.allocator.dupe(u8, ts_str) catch null;
+                            break :blk if (ts_heap) |h| h else "0";
+                        };
+                        cb(.{
+                            .asset_id = asset_id,
+                            .market = market,
+                            .best_bid = best_bid,
+                            .best_ask = best_ask,
+                            .timestamp = ts_final,
+                            .event_type = "price_change",
+                        });
+                        if (ts_heap) |h| self.allocator.free(h);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn handleLastTradeEvent(self: *WebSocketClient, root: std.json.ObjectMap) void {
+    const asset_id = jsonStr(root, "asset_id");
+    const market = jsonStr(root, "market");
+    const price = jsonStr(root, "price");
+    const timestamp = jsonStr(root, "timestamp");
+
+    if (self.callback) |cb| {
+        var ts_heap: ?[]u8 = null;
+        const ts_final = if (timestamp.len > 0) timestamp else blk: {
+            var ts_buf: [32]u8 = undefined;
+            const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch "0";
+            ts_heap = self.allocator.dupe(u8, ts_str) catch null;
+            break :blk if (ts_heap) |h| h else "0";
+        };
+        cb(.{
+            .asset_id = asset_id,
+            .market = market,
+            .best_bid = price,
+            .best_ask = price,
+            .timestamp = ts_final,
+            .event_type = "last_trade_price",
+        });
+        if (ts_heap) |h| self.allocator.free(h);
+    }
+}
+
+fn handleBestBidAskEvent(self: *WebSocketClient, root: std.json.ObjectMap) void {
+    const asset_id = jsonStr(root, "asset_id");
+    const market = jsonStr(root, "market");
+    const best_bid = jsonStr(root, "best_bid");
+    const best_ask = jsonStr(root, "best_ask");
+    const timestamp = jsonStr(root, "timestamp");
+
+    if (self.callback) |cb| {
+        var ts_heap: ?[]u8 = null;
+        const ts_final = if (timestamp.len > 0) timestamp else blk: {
+            var ts_buf: [32]u8 = undefined;
+            const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch "0";
+            ts_heap = self.allocator.dupe(u8, ts_str) catch null;
+            break :blk if (ts_heap) |h| h else "0";
+        };
+        cb(.{
+            .asset_id = asset_id,
+            .market = market,
+            .best_bid = best_bid,
+            .best_ask = best_ask,
+            .timestamp = ts_final,
+            .event_type = "best_bid_ask",
+        });
+        if (ts_heap) |h| self.allocator.free(h);
+    }
+}
+
+fn handleTickSizeChangeEvent(_: *WebSocketClient, root: std.json.ObjectMap) void {
+    const asset_id = jsonStr(root, "asset_id");
+    const old = jsonStr(root, "old_tick_size");
+    const new = jsonStr(root, "new_tick_size");
+    log.warn("ws", "tick_size_change for {s}: {s} -> {s}", .{
+        asset_id[0..@min(asset_id.len, 20)],
+        old,
+        new,
+    });
+}
+
 test "websocket: init and deinit" {
-    var ws = WebSocketClient.init(std.testing.allocator);
-    defer ws.deinit();
-    try std.testing.expectEqual(WebSocketState.disconnected, ws.state);
+    var ws_client = WebSocketClient.init(std.testing.allocator);
+    defer ws_client.deinit();
+    try std.testing.expectEqual(WebSocketState.disconnected, ws_client.state);
 }
 
 test "websocket: subscribe adds to list" {
-    var ws = WebSocketClient.init(std.testing.allocator);
-    defer ws.deinit();
-    try ws.subscribe("test-asset-id-123");
-    try std.testing.expectEqual(@as(usize, 1), ws.subscriptions.items.len);
+    var ws_client = WebSocketClient.init(std.testing.allocator);
+    defer ws_client.deinit();
+    try ws_client.subscribe("test-asset-id-123");
+    try std.testing.expectEqual(@as(usize, 1), ws_client.subscriptions.items.len);
+}
+
+test "websocket: subscribe deduplicates" {
+    var ws_client = WebSocketClient.init(std.testing.allocator);
+    defer ws_client.deinit();
+    try ws_client.subscribe("asset1");
+    try ws_client.subscribe("asset1");
+    try std.testing.expectEqual(@as(usize, 1), ws_client.subscriptions.items.len);
 }
 
 test "websocket: buildSubscriptionMessage" {
-    var ws = WebSocketClient.init(std.testing.allocator);
-    defer ws.deinit();
-    try ws.subscribe("asset1");
-    try ws.subscribe("asset2");
+    var ws_client = WebSocketClient.init(std.testing.allocator);
+    defer ws_client.deinit();
+    try ws_client.subscribe("asset1");
+    try ws_client.subscribe("asset2");
     var buf: [4096]u8 = undefined;
-    const msg = try ws.buildSubscriptionMessage(&buf);
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, msg, .{});
-    defer parsed.deinit();
-    try std.testing.expect(parsed.value == .object);
+    const msg = try ws_client.buildSubscriptionMessage(&buf);
+    var parsed_msg = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, msg, .{});
+    defer parsed_msg.deinit();
+    try std.testing.expect(parsed_msg.value == .object);
+    // Verify custom_feature_enabled is present and true
+    const cfe = parsed_msg.value.object.get("custom_feature_enabled").?;
+    try std.testing.expect(cfe == .bool);
+    try std.testing.expect(cfe.bool == true);
 }
 
 test "websocket: exponential backoff constants" {
-    var ws = WebSocketClient.init(std.testing.allocator);
-    defer ws.deinit();
-    try std.testing.expectEqual(@as(u64, 250), ws.reconnect_delay_ms);
-    try std.testing.expectEqual(@as(u64, 30_000), ws.max_reconnect_delay_ms);
+    var ws_client = WebSocketClient.init(std.testing.allocator);
+    defer ws_client.deinit();
+    try std.testing.expectEqual(@as(u64, 250), ws_client.reconnect_delay_ms);
+    try std.testing.expectEqual(@as(u64, 30_000), ws_client.max_reconnect_delay_ms);
+}
+
+test "websocket: parseEventType" {
+    try std.testing.expectEqual(EventType.book, parseEventType("book"));
+    try std.testing.expectEqual(EventType.price_change, parseEventType("price_change"));
+    try std.testing.expectEqual(EventType.best_bid_ask, parseEventType("best_bid_ask"));
+    try std.testing.expectEqual(EventType.unknown, parseEventType("garbage"));
 }

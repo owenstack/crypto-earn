@@ -10,6 +10,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    // WebSocket dependency
+    const websocket_dep = b.dependency("websocket", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Main engine executable
     const exe = b.addExecutable(.{
         .name = "cex-engine",
@@ -19,6 +25,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zig", .module = mod },
+                .{ .name = "websocket", .module = websocket_dep.module("websocket") },
             },
         }),
     });

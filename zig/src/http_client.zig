@@ -72,6 +72,20 @@ pub const HttpClient = struct {
         var body_writer = std.Io.Writer.Allocating.init(self.allocator);
         errdefer body_writer.deinit();
 
+        // Ensure Accept-Encoding: identity is present to avoid Zig 0.15.2 flate decompressor bug.
+        var has_accept_encoding = false;
+        for (merged_headers.items) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "Accept-Encoding")) {
+                has_accept_encoding = true;
+                break;
+            }
+        }
+        if (!has_accept_encoding) {
+            merged_headers.append(self.allocator, .{ .name = "Accept-Encoding", .value = "identity" }) catch {
+                return error.RequestFailed;
+            };
+        }
+
         const result = self.client.fetch(.{
             .location = .{ .uri = uri },
             .method = .POST,
@@ -118,10 +132,14 @@ pub const HttpClient = struct {
             .method = method,
             .payload = payload,
             .response_writer = &body_writer.writer,
-            .extra_headers = if (payload != null) &.{.{
-                .name = "Content-Type",
-                .value = "application/json",
-            }} else &.{},
+            // Force identity encoding to avoid the Zig 0.15.2 flate decompressor
+            // bug where unreachableRebase panics on back-references in indirect mode.
+            .extra_headers = if (payload != null) &.{
+                .{ .name = "Content-Type", .value = "application/json" },
+                .{ .name = "Accept-Encoding", .value = "identity" },
+            } else &.{
+                .{ .name = "Accept-Encoding", .value = "identity" },
+            },
         }) catch {
             log.err("http", "{s} {s} failed", .{ @tagName(method), url });
             return error.RequestFailed;

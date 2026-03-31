@@ -29,34 +29,53 @@ pub const GammaMarket = struct {
     accepting_orders: bool,
 };
 
-/// Poll markets from Gamma API, filter by config, return filtered list.
+/// Poll markets from Gamma API via /events endpoint, filter by config, return filtered list.
 /// Caller owns the returned slice and all string data within.
 pub fn pollMarkets(allocator: std.mem.Allocator, client: *http.HttpClient, config: FilterConfig) ![]GammaMarket {
     var url_buf: [512]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "{s}/markets?active=true&closed=false&limit={d}&offset=0&order=volume_24hr&ascending=false", .{
+    const url = std.fmt.bufPrint(&url_buf, "{s}/events?active=true&closed=false&limit={d}&offset=0&order=volume24hr&ascending=false", .{
         GAMMA_API_BASE,
         config.limit,
     }) catch return error.Overflow;
 
     var response = client.get(url) catch |e| {
-        log.err("gamma", "GET /markets failed: {s}", .{@errorName(e)});
+        log.err("gamma", "GET /events failed: {s}", .{@errorName(e)});
         return error.RequestFailed;
     };
     defer response.deinit();
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, response.body, .{}) catch {
-        log.err("gamma", "failed to parse markets JSON", .{});
+        log.err("gamma", "failed to parse events JSON", .{});
         return error.InvalidJson;
     };
     defer parsed.deinit();
 
-    const items = switch (parsed.value) {
+    const events = switch (parsed.value) {
         .array => |arr| arr.items,
         else => {
-            log.err("gamma", "expected JSON array from /markets", .{});
+            log.err("gamma", "expected JSON array from /events", .{});
             return error.InvalidJson;
         },
     };
+
+    // Collect all nested markets from events into a flat list
+    var all_markets: std.ArrayList(std.json.Value) = .empty;
+    defer all_markets.deinit(allocator);
+    for (events) |event| {
+        const obj = switch (event) {
+            .object => |o| o,
+            else => continue,
+        };
+        const nested = obj.get("markets") orelse continue;
+        const nested_arr = switch (nested) {
+            .array => |a| a.items,
+            else => continue,
+        };
+        for (nested_arr) |m| {
+            try all_markets.append(allocator, m);
+        }
+    }
+    const items = all_markets.items;
 
     const now_s = std.time.timestamp();
     const max_ts: i64 = now_s + @as(i64, @intCast(config.max_resolution_days)) * 86400;

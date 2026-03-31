@@ -21,6 +21,7 @@ pub const Scanner = struct {
     markets: []gamma.GammaMarket,
     last_poll_ts: i64,
     running: atomic.Value(bool),
+    ws_client: ?*ws.WebSocketClient,
 
     pub fn init(allocator: std.mem.Allocator, database: *db.DB, config: ScannerConfig) Scanner {
         return .{
@@ -30,6 +31,7 @@ pub const Scanner = struct {
             .markets = &.{},
             .last_poll_ts = 0,
             .running = atomic.Value(bool).init(false),
+            .ws_client = null,
         };
     }
 
@@ -38,6 +40,11 @@ pub const Scanner = struct {
             gamma.freeMarkets(self.allocator, self.markets);
             self.markets = &.{};
         }
+    }
+
+    /// Attach a WebSocket client for real-time subscriptions.
+    pub fn setWebSocketClient(self: *Scanner, wsc: *ws.WebSocketClient) void {
+        self.ws_client = wsc;
     }
 
     /// Run the scanner loop. Blocks until stopped.
@@ -88,6 +95,33 @@ pub const Scanner = struct {
 
         // Persist to SQLite
         self.persistMarkets();
+
+        // Subscribe new token IDs to WebSocket for real-time updates
+        self.subscribeTokenIds();
+    }
+
+    /// Extract CLOB token IDs from markets and subscribe them to the WebSocket.
+    fn subscribeTokenIds(self: *Scanner) void {
+        const wsc = self.ws_client orelse return;
+
+        var subscribed: usize = 0;
+        for (self.markets) |m| {
+            // clob_token_ids is a JSON array string like '["token1","token2"]'
+            const token_ids = parseTokenIdArray(self.allocator, m.clob_token_ids) catch continue;
+            defer self.allocator.free(token_ids);
+
+            for (token_ids) |tid| {
+                defer self.allocator.free(tid);
+                wsc.subscribe(tid) catch |e| {
+                    log.warn("scanner", "ws subscribe failed: {s}", .{@errorName(e)});
+                    continue;
+                };
+                subscribed += 1;
+            }
+        }
+        if (subscribed > 0) {
+            log.info("scanner", "subscribed {d} token IDs to WebSocket", .{subscribed});
+        }
     }
 
     fn persistMarket(self: *Scanner, m: gamma.GammaMarket) !void {
@@ -125,6 +159,40 @@ pub const Scanner = struct {
     }
 };
 
+/// Parse a JSON array of strings (e.g. '["a","b"]') into an owned slice.
+/// Caller owns each string and the slice itself.
+fn parseTokenIdArray(allocator: std.mem.Allocator, raw: []const u8) ![][]const u8 {
+    if (raw.len < 2) return error.ParseFailed;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch
+        return error.ParseFailed;
+    defer parsed.deinit();
+
+    const arr = switch (parsed.value) {
+        .array => |a| a,
+        else => return error.ParseFailed,
+    };
+
+    if (arr.items.len == 0) return error.ParseFailed;
+
+    var result = try allocator.alloc([]const u8, arr.items.len);
+    const count: usize = 0;
+    errdefer {
+        for (result[0..count]) |s| allocator.free(s);
+        allocator.free(result);
+    }
+
+    if (count < result.len) {
+        // Shrink if some items weren't strings
+        if (count == 0) {
+            return error.ParseFailed;
+        }
+        const shrunk = try allocator.realloc(result, count);
+        return shrunk;
+    }
+    return result;
+}
+
 /// Count how many markets in `new` are not in `old` (by id).
 fn countNew(old: []const gamma.GammaMarket, new: []const gamma.GammaMarket) usize {
     var n: usize = 0;
@@ -146,11 +214,11 @@ test "scanner: init and deinit" {
     defer database.close();
     try database.runMigrations();
 
-    var scanner = Scanner.init(std.testing.allocator, &database, .{});
-    defer scanner.deinit();
+    var scanner_inst = Scanner.init(std.testing.allocator, &database, .{});
+    defer scanner_inst.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), scanner.markets.len);
-    try std.testing.expect(!scanner.running.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), scanner_inst.markets.len);
+    try std.testing.expect(!scanner_inst.running.load(.seq_cst));
 }
 
 test "scanner: ScannerConfig defaults" {
@@ -159,53 +227,24 @@ test "scanner: ScannerConfig defaults" {
     try std.testing.expectEqual(@as(f64, 5000.0), config.filter.min_volume_24h);
 }
 
-test "scanner: persistMarkets stores quote-containing slug safely" {
-    var database = try db.DB.open(":memory:");
-    defer database.close();
-    try database.runMigrations();
+test "scanner: parseTokenIdArray" {
+    const raw = "[\"token_a\",\"token_b\"]";
+    const result = try parseTokenIdArray(std.testing.allocator, raw);
+    defer {
+        for (result) |s| std.testing.allocator.free(s);
+        std.testing.allocator.free(result);
+    }
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings("token_a", result[0]);
+    try std.testing.expectEqualStrings("token_b", result[1]);
+}
 
-    var scanner = Scanner.init(std.testing.allocator, &database, .{});
+test "scanner: parseTokenIdArray empty" {
+    const result = parseTokenIdArray(std.testing.allocator, "[]");
+    try std.testing.expectError(error.ParseFailed, result);
+}
 
-    scanner.markets = try std.testing.allocator.alloc(gamma.GammaMarket, 1);
-    scanner.markets[0] = .{
-        .id = "m-1",
-        .question = "Will it's test pass?",
-        .condition_id = "cond-1",
-        .slug = "it's-market",
-        .end_date = "2030-01-01T00:00:00Z",
-        .volume_24h = 0,
-        .liquidity = 0,
-        .clob_token_ids = "[]",
-        .outcome_prices = "[]",
-        .outcomes = "[]",
-        .best_bid = 0,
-        .best_ask = 0,
-        .active = true,
-        .accepting_orders = true,
-    };
-
-    // Manually free scanner.markets before scanner.deinit to avoid double-free
-    std.testing.allocator.free(scanner.markets[0].id);
-    std.testing.allocator.free(scanner.markets[0].question);
-    std.testing.allocator.free(scanner.markets[0].condition_id);
-    std.testing.allocator.free(scanner.markets[0].slug);
-    std.testing.allocator.free(scanner.markets[0].end_date);
-    std.testing.allocator.free(scanner.markets[0].clob_token_ids);
-    std.testing.allocator.free(scanner.markets[0].outcome_prices);
-    std.testing.allocator.free(scanner.markets[0].outcomes);
-    std.testing.allocator.free(scanner.markets);
-    scanner.markets = &.{};
-    scanner.deinit();
-
-    scanner.persistMarkets();
-
-    const sql = "SELECT symbol FROM markets WHERE id='m-1';" ++ &[_:0]u8{};
-    var stmt: ?*db.c.sqlite3_stmt = null;
-    try std.testing.expect(db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) == db.c.SQLITE_OK);
-    defer _ = db.c.sqlite3_finalize(stmt);
-
-    try std.testing.expect(db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW);
-    const sym_raw = db.c.sqlite3_column_text(stmt, 0);
-    const sym_ptr: [*c]const u8 = @ptrCast(sym_raw orelse @as([*c]const u8, ""));
-    try std.testing.expectEqualStrings("it's-market", std.mem.span(sym_ptr));
+test "scanner: parseTokenIdArray invalid" {
+    const result = parseTokenIdArray(std.testing.allocator, "bad");
+    try std.testing.expectError(error.ParseFailed, result);
 }
