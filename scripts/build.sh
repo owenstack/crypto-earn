@@ -3,6 +3,10 @@
 set -euo pipefail
 
 
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)"
+#!/usr/bin/env bash
+set -euo pipefail
+
 # Dependency check and install
 echo "Checking for required system libraries..."
 MISSING_DEPS=()
