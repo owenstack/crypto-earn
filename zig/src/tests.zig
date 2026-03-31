@@ -903,10 +903,10 @@ test "strategy_engine: LP returns no signals when spread narrow" {
 test "strategy_engine: order tracking and untracking" {
     var se = strategy_engine.StrategyEngine.init(.{});
 
-    se.trackOrder("order-1", "market-1", .news_repricing, .buy, 0.65);
+    try testing.expect(se.trackOrder("order-1", "market-1", .news_repricing, .buy, 0.65));
     try testing.expectEqual(@as(usize, 1), se.active_order_count);
 
-    se.trackOrder("order-2", "market-1", .liquidity_provision, .sell, 0.55);
+    try testing.expect(se.trackOrder("order-2", "market-1", .liquidity_provision, .sell, 0.55));
     try testing.expectEqual(@as(usize, 2), se.active_order_count);
 
     se.untrackOrder("order-1");
@@ -921,8 +921,8 @@ test "strategy_engine: repricing cancel-on-collapse" {
         .news_delta_threshold = 0.05,
     });
 
-    se.trackOrder("order-1", "market-1", .news_repricing, .buy, 0.65);
-    se.trackOrder("order-2", "market-2", .news_repricing, .sell, 0.35);
+    try testing.expect(se.trackOrder("order-1", "market-1", .news_repricing, .buy, 0.65));
+    try testing.expect(se.trackOrder("order-2", "market-2", .news_repricing, .sell, 0.35));
 
     // current_delta for market-1 is 0.02, below threshold => should find order-1
     const collapsed = se.findCollapsedEdgeOrders("market-1", 0.02);
@@ -939,8 +939,8 @@ test "strategy_engine: LP pair lifecycle" {
         .lp_exit_spread = 0.02,
     });
 
-    se.trackOrder("bid-1", "m1", .liquidity_provision, .buy, 0.45);
-    se.trackOrder("ask-1", "m1", .liquidity_provision, .sell, 0.55);
+    try testing.expect(se.trackOrder("bid-1", "m1", .liquidity_provision, .buy, 0.45));
+    try testing.expect(se.trackOrder("ask-1", "m1", .liquidity_provision, .sell, 0.55));
 
     // Find indices and link them
     var bid_idx: ?usize = null;
@@ -991,6 +991,20 @@ test "strategy_engine: stats tracking" {
     _ = se.evaluateNewsRepricing("m1", 0.80, 0.50);
     const ns2 = se.getStats(.news_repricing);
     try testing.expectEqual(@as(u64, 1), ns2.signals_emitted);
+}
+
+test "strategy_engine: trackOrder overflow increments counter" {
+    var se = strategy_engine.StrategyEngine.init(.{});
+
+    var id_buf: [32]u8 = undefined;
+    for (0..64) |i| {
+        const id = try std.fmt.bufPrint(&id_buf, "order-{d}", .{i});
+        try testing.expect(se.trackOrder(id, "m1", .news_repricing, .buy, 0.5));
+    }
+
+    try testing.expect(!se.trackOrder("order-overflow", "m1", .news_repricing, .buy, 0.5));
+    const stats = se.getStats(.news_repricing);
+    try testing.expectEqual(@as(u64, 1), stats.active_order_overflow_count);
 }
 
 // ─── Phase 3: IPC type constants ────────────────────────────────────────────
@@ -1056,6 +1070,27 @@ test "db: insertOrder with strategy_origin" {
 
     const count = try database.queryOpenOrderCount();
     try testing.expectEqual(@as(u32, 1), count);
+}
+
+test "portfolio_tracker: writeOrdersJson reports truncation metadata" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
+
+    var long_id_buf: [1400]u8 = undefined;
+    @memset(long_id_buf[0..], 'a');
+    const long_id = long_id_buf[0..];
+
+    try database.insertOrder(long_id, "m1", "co-long", "limit", "buy", "10", "0.50", null);
+
+    var pt = portfolio_tracker.PortfolioTracker.init(testing.allocator, &database, .{});
+    var out: [4096]u8 = undefined;
+    const json = try pt.writeOrdersJson(&out);
+
+    try testing.expect(std.mem.indexOf(u8, json, "\"truncated\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"skipped_count\":1") != null);
 }
 
 // ─── Phase 3: News sources tests ────────────────────────────────────────────

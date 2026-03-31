@@ -25,21 +25,26 @@ import type {
   ConfigPayload,
 } from "../ipc/types";
 
-const ALLOWED_IDS = new Set(
-  (Bun.env.TELEGRAM_ALLOWED_CHAT_IDS ?? "")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean)
-    .map(Number)
-);
+export function createAllowedIds(raw: string): Set<number> {
+  return new Set(
+    raw
+      .split(",")
+      .map(s => s.trim())
+      .filter(Boolean)
+      .map(Number)
+      .filter(Number.isFinite)
+  );
+}
+
+const ALLOWED_IDS = createAllowedIds(Bun.env.TELEGRAM_ALLOWED_CHAT_IDS ?? "");
 
 function isAllowed(ctx: Context): boolean {
   const id = ctx.chat?.id;
   return id !== undefined && ALLOWED_IDS.has(id);
 }
 
-export function isAllowedChatId(chatId: number): boolean {
-  return ALLOWED_IDS.has(chatId);
+export function isAllowedChatId(chatId: number, allowedIds: Set<number> = ALLOWED_IDS): boolean {
+  return allowedIds.has(chatId);
 }
 
 function guard(handler: (ctx: Context) => Promise<void>) {
@@ -60,6 +65,12 @@ function guard(handler: (ctx: Context) => Promise<void>) {
 const DEDUP_MAX_SIZE = 500;
 const recentEventIds = new Set<string>();
 
+/**
+ * Deduplicates event IDs with a bounded FIFO set.
+ * Capacity is DEDUP_MAX_SIZE; once exceeded, we evict one oldest ID at a time.
+ * Under sustained load the set intentionally stays near-full, which is fine
+ * because event IDs are monotonic and old IDs are least likely to repeat.
+ */
 function dedup(eventId: string): boolean {
   if (recentEventIds.has(eventId)) return true;
   recentEventIds.add(eventId);

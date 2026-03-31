@@ -174,8 +174,32 @@ fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
     const result = ctx.om.placeOrder(market_id, side_str, size_str, price_str, "limit", origin);
     switch (result) {
         .success => |s| {
-            ctx.se.incrementOrdersAccepted(signal.strategy);
-            ctx.se.trackOrder(s.order_id, market_id, signal.strategy, signal.direction, signal.price);
+            const tracked = ctx.se.trackOrder(s.order_id, market_id, signal.strategy, signal.direction, signal.price);
+            if (tracked) {
+                ctx.se.incrementOrdersAccepted(signal.strategy);
+            } else {
+                log.err("strategy_worker", "failed to track order due to active-order cap; attempting to cancel placed order {s}", .{s.order_id});
+                const max_retries = 3;
+                var attempt: usize = 0;
+                var cancelled = false;
+                while (attempt < max_retries) : (attempt += 1) {
+                    if (ctx.om.cancelOrder(s.order_id)) {
+                        cancelled = true;
+                        break;
+                    } else {
+                        log.err("strategy_worker", "cancelOrder failed for {s} (attempt {d}/{d})", .{ s.order_id, attempt + 1, max_retries });
+                        std.time.sleep(100_000_000 * (attempt + 1)); // Exponential backoff: 100ms, 200ms, 300ms
+                    }
+                }
+                if (cancelled) {
+                    ctx.se.untrackOrder(s.order_id);
+                } else {
+                    log.err("strategy_worker", "cancelOrder failed for {s} after {d} attempts; halting engine", .{ s.order_id, max_retries });
+                    // Escalate: halt engine or propagate error. Here, we return to halt the worker.
+                    return;
+                }
+                ctx.se.incrementOrdersRejected(signal.strategy);
+            }
             ctx.om.allocator.free(s.order_id);
 
             // Persist signal to DB

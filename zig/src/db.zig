@@ -2,6 +2,9 @@
 const std = @import("std");
 const log = @import("logger.zig");
 
+// NOTE: Keep embedded MIGRATION_00N SQL in sync with db/migrations/00N_*.sql.
+// Shell tooling applies file-based migrations, while the engine applies embedded migrations.
+
 pub const c = @cImport(@cInclude("sqlite3.h"));
 
 /// Embedded Phase-0 migration (idempotent via CREATE IF NOT EXISTS).

@@ -148,8 +148,8 @@ if command -v sqlite3 &>/dev/null && [[ -f "$DB_PATH" ]]; then
     fail "schema_migrations table is queryable"
   fi
 
-  # Verify migration versions 1, 2, 4 are present
-  for v in 1 2 4; do
+  # Verify migration versions 1, 2, 3, 4 are present
+  for v in 1 2 3 4; do
     count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM schema_migrations WHERE version=$v;" 2>/dev/null || echo "0")
     if [[ "$count" -gt 0 ]]; then
       pass "migration version $v is present"

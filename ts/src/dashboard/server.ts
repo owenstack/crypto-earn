@@ -7,6 +7,8 @@ import { queryPositions, queryOrders, queryRecentLogs } from "../db/client";
 
 const DASHBOARD_SECRET = Bun.env.DASHBOARD_SECRET ?? "";
 
+// Frontend intentionally sends no Authorization header; auth is enforced here.
+// Operators should access through a trusted layer that injects the bearer token.
 function bearerAuth(req: Request): boolean {
   const auth = req.headers.get("Authorization") ?? "";
   return auth === `Bearer ${DASHBOARD_SECRET}` && DASHBOARD_SECRET.length > 0;

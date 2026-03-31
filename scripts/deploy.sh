@@ -46,7 +46,7 @@ echo "==> Step 3: Database migration"
 if [[ -f /opt/cex-zig/.env ]]; then
   set -a; source /opt/cex-zig/.env; set +a
 elif [[ -f "$DIR/.env" ]]; then
-  set -a; source "$DIR/.env; set +a
+  set -a; source "$DIR/.env"; set +a
 fi
 bash "$DIR/scripts/migrate.sh"
 

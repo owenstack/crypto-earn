@@ -34,6 +34,7 @@ pub const StrategyStats = struct {
     orders_rejected: u64 = 0,
     cancels: u64 = 0,
     realized_pnl_estimate: f64 = 0.0,
+    active_order_overflow_count: u64 = 0,
 };
 
 const MAX_ACTIVE_ORDERS = 64;
@@ -211,7 +212,7 @@ pub const StrategyEngine = struct {
         strategy: StrategyName,
         direction: SignalDirection,
         signal_price: f64,
-    ) void {
+    ) bool {
         self.state_mu.lock();
         defer self.state_mu.unlock();
 
@@ -241,10 +242,16 @@ pub const StrategyEngine = struct {
                     order_id,
                     @tagName(strategy),
                 });
-                return;
+                return true;
             }
         }
+
+        switch (strategy) {
+            .news_repricing => self.news_stats.active_order_overflow_count += 1,
+            .liquidity_provision => self.lp_stats.active_order_overflow_count += 1,
+        }
         log.warn("strategy", "cannot track order: active_orders full ({d})", .{MAX_ACTIVE_ORDERS});
+        return false;
     }
 
     /// Link two LP orders as a pair.

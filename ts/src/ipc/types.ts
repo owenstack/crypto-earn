@@ -78,7 +78,12 @@ export interface Envelope<P = unknown> {
 export interface HeartbeatPayload  { status: "ok"; uptime_ms: number }
 export interface StatusPayload     { engine: string; db: string; uptime_ms: number }
 export interface PortfolioPayload  { positions: unknown[]; note?: string }
-export interface OrdersPayload     { orders: unknown[]; note?: string }
+export interface OrdersPayload     {
+  orders: unknown[];
+  note?: string;
+  truncated?: boolean;
+  skipped_count?: number;
+}
 export interface ConfigPayload     { config: Record<string, string>; note?: string }
 export interface LogsPayload       { logs: LogEntry[] }
 export interface ErrorPayload      { error: string }
@@ -251,6 +256,7 @@ export interface StrategyStatsInfo {
   orders_rejected: number;
   cancels: number;
   realized_pnl_estimate: number;
+  active_order_overflow_count: number;
 }
 
 export interface StrategyInfo {

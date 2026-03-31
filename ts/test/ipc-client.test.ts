@@ -17,11 +17,15 @@ function startEchoServer() {
         for (const line of lines) {
           try {
             const req = JSON.parse(line) as Envelope;
+            // Zig contract: ipc_types.T.pnl_response = "pnl.response".
+            const responseType = req.type === "pnl.query"
+              ? "pnl.response"
+              : `${req.type}.response`;
             const response: Envelope = {
               v: 1,
               id: req.id,
               ts: Date.now(),
-              type: `${req.type}.response` as Envelope["type"],
+              type: responseType as Envelope["type"],
               payload: { echo: true },
             };
             socket.write(JSON.stringify(response) + "\n");
@@ -465,6 +469,71 @@ describe("IPCClient", () => {
         try { unlinkSync(wildSock); } catch {}
       }
     });
+
+    test("onEvent logs handler errors", async () => {
+      const errSock = `/tmp/cex-test-event-err-${Date.now()}.sock`;
+      let errSocket: any = null;
+
+      const errServer = Bun.listen({
+        unix: errSock,
+        socket: {
+          data(socket, raw: Buffer) {
+            const text = raw.toString("utf8");
+            for (const line of text.split("\n").filter(Boolean)) {
+              try {
+                const req = JSON.parse(line);
+                if (req.type === "event.subscribe") {
+                  socket.write(JSON.stringify({
+                    v: 1, id: req.id, ts: Date.now(),
+                    type: "event.subscribe.response",
+                    payload: { status: "subscribed" },
+                  }) + "\n");
+                  errSocket = socket;
+                }
+              } catch {}
+            }
+          },
+          open() {},
+          close() {},
+          error() {},
+        },
+      });
+
+      const originalConsoleError = console.error;
+      const logs: string[] = [];
+      console.error = (...args: unknown[]) => {
+        logs.push(args.map(String).join(" "));
+      };
+
+      try {
+        const client = new IPCClient({ socketPath: errSock, requestTimeoutMs: 3000 });
+        await client.connect();
+        await client.subscribe();
+
+        client.onEvent("event.order.placed" as any, () => {
+          throw new Error("handler boom");
+        });
+
+        if (errSocket) {
+          errSocket.write(JSON.stringify({
+            v: 1,
+            id: "evt-err-1",
+            ts: Date.now(),
+            type: "event.order.placed",
+            payload: { order_id: "o1" },
+          }) + "\n");
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 100));
+        expect(logs.some(l => l.includes("handler boom") && l.includes("event.order.placed"))).toBe(true);
+
+        client.disconnect();
+      } finally {
+        console.error = originalConsoleError;
+        errServer.stop(true);
+        try { unlinkSync(errSock); } catch {}
+      }
+    });
   });
 
   describe("Phase 5 control messages", () => {
@@ -505,7 +574,7 @@ describe("IPCClient", () => {
 
       const res = await client.request("pnl.query", { window: "today" });
       expect(res.v).toBe(1);
-      expect(res.type).toBe("pnl.query.response");
+      expect(res.type).toBe("pnl.response");
 
       client.disconnect();
     });
@@ -547,7 +616,7 @@ describe("IPCClient", () => {
 
       const res = await client.pnl("7d");
       expect(res.v).toBe(1);
-      expect(res.type).toBe("pnl.query.response");
+      expect(res.type).toBe("pnl.response");
 
       client.disconnect();
     });

@@ -90,17 +90,32 @@ pub const Scanner = struct {
         self.persistMarkets();
     }
 
+    fn persistMarket(self: *Scanner, m: gamma.GammaMarket) !void {
+        const sql =
+            "INSERT OR REPLACE INTO markets(id,symbol,base,quote,status)" ++
+            "VALUES(?,?,?,?,?);" ++ &[_:0]u8{};
+        var stmt: ?*db.c.sqlite3_stmt = null;
+        if (db.c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != db.c.SQLITE_OK)
+            return error.DBExecFailed;
+        defer _ = db.c.sqlite3_finalize(stmt);
+
+        const status = if (m.active) "active" else "inactive";
+        const quote = "USDC";
+        if (db.c.sqlite3_bind_text(stmt, 1, m.id.ptr, @intCast(m.id.len), null) != db.c.SQLITE_OK or
+            db.c.sqlite3_bind_text(stmt, 2, m.slug.ptr, @intCast(m.slug.len), null) != db.c.SQLITE_OK or
+            db.c.sqlite3_bind_text(stmt, 3, m.question.ptr, @intCast(m.question.len), null) != db.c.SQLITE_OK or
+            db.c.sqlite3_bind_text(stmt, 4, quote.ptr, @intCast(quote.len), null) != db.c.SQLITE_OK or
+            db.c.sqlite3_bind_text(stmt, 5, status.ptr, @intCast(status.len), null) != db.c.SQLITE_OK)
+            return error.DBExecFailed;
+
+        if (db.c.sqlite3_step(stmt) != db.c.SQLITE_DONE)
+            return error.DBExecFailed;
+    }
+
     fn persistMarkets(self: *Scanner) void {
         for (self.markets) |m| {
-            var buf: [2048:0]u8 = @splat(0);
-            _ = std.fmt.bufPrint(&buf, "INSERT OR REPLACE INTO markets(id,symbol,base,quote,status)VALUES('{s}','{s}','{s}','USDC','{s}');", .{
-                m.id,
-                m.slug,
-                m.question,
-                if (m.active) "active" else "inactive",
-            }) catch continue;
-            self.database.execZ(&buf) catch |e| {
-                log.warn("scanner", "persist market failed: {any}", .{e});
+            self.persistMarket(m) catch |e| {
+                log.warn("scanner", "persist market failed: {s} market_id={s}", .{ @errorName(e), m.id });
             };
         }
     }
@@ -142,4 +157,55 @@ test "scanner: ScannerConfig defaults" {
     const config = ScannerConfig{};
     try std.testing.expectEqual(@as(u32, 10), config.poll_interval_min);
     try std.testing.expectEqual(@as(f64, 5000.0), config.filter.min_volume_24h);
+}
+
+test "scanner: persistMarkets stores quote-containing slug safely" {
+    var database = try db.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    var scanner = Scanner.init(std.testing.allocator, &database, .{});
+
+    scanner.markets = try std.testing.allocator.alloc(gamma.GammaMarket, 1);
+    scanner.markets[0] = .{
+        .id = "m-1",
+        .question = "Will it's test pass?",
+        .condition_id = "cond-1",
+        .slug = "it's-market",
+        .end_date = "2030-01-01T00:00:00Z",
+        .volume_24h = 0,
+        .liquidity = 0,
+        .clob_token_ids = "[]",
+        .outcome_prices = "[]",
+        .outcomes = "[]",
+        .best_bid = 0,
+        .best_ask = 0,
+        .active = true,
+        .accepting_orders = true,
+    };
+
+    // Manually free scanner.markets before scanner.deinit to avoid double-free
+    std.testing.allocator.free(scanner.markets[0].id);
+    std.testing.allocator.free(scanner.markets[0].question);
+    std.testing.allocator.free(scanner.markets[0].condition_id);
+    std.testing.allocator.free(scanner.markets[0].slug);
+    std.testing.allocator.free(scanner.markets[0].end_date);
+    std.testing.allocator.free(scanner.markets[0].clob_token_ids);
+    std.testing.allocator.free(scanner.markets[0].outcome_prices);
+    std.testing.allocator.free(scanner.markets[0].outcomes);
+    std.testing.allocator.free(scanner.markets);
+    scanner.markets = &.{};
+    scanner.deinit();
+
+    scanner.persistMarkets();
+
+    const sql = "SELECT symbol FROM markets WHERE id='m-1';" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try std.testing.expect(db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(stmt);
+
+    try std.testing.expect(db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW);
+    const sym_raw = db.c.sqlite3_column_text(stmt, 0);
+    const sym_ptr: [*c]const u8 = @ptrCast(sym_raw orelse @as([*c]const u8, ""));
+    try std.testing.expectEqualStrings("it's-market", std.mem.span(sym_ptr));
 }

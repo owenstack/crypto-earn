@@ -4,7 +4,7 @@ Low-latency crypto trading engine with a Zig core and a TypeScript control plane
 
 ## Architecture
 
-```
+```sh
 zig/   — Trading engine (SQLite WAL, UNIX IPC server)
 ts/    — Control plane (Telegram bot + Web dashboard)
 db/    — Schema & migrations
@@ -96,7 +96,7 @@ cd ts && bun run dev
 
 ```sh
 # Clone to /opt/cex-zig
-sudo git clone <repo-url> /opt/cex-zig
+sudo git clone https://github.com/owenstack/crypto-earn.git /opt/cex-zig
 cd /opt/cex-zig
 
 # Provision: installs deps, creates cex-engine user, installs systemd units
@@ -174,9 +174,15 @@ scripts/latency-profile.sh
 JSON-lines over UNIX domain socket (`IPC_SOCKET`).
 
 Envelope:
+
 ```json
 { "v": 1, "id": "<uuid>", "ts": <epoch_ms>, "type": "<type>", "payload": {} }
 ```
+
+## Market Data Transport
+
+- Native WebSocket upgrade support is not yet implemented in the Zig client.
+- Current runtime behavior uses REST polling fallback for market updates.
 
 Supported types (Phase 0): `heartbeat`, `status`, `portfolio`, `orders`, `config.get`, `logs`.
 

@@ -371,6 +371,10 @@ pub const PortfolioTracker = struct {
         }
         if (skipped_orders > 0) {
             log.warn("portfolio", "writeOrdersJson skipped {d} orders due to serialization errors", .{skipped_orders});
+            var meta_buf: [96]u8 = undefined;
+            const meta = std.fmt.bufPrint(&meta_buf, "],\"truncated\":true,\"skipped_count\":{d}}}", .{skipped_orders}) catch return error.Overflow;
+            try writer.writeAll(meta);
+            return fbs.getWritten();
         }
         try writer.writeAll("]}");
         return fbs.getWritten();

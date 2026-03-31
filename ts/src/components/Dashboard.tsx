@@ -2,8 +2,6 @@ import { useEffect, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 
-const API_KEY = Bun.env.API_KEY;
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -48,9 +46,7 @@ function useApi<T>(path: string, intervalMs = 2000) {
     let mounted = true;
     const fetcher = async () => {
       try {
-        const res = await fetch(path, {
-          headers: { Authorization: `Bearer ${API_KEY}` },
-        });
+        const res = await fetch(path);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const json = await res.json();
         if (mounted) {
@@ -135,6 +131,8 @@ interface PortfolioData {
 
 interface OrdersData {
   orders: OrderRow[];
+  truncated?: boolean;
+  skipped_count?: number;
 }
 
 interface LogsData {
@@ -295,6 +293,11 @@ export function Dashboard() {
             <CardTitle>Active Orders</CardTitle>
           </CardHeader>
           <CardContent>
+            {orders?.truncated && (
+              <div className="mb-3 rounded border border-amber-400 bg-amber-50 p-2 text-xs text-amber-900">
+                Order list is incomplete. Skipped rows: {orders.skipped_count ?? 0}
+              </div>
+            )}
             {orderList.length === 0 ? (
               <div className="text-muted-foreground text-sm py-4 text-center">No active orders</div>
             ) : (

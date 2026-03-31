@@ -10,20 +10,35 @@ if [ -z "$NOLOGIN_SHELL" ]; then
 fi
 
 echo "--- Installing Zig 0.15.2 ---"
-echo "--- Installing Zig 0.15.2 ---"
 ARCH=$(uname -m)
 case "$ARCH" in
-  x86_64)  ZIG_ARCH="x86_64" ;;
-  aarch64) ZIG_ARCH="aarch64" ;;
+  x86_64)
+    ZIG_ARCH="x86_64"
+    ZIG_SHA256="02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239"
+    ;;
+  aarch64)
+    ZIG_ARCH="aarch64"
+    ZIG_SHA256="958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f"
+    ;;
   *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
 esac
-ZIG_TARBALL="zig-linux-${ZIG_ARCH}-0.15.2.tar.xz"
+ZIG_TARBALL="zig-${ZIG_ARCH}-linux-0.15.2.tar.xz"
 ZIG_URL="https://ziglang.org/download/0.15.2/${ZIG_TARBALL}"
 
-curl -fsSL "$ZIG_URL" -o "$ZIG_TARBALL"
+if ! curl -fsSL "$ZIG_URL" -o "$ZIG_TARBALL"; then
+  echo "ERROR: Failed to download Zig from $ZIG_URL" >&2
+  exit 1
+fi
+
+echo "${ZIG_SHA256}  ${ZIG_TARBALL}" | sha256sum --check || {
+  echo "ERROR: Zig tarball checksum mismatch. Aborting." >&2
+  rm -f "${ZIG_TARBALL}"
+  exit 1
+}
+
 tar xf "$ZIG_TARBALL"
 sudo rm -rf /usr/local/zig
-sudo mv "zig-linux-${ZIG_ARCH}-0.15.2" /usr/local/zig
+sudo mv "zig-${ZIG_ARCH}-linux-0.15.2" /usr/local/zig
 sudo ln -sf /usr/local/zig/zig /usr/local/bin/zig
 rm -f "$ZIG_TARBALL"
 

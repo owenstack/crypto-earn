@@ -316,19 +316,27 @@ export class IPCClient {
   get subscribed() { return this._subscribed; }
 
   private _dispatchEvent(env: Envelope): void {
-    // Dispatch to specific handlers
+    const dispatch = (handler: EventHandler, handlerKind: string) => {
+      try {
+        handler(env);
+      } catch (err) {
+        console.error(JSON.stringify({
+          ts: Date.now(),
+          level: "WARN",
+          component: "ipc",
+          msg: `event handler error type=${env.type} handler=${handlerKind}: ${err instanceof Error ? err.message : String(err)}`,
+        }));
+      }
+    };
+
     const specific = this.eventHandlers.get(env.type);
     if (specific) {
-      for (const handler of specific) {
-        try { handler(env); } catch { /* swallow handler errors */ }
-      }
+      for (const handler of specific) dispatch(handler, "specific");
     }
-    // Dispatch to wildcard handlers
+
     const wildcard = this.eventHandlers.get("*");
     if (wildcard) {
-      for (const handler of wildcard) {
-        try { handler(env); } catch { /* swallow handler errors */ }
-      }
+      for (const handler of wildcard) dispatch(handler, "wildcard");
     }
   }
 }

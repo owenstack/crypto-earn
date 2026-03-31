@@ -85,8 +85,8 @@ pub const WebSocketClient = struct {
 
     /// Connect and run the WebSocket read loop. Blocks.
     /// On disconnect, reconnects with exponential backoff (250ms -> 30s).
-    /// This should be called from a dedicated thread.
-    pub fn connectAndRun(self: *WebSocketClient) void {
+    /// This remains internal until native WebSocket upgrade support is implemented.
+    fn connectAndRun(self: *WebSocketClient) void {
         while (!self.should_stop.load(.seq_cst)) {
             self.state = .connecting;
             log.info("ws", "connecting to CLOB WebSocket...", .{});
@@ -110,7 +110,7 @@ pub const WebSocketClient = struct {
         defer client.deinit();
 
         const uri = try std.Uri.parse(WS_ENDPOINT);
-        try self.performUpgrade(&client, uri);
+        try self.performUpgrade_unimplemented(&client, uri);
 
         // Successful upgrade path: transition state first, then reset backoff.
         self.state = .connected;
@@ -120,7 +120,8 @@ pub const WebSocketClient = struct {
         // validate the std.http.Client WebSocket API surface.
     }
 
-    fn performUpgrade(self: *WebSocketClient, client: *std.http.Client, uri: std.Uri) !void {
+    // TODO(ws): implement RFC 6455 handshake.
+    fn performUpgrade_unimplemented(self: *WebSocketClient, client: *std.http.Client, uri: std.Uri) !void {
         _ = self;
         _ = client;
         _ = uri;

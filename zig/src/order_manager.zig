@@ -12,6 +12,19 @@ const c = db_mod.c;
 
 const CLOB_API_BASE = "https://clob.polymarket.com";
 
+fn applyCancelledUpdate(stmt: *c.sqlite3_stmt, order_id: []const u8) bool {
+    if (order_id.len == 0) return false;
+
+    _ = c.sqlite3_reset(stmt);
+    _ = c.sqlite3_clear_bindings(stmt);
+
+    if (c.sqlite3_bind_text(stmt, 1, order_id.ptr, @intCast(order_id.len), null) != c.SQLITE_OK) {
+        return false;
+    }
+
+    return c.sqlite3_step(stmt) == c.SQLITE_DONE;
+}
+
 pub const OrderSide = enum { buy, sell };
 
 pub const OrderType = enum { limit, market, GTC, FOK };
@@ -278,37 +291,25 @@ pub const OrderManager = struct {
         }
 
         var cancelled_count: u32 = 0;
+
+        const update_sql = "UPDATE orders SET status='cancelled', updated_at=unixepoch() WHERE id=?;" ++ &[_:0]u8{};
+        var upd_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.database.handle, update_sql.ptr, -1, &upd_stmt, null) != c.SQLITE_OK) {
+            log.err("order_mgr", "cancelAll failed to prepare UPDATE", .{});
+            return 0;
+        }
+        defer _ = c.sqlite3_finalize(upd_stmt);
+
         for (order_ids.items) |order_id| {
             if (!self.cancelOnCLOB(order_id)) {
                 log.err("order_mgr", "cancelAll failed CLOB cancel for order {s}", .{order_id});
                 continue;
             }
 
-            const escaped_order_id = escapeSqlLiteral(self.allocator, order_id) catch {
-                log.err("order_mgr", "cancelAll failed to escape order id {s}", .{order_id});
+            if (!applyCancelledUpdate(upd_stmt.?, order_id)) {
+                log.err("order_mgr", "cancelAll DB update failed for order {s}", .{order_id});
                 continue;
-            };
-
-            const update_sql = std.fmt.allocPrintSentinel(
-                self.allocator,
-                "UPDATE orders SET status='cancelled', updated_at=unixepoch() WHERE id='{s}';",
-                .{escaped_order_id},
-                0,
-            ) catch {
-                self.allocator.free(escaped_order_id);
-                log.err("order_mgr", "cancelAll failed to build UPDATE for order {s}", .{order_id});
-                continue;
-            };
-
-            self.database.execZ(update_sql) catch |e| {
-                self.allocator.free(update_sql);
-                self.allocator.free(escaped_order_id);
-                log.err("order_mgr", "cancelAll DB update failed for order {s}: {any}", .{ order_id, e });
-                continue;
-            };
-
-            self.allocator.free(update_sql);
-            self.allocator.free(escaped_order_id);
+            }
 
             cancelled_count += 1;
         }
@@ -335,6 +336,14 @@ pub const OrderManager = struct {
             return;
         }
 
+        const update_sql = "UPDATE orders SET status='cancelled', updated_at=unixepoch() WHERE id=?;" ++ &[_:0]u8{};
+        var upd_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.database.handle, update_sql.ptr, -1, &upd_stmt, null) != c.SQLITE_OK) {
+            log.err("order_mgr", "scanStaleOrders failed: unable to prepare stale-order update", .{});
+            return;
+        }
+        defer _ = c.sqlite3_finalize(upd_stmt);
+
         var cancelled_count: u32 = 0;
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const order_id_raw = c.sqlite3_column_text(stmt, 0);
@@ -347,27 +356,10 @@ pub const OrderManager = struct {
                 continue;
             }
 
-            const escaped_order_id = escapeSqlLiteral(self.allocator, order_id) catch {
-                log.err("order_mgr", "failed to escape stale-order id for DB update: {s}", .{order_id});
+            if (!applyCancelledUpdate(upd_stmt.?, order_id)) {
+                log.err("order_mgr", "failed DB update after stale-order cancel {s}", .{order_id});
                 continue;
-            };
-            defer self.allocator.free(escaped_order_id);
-
-            const update_sql = std.fmt.allocPrintSentinel(
-                self.allocator,
-                "UPDATE orders SET status='cancelled', updated_at=unixepoch() WHERE id='{s}';",
-                .{escaped_order_id},
-                0,
-            ) catch {
-                log.err("order_mgr", "failed to build stale-order update SQL: {s}", .{order_id});
-                continue;
-            };
-            defer self.allocator.free(update_sql);
-
-            self.database.execZ(update_sql) catch |e| {
-                log.err("order_mgr", "failed DB update after stale-order cancel {s}: {any}", .{ order_id, e });
-                continue;
-            };
+            }
 
             cancelled_count += 1;
         }
@@ -504,7 +496,7 @@ pub const OrderManager = struct {
 
     /// Cancel order on CLOB API before mutating local state.
     fn cancelOnCLOB(self: *OrderManager, order_id: []const u8) bool {
-        var client = std.http.Client{ .allocator = self.allocator };
+        var client = http.HttpClient.init(self.allocator);
         defer client.deinit();
 
         const url = CLOB_API_BASE ++ "/order/cancel";
@@ -522,7 +514,11 @@ pub const OrderManager = struct {
         };
 
         const digest = crypto.Keccak256.hash(payload);
-        const sig = crypto.signEip712(digest, self.config.private_key) catch |e| {
+        // Copy key to stack and zero it immediately after signing to reduce key exposure lifetime.
+        var key_copy: [32]u8 = self.config.private_key;
+        defer std.crypto.secureZero(u8, key_copy[0..]);
+
+        const sig = crypto.signEip712(digest, key_copy) catch |e| {
             log.err("order_mgr", "failed to sign cancel payload: {s}", .{@errorName(e)});
             return false;
         };
@@ -539,35 +535,29 @@ pub const OrderManager = struct {
         sig_hdr_buf[1] = 'x';
         @memcpy(sig_hdr_buf[2..], sig_hex_body[0..]);
 
-        const uri = std.Uri.parse(url) catch {
-            log.err("order_mgr", "invalid cancel URL: {s}", .{url});
-            return false;
-        };
-
         var delay_ms: u64 = 1000;
         const max_delay_ms: u64 = 60_000;
 
         var attempt: u32 = 0;
         while (attempt < self.config.max_retry_attempts) : (attempt += 1) {
-            var body_writer = std.Io.Writer.Allocating.init(self.allocator);
-            defer body_writer.deinit();
-
-            const result = client.fetch(.{
-                .location = .{ .uri = uri },
-                .method = .POST,
-                .payload = payload,
-                .response_writer = &body_writer.writer,
-                .extra_headers = &.{
-                    .{ .name = "Content-Type", .value = "application/json" },
-                    .{ .name = "POLY_TIMESTAMP", .value = ts },
-                    .{ .name = "POLY_SIGNATURE", .value = sig_hdr_buf[0..] },
-                },
+            var response = client.postJsonWithHeaders(url, payload, &.{
+                .{ .name = "POLY_TIMESTAMP", .value = ts },
+                .{ .name = "POLY_SIGNATURE", .value = sig_hdr_buf[0..] },
             }) catch |e| {
+                if (e == error.ClientError) {
+                    log.warn("order_mgr", "CLOB cancel 429/client error, backoff {d}ms (attempt {d}/{d})", .{
+                        delay_ms, attempt + 1, self.config.max_retry_attempts,
+                    });
+                    std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                    delay_ms = @min(delay_ms * 2, max_delay_ms);
+                    continue;
+                }
                 log.err("order_mgr", "CLOB cancel request failed: {s}", .{@errorName(e)});
                 return false;
             };
+            defer response.deinit();
 
-            if (result.status == .too_many_requests) {
+            if (response.status == .too_many_requests) {
                 log.warn("order_mgr", "CLOB cancel 429, backoff {d}ms (attempt {d}/{d})", .{
                     delay_ms, attempt + 1, self.config.max_retry_attempts,
                 });
@@ -576,18 +566,12 @@ pub const OrderManager = struct {
                 continue;
             }
 
-            if (result.status.class() != .success) {
-                log.err("order_mgr", "CLOB cancel unexpected status: {d}", .{@intFromEnum(result.status)});
+            if (response.status.class() != .success) {
+                log.err("order_mgr", "CLOB cancel unexpected status: {d}", .{@intFromEnum(response.status)});
                 return false;
             }
 
-            const body = body_writer.toOwnedSlice() catch {
-                log.err("order_mgr", "failed to read CLOB cancel response body", .{});
-                return false;
-            };
-            defer self.allocator.free(body);
-
-            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
+            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{}) catch {
                 log.err("order_mgr", "failed to parse CLOB cancel response", .{});
                 return false;
             };
@@ -635,18 +619,41 @@ fn bytesToHex(bytes: []const u8, buf: []u8) []const u8 {
     return buf[0 .. bytes.len * 2];
 }
 
-fn escapeSqlLiteral(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
+test "order_manager: applyCancelledUpdate handles quoted and escaped ids" {
+    var database = try db_mod.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
 
-    for (input) |ch| {
-        if (ch == '\'') {
-            try out.append(allocator, '\'');
-            try out.append(allocator, '\'');
-        } else {
-            try out.append(allocator, ch);
-        }
-    }
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
+    try database.insertOrder("ord'one", "m1", "co-1", "limit", "buy", "10", "0.50", null);
+    try database.insertOrder("ord\\two", "m1", "co-2", "limit", "sell", "9", "0.49", null);
 
-    return out.toOwnedSlice(allocator);
+    const update_sql = "UPDATE orders SET status='cancelled', updated_at=unixepoch() WHERE id=?;" ++ &[_:0]u8{};
+    var upd_stmt: ?*c.sqlite3_stmt = null;
+    try std.testing.expect(c.sqlite3_prepare_v2(database.handle, update_sql.ptr, -1, &upd_stmt, null) == c.SQLITE_OK);
+    defer _ = c.sqlite3_finalize(upd_stmt);
+
+    try std.testing.expect(applyCancelledUpdate(upd_stmt.?, "ord'one"));
+    try std.testing.expect(applyCancelledUpdate(upd_stmt.?, "ord\\two"));
+
+    const count_sql = "SELECT COUNT(*) FROM orders WHERE status='cancelled';" ++ &[_:0]u8{};
+    var count_stmt: ?*c.sqlite3_stmt = null;
+    try std.testing.expect(c.sqlite3_prepare_v2(database.handle, count_sql.ptr, -1, &count_stmt, null) == c.SQLITE_OK);
+    defer _ = c.sqlite3_finalize(count_stmt);
+
+    try std.testing.expect(c.sqlite3_step(count_stmt) == c.SQLITE_ROW);
+    try std.testing.expectEqual(@as(c_int, 2), c.sqlite3_column_int(count_stmt, 0));
+}
+
+test "order_manager: applyCancelledUpdate rejects empty id" {
+    var database = try db_mod.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    const update_sql = "UPDATE orders SET status='cancelled', updated_at=unixepoch() WHERE id=?;" ++ &[_:0]u8{};
+    var upd_stmt: ?*c.sqlite3_stmt = null;
+    try std.testing.expect(c.sqlite3_prepare_v2(database.handle, update_sql.ptr, -1, &upd_stmt, null) == c.SQLITE_OK);
+    defer _ = c.sqlite3_finalize(upd_stmt);
+
+    try std.testing.expect(!applyCancelledUpdate(upd_stmt.?, ""));
 }
