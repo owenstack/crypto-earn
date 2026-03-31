@@ -8,10 +8,12 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)"
 MIGRATIONS_DIR="$DIR/db/migrations"
 
+
+# Set DB_PATH from argument, env, or default
 DB_PATH="${1:-${DB_PATH:-}}"
 if [[ -z "$DB_PATH" ]]; then
-  echo "ERROR: DB_PATH not set. Pass as argument or export DB_PATH." >&2
-  exit 1
+  DB_PATH="$DIR/db/cex.sqlite3"
+  echo "DB_PATH not set, using default: $DB_PATH"
 fi
 
 if ! command -v sqlite3 &>/dev/null; then
