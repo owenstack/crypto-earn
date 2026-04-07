@@ -7,6 +7,7 @@ const gamma = @import("gamma_api.zig");
 const clob = @import("clob_orderbook.zig");
 const http = @import("http_client.zig");
 const ws = @import("websocket.zig");
+const news = @import("news_sources.zig");
 const atomic = std.atomic;
 
 pub const ScannerConfig = struct {
@@ -22,6 +23,7 @@ pub const Scanner = struct {
     last_poll_ts: i64,
     running: atomic.Value(bool),
     ws_client: ?*ws.WebSocketClient,
+    news_client: ?*news.NewsClient,
 
     pub fn init(allocator: std.mem.Allocator, database: *db.DB, config: ScannerConfig) Scanner {
         return .{
@@ -32,6 +34,7 @@ pub const Scanner = struct {
             .last_poll_ts = 0,
             .running = atomic.Value(bool).init(false),
             .ws_client = null,
+            .news_client = null,
         };
     }
 
@@ -45,6 +48,11 @@ pub const Scanner = struct {
     /// Attach a WebSocket client for real-time subscriptions.
     pub fn setWebSocketClient(self: *Scanner, wsc: *ws.WebSocketClient) void {
         self.ws_client = wsc;
+    }
+
+    /// Attach a news client for probability estimate updates.
+    pub fn setNewsClient(self: *Scanner, nc: *news.NewsClient) void {
+        self.news_client = nc;
     }
 
     /// Run the scanner loop. Blocks until stopped.
@@ -98,6 +106,11 @@ pub const Scanner = struct {
 
         // Subscribe new token IDs to WebSocket for real-time updates
         self.subscribeTokenIds();
+
+        // Update news client with probability estimates from polled markets
+        if (self.news_client) |nc| {
+            nc.updateFromGammaMarkets(self.markets);
+        }
     }
 
     /// Extract CLOB token IDs from markets and subscribe them to the WebSocket.
@@ -126,8 +139,8 @@ pub const Scanner = struct {
 
     fn persistMarket(self: *Scanner, m: gamma.GammaMarket) !void {
         const sql =
-            "INSERT OR REPLACE INTO markets(id,symbol,base,quote,status)" ++
-            "VALUES(?,?,?,?,?);" ++ &[_:0]u8{};
+            "INSERT OR REPLACE INTO markets(id,symbol,base,quote,status,condition_id,clob_token_ids,outcomes,neg_risk,min_tick_size)" ++
+            "VALUES(?,?,?,?,?,?,?,?,?,?);" ++ &[_:0]u8{};
         var stmt: ?*db.c.sqlite3_stmt = null;
         if (db.c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != db.c.SQLITE_OK)
             return error.DBExecFailed;
@@ -135,11 +148,17 @@ pub const Scanner = struct {
 
         const status = if (m.active) "active" else "inactive";
         const quote = "USDC";
+        const default_min_tick = "0.01";
         if (db.c.sqlite3_bind_text(stmt, 1, m.id.ptr, @intCast(m.id.len), null) != db.c.SQLITE_OK or
             db.c.sqlite3_bind_text(stmt, 2, m.slug.ptr, @intCast(m.slug.len), null) != db.c.SQLITE_OK or
             db.c.sqlite3_bind_text(stmt, 3, m.question.ptr, @intCast(m.question.len), null) != db.c.SQLITE_OK or
             db.c.sqlite3_bind_text(stmt, 4, quote.ptr, @intCast(quote.len), null) != db.c.SQLITE_OK or
-            db.c.sqlite3_bind_text(stmt, 5, status.ptr, @intCast(status.len), null) != db.c.SQLITE_OK)
+            db.c.sqlite3_bind_text(stmt, 5, status.ptr, @intCast(status.len), null) != db.c.SQLITE_OK or
+            db.c.sqlite3_bind_text(stmt, 6, m.condition_id.ptr, @intCast(m.condition_id.len), null) != db.c.SQLITE_OK or
+            db.c.sqlite3_bind_text(stmt, 7, m.clob_token_ids.ptr, @intCast(m.clob_token_ids.len), null) != db.c.SQLITE_OK or
+            db.c.sqlite3_bind_text(stmt, 8, m.outcomes.ptr, @intCast(m.outcomes.len), null) != db.c.SQLITE_OK or
+            db.c.sqlite3_bind_int(stmt, 9, 0) != db.c.SQLITE_OK or
+            db.c.sqlite3_bind_text(stmt, 10, default_min_tick.ptr, @intCast(default_min_tick.len), null) != db.c.SQLITE_OK)
             return error.DBExecFailed;
 
         if (db.c.sqlite3_step(stmt) != db.c.SQLITE_DONE)
@@ -176,19 +195,27 @@ fn parseTokenIdArray(allocator: std.mem.Allocator, raw: []const u8) ![][]const u
     if (arr.items.len == 0) return error.ParseFailed;
 
     var result = try allocator.alloc([]const u8, arr.items.len);
-    const count: usize = 0;
+    var count: usize = 0;
     errdefer {
         for (result[0..count]) |s| allocator.free(s);
         allocator.free(result);
     }
 
-    if (count < result.len) {
-        // Shrink if some items weren't strings
-        if (count == 0) {
-            return error.ParseFailed;
+    for (arr.items) |item| {
+        switch (item) {
+            .string => |s| {
+                result[count] = try allocator.dupe(u8, s);
+                count += 1;
+            },
+            else => {},
         }
-        const shrunk = try allocator.realloc(result, count);
-        return shrunk;
+    }
+
+    if (count == 0) {
+        return error.ParseFailed;
+    }
+    if (count < result.len) {
+        result = try allocator.realloc(result, count);
     }
     return result;
 }

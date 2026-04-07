@@ -1,0 +1,18 @@
+.git
+.env
+*.log
+agent_workspace
+plans
+systemd
+scripts
+db/cex.sqlite3
+
+# Zig build artifacts
+zig/.zig-cache
+zig/zig-out
+zig/data
+
+# TS build artifacts / deps (reinstalled in container)
+ts/node_modules
+ts/dist
+ts/.env

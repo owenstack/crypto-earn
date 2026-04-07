@@ -5,6 +5,7 @@ const log = @import("logger.zig");
 const db_mod = @import("db.zig");
 const http = @import("http_client.zig");
 const crypto = @import("crypto.zig");
+const poly_auth = @import("polymarket_auth.zig");
 const risk = @import("risk_gate.zig");
 const ipc = @import("ipc.zig");
 const ipc_types = @import("ipc_types.zig");
@@ -68,6 +69,10 @@ pub const OrderManagerConfig = struct {
     stale_scan_interval_min: u32 = 5,
     max_retry_attempts: u32 = 7,
     private_key: [32]u8 = [_]u8{0} ** 32,
+    signer_address: [20]u8 = [_]u8{0} ** 20,
+    funder_address: ?[20]u8 = null,
+    signature_type: u8 = 0, // 0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE
+    api_creds: ?poly_auth.ApiCredentials = null,
 };
 
 pub const OrderManager = struct {
@@ -412,7 +417,7 @@ pub const OrderManager = struct {
         return self.halted.load(.seq_cst);
     }
 
-    /// Submit order to CLOB REST API with 429 exponential backoff.
+    /// Submit a signed CTF Exchange order to the CLOB REST API with L2 HMAC auth.
     /// Backoff schedule: 1s, 2s, 4s, 8s, 16s, 32s, 60s (capped).
     /// Returns true on success, false on failure after exhausting retries.
     fn submitToCLOB(
@@ -424,42 +429,165 @@ pub const OrderManager = struct {
         order_type: []const u8,
         client_order_id: []const u8,
     ) bool {
+        // Use order_type and client_order_id in JSON body below
+
+        const creds = self.config.api_creds orelse {
+            log.err("order_mgr", "no API credentials — cannot submit order", .{});
+            return false;
+        };
+
+        // Resolve token_id from market/condition_id
+        var token_id_buf: [128]u8 = undefined;
+        const token_id = self.resolveTokenId(market_id, side, &token_id_buf) orelse {
+            log.err("order_mgr", "failed to resolve token_id for market={s} side={s}", .{ market_id, side });
+            return false;
+        };
+
+        // Parse price/size as f64
+        const price_f = std.fmt.parseFloat(f64, price) catch {
+            log.err("order_mgr", "invalid price: {s}", .{price});
+            return false;
+        };
+        const size_f = std.fmt.parseFloat(f64, size) catch {
+            log.err("order_mgr", "invalid size: {s}", .{size});
+            return false;
+        };
+
+        const side_u8: u8 = if (std.mem.eql(u8, side, "buy")) 0 else 1;
+        const amounts = poly_auth.computeOrderAmounts(side_u8, price_f, size_f) catch {
+            log.err("order_mgr", "invalid order amounts: side={d} price={d} size={d}", .{ side_u8, price_f, size_f });
+            return false;
+        };
+
+        // Parse token_id string to u256
+        const token_id_u256: u256 = std.fmt.parseInt(u256, token_id, 10) catch {
+            log.err("order_mgr", "invalid token_id: {s}", .{token_id});
+            return false;
+        };
+
+        const maker = self.config.funder_address orelse self.config.signer_address;
+
+        // Build CTF Order struct
+        // Use nanoTimestamp() for high 128 bits, cryptographically secure random for low 128 bits
+        const nano: u128 = @intCast(std.time.nanoTimestamp());
+        var rand_bytes: [16]u8 = undefined;
+        std.crypto.random.bytes(&rand_bytes);
+        const rand_low = std.mem.readInt(u128, &rand_bytes, .big);
+        const salt: u256 = (@as(u256, nano) << @as(u8, 128)) | rand_low;
+
+        const order = poly_auth.CtfOrder{
+            .salt = salt,
+            .maker = maker,
+            .signer = self.config.signer_address,
+            .taker = [_]u8{0} ** 20,
+            .token_id = token_id_u256,
+            .maker_amount = amounts.maker_amount,
+            .taker_amount = amounts.taker_amount,
+            .expiration = 0,
+            .nonce = 0,
+            .fee_rate_bps = 0,
+            .side = side_u8,
+            .signature_type = self.config.signature_type,
+        };
+
+        // EIP-712 sign the order (use neg-risk exchange for neg-risk markets)
+        const is_neg_risk = self.isNegRiskMarket(market_id);
+        const exchange = if (is_neg_risk) poly_auth.NEG_RISK_CTF_EXCHANGE else poly_auth.CTF_EXCHANGE;
+        const order_digest = poly_auth.buildOrderDigest(order, poly_auth.CHAIN_ID, exchange);
+        var key_copy: [32]u8 = self.config.private_key;
+        defer std.crypto.secureZero(u8, key_copy[0..]);
+
+        const order_sig = crypto.signEip712(order_digest, key_copy) catch |e| {
+            log.err("order_mgr", "failed to sign order: {s}", .{@errorName(e)});
+            return false;
+        };
+        const order_sig_hex = poly_auth.formatSignature(order_sig);
+
+        // Format address
+        var addr_hex: [42]u8 = undefined;
+        addr_hex[0] = '0';
+        addr_hex[1] = 'x';
+        const charset = "0123456789abcdef";
+        for (self.config.signer_address, 0..) |b, i| {
+            addr_hex[2 + i * 2] = charset[b >> 4];
+            addr_hex[2 + i * 2 + 1] = charset[b & 0x0f];
+        }
+
+        // Format maker address
+        var maker_hex: [42]u8 = undefined;
+        maker_hex[0] = '0';
+        maker_hex[1] = 'x';
+        for (maker, 0..) |b, i| {
+            maker_hex[2 + i * 2] = charset[b >> 4];
+            maker_hex[2 + i * 2 + 1] = charset[b & 0x0f];
+        }
+
+        // Build the SendOrder JSON body
+        var salt_buf: [80]u8 = undefined;
+        const salt_str = std.fmt.bufPrint(&salt_buf, "{d}", .{order.salt}) catch "0";
+        var maker_amt_buf: [32]u8 = undefined;
+        const maker_amt_str = std.fmt.bufPrint(&maker_amt_buf, "{d}", .{amounts.maker_amount}) catch "0";
+        var taker_amt_buf: [32]u8 = undefined;
+        const taker_amt_str = std.fmt.bufPrint(&taker_amt_buf, "{d}", .{amounts.taker_amount}) catch "0";
+
+        var body_buf: [2048]u8 = undefined;
+        // Use order_type and client_order_id in JSON body
+        const json_body = std.fmt.bufPrint(&body_buf,
+            \\{{"order":{{"salt":"{s}","maker":"{s}","signer":"{s}","taker":"0x0000000000000000000000000000000000000000","tokenId":"{s}","makerAmount":"{s}","takerAmount":"{s}","expiration":"0","nonce":"0","feeRateBps":"0","side":"{s}","signatureType":{d},"signature":"{s}"}},"owner":"{s}","orderType":"{s}","clientOrderId":"{s}"}}
+        , .{
+            salt_str,
+            &maker_hex,
+            &addr_hex,
+            token_id,
+            maker_amt_str,
+            taker_amt_str,
+            if (side_u8 == 0) "BUY" else "SELL",
+            self.config.signature_type,
+            &order_sig_hex,
+            &addr_hex,
+            order_type,
+            client_order_id,
+        }) catch {
+            log.err("order_mgr", "failed to format order JSON", .{});
+            return false;
+        };
+
         var client = http.HttpClient.init(self.allocator);
         defer client.deinit();
 
-        // Build order JSON payload with proper escaping.
-        const order_payload = struct {
-            market: []const u8,
-            side: []const u8,
-            size: []const u8,
-            price: []const u8,
-            type: []const u8,
-            client_order_id: []const u8,
-        }{
-            .market = market_id,
-            .side = side,
-            .size = size,
-            .price = price,
-            .type = order_type,
-            .client_order_id = client_order_id,
-        };
-
-        const json_body = std.json.Stringify.valueAlloc(self.allocator, order_payload, .{}) catch |e| {
-            log.err("order_mgr", "failed to stringify order JSON: {s}", .{@errorName(e)});
-            return false;
-        };
-        defer self.allocator.free(json_body);
-
         const url = CLOB_API_BASE ++ "/order";
 
-        var delay_ms: u64 = 1000; // Start at 1 second
-        const max_delay_ms: u64 = 60_000; // Cap at 60 seconds
+        var delay_ms: u64 = 1000;
+        const max_delay_ms: u64 = 60_000;
 
         var attempt: u32 = 0;
         while (attempt < self.config.max_retry_attempts) : (attempt += 1) {
-            var response = client.postJson(url, json_body) catch |e| {
+            // Build L2 HMAC headers per attempt
+            var ts_buf: [32]u8 = undefined;
+            const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch {
+                log.err("order_mgr", "failed to format timestamp", .{});
+                return false;
+            };
+
+            const hmac_result = poly_auth.buildHmacSignature(
+                creds.secret[0..creds.secret_len],
+                ts,
+                "POST",
+                "/order",
+                json_body,
+            ) catch |e| {
+                log.err("order_mgr", "failed to compute HMAC: {s}", .{@errorName(e)});
+                return false;
+            };
+
+            var response = client.postJsonWithHeaders(url, json_body, &.{
+                .{ .name = "POLY_ADDRESS", .value = &addr_hex },
+                .{ .name = "POLY_SIGNATURE", .value = hmac_result.slice() },
+                .{ .name = "POLY_TIMESTAMP", .value = ts },
+                .{ .name = "POLY_API_KEY", .value = creds.api_key[0..creds.api_key_len] },
+                .{ .name = "POLY_PASSPHRASE", .value = creds.passphrase[0..creds.passphrase_len] },
+            }) catch |e| {
                 if (e == error.ClientError) {
-                    // Could be a 429 - apply backoff
                     log.warn("order_mgr", "CLOB 429/client error, backoff {d}ms (attempt {d}/{d})", .{
                         delay_ms, attempt + 1, self.config.max_retry_attempts,
                     });
@@ -482,11 +610,15 @@ pub const OrderManager = struct {
             }
 
             if (response.status.class() == .success) {
-                log.info("order_mgr", "CLOB order submitted successfully", .{});
+                log.info("order_mgr", "CLOB order submitted: market={s} side={s} price={s} size={s}", .{
+                    market_id, side, price, size,
+                });
                 return true;
             }
 
-            log.err("order_mgr", "CLOB unexpected status: {d}", .{@intFromEnum(response.status)});
+            log.err("order_mgr", "CLOB unexpected status: {d} body={s}", .{
+                @intFromEnum(response.status), response.body,
+            });
             return false;
         }
 
@@ -494,55 +626,116 @@ pub const OrderManager = struct {
         return false;
     }
 
+    /// Check if a market is neg-risk by querying the DB.
+    fn isNegRiskMarket(self: *OrderManager, market_id: []const u8) bool {
+        const sql = "SELECT neg_risk FROM markets WHERE condition_id=? OR id=? LIMIT 1;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return false;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_text(stmt, 1, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK) return false;
+        if (c.sqlite3_bind_text(stmt, 2, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK) return false;
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return false;
+        return c.sqlite3_column_int(stmt, 0) != 0;
+    }
+
+    /// Resolve token_id from condition_id + side by looking up clob_token_ids in DB.
+    fn resolveTokenId(self: *OrderManager, market_id: []const u8, side: []const u8, buf: *[128]u8) ?[]const u8 {
+        // Query: SELECT clob_token_ids FROM markets WHERE condition_id = ? OR id = ? LIMIT 1
+        const sql = "SELECT clob_token_ids FROM markets WHERE condition_id=? OR id=? LIMIT 1;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return null;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_text(stmt, 1, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK) return null;
+        if (c.sqlite3_bind_text(stmt, 2, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK) return null;
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+
+        const raw_ptr = c.sqlite3_column_text(stmt, 0);
+        const raw = if (raw_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else return null;
+
+        // Parse JSON array, pick index based on side: buy -> [0] (Yes), sell -> [1] (No)
+        const idx: usize = if (std.mem.eql(u8, side, "sell")) 1 else 0;
+        return extractJsonArrayElement(raw, idx, buf);
+    }
+
+    /// Extract element at `idx` from a JSON string array like '["a","b"]'.
+    fn extractJsonArrayElement(raw: []const u8, idx: usize, buf: *[128]u8) ?[]const u8 {
+        if (raw.len < 2) return null;
+        var count: usize = 0;
+        var i: usize = 0;
+        while (i < raw.len) : (i += 1) {
+            if (raw[i] == '"') {
+                const start = i + 1;
+                i += 1;
+                while (i < raw.len and raw[i] != '"') : (i += 1) {}
+                if (count == idx) {
+                    const token = raw[start..i];
+                    if (token.len > buf.len) return null;
+                    @memcpy(buf[0..token.len], token);
+                    return buf[0..token.len];
+                }
+                count += 1;
+            }
+        }
+        return null;
+    }
+
     /// Cancel order on CLOB API before mutating local state.
     fn cancelOnCLOB(self: *OrderManager, order_id: []const u8) bool {
         var client = http.HttpClient.init(self.allocator);
         defer client.deinit();
 
-        const url = CLOB_API_BASE ++ "/order/cancel";
-
-        var ts_buf: [32]u8 = undefined;
-        const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch {
-            log.err("order_mgr", "failed to format cancel timestamp", .{});
+        const creds = self.config.api_creds orelse {
+            log.err("order_mgr", "no API credentials — cannot cancel order", .{});
             return false;
         };
 
+        const url = CLOB_API_BASE ++ "/order/cancel";
+
         var payload_buf: [256]u8 = undefined;
-        const payload = std.fmt.bufPrint(&payload_buf, "{{\"order_id\":\"{s}\",\"timestamp\":\"{s}\"}}", .{ order_id, ts }) catch {
+        const payload = std.fmt.bufPrint(&payload_buf, "{{\"order_id\":\"{s}\"}}", .{order_id}) catch {
             log.err("order_mgr", "failed to format cancel payload", .{});
             return false;
         };
 
-        const digest = crypto.Keccak256.hash(payload);
-        // Copy key to stack and zero it immediately after signing to reduce key exposure lifetime.
-        var key_copy: [32]u8 = self.config.private_key;
-        defer std.crypto.secureZero(u8, key_copy[0..]);
-
-        const sig = crypto.signEip712(digest, key_copy) catch |e| {
-            log.err("order_mgr", "failed to sign cancel payload: {s}", .{@errorName(e)});
-            return false;
-        };
-
-        var sig_bytes: [65]u8 = undefined;
-        @memcpy(sig_bytes[0..32], sig.r[0..32]);
-        @memcpy(sig_bytes[32..64], sig.s[0..32]);
-        sig_bytes[64] = sig.v;
-
-        var sig_hex_body: [130]u8 = undefined;
-        _ = bytesToHex(sig_bytes[0..], sig_hex_body[0..]);
-        var sig_hdr_buf: [132]u8 = undefined;
-        sig_hdr_buf[0] = '0';
-        sig_hdr_buf[1] = 'x';
-        @memcpy(sig_hdr_buf[2..], sig_hex_body[0..]);
+        // Format address
+        var addr_hex: [42]u8 = undefined;
+        addr_hex[0] = '0';
+        addr_hex[1] = 'x';
+        const charset = "0123456789abcdef";
+        for (self.config.signer_address, 0..) |b, i| {
+            addr_hex[2 + i * 2] = charset[b >> 4];
+            addr_hex[2 + i * 2 + 1] = charset[b & 0x0f];
+        }
 
         var delay_ms: u64 = 1000;
         const max_delay_ms: u64 = 60_000;
 
         var attempt: u32 = 0;
         while (attempt < self.config.max_retry_attempts) : (attempt += 1) {
+            // Build L2 HMAC signature and timestamp per attempt
+            var ts_buf: [32]u8 = undefined;
+            const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch {
+                log.err("order_mgr", "failed to format cancel timestamp", .{});
+                return false;
+            };
+
+            const hmac_result = poly_auth.buildHmacSignature(
+                creds.secret[0..creds.secret_len],
+                ts,
+                "DELETE",
+                "/order/cancel",
+                payload,
+            ) catch |e| {
+                log.err("order_mgr", "failed to compute cancel HMAC: {s}", .{@errorName(e)});
+                return false;
+            };
+
             var response = client.postJsonWithHeaders(url, payload, &.{
+                .{ .name = "POLY_ADDRESS", .value = &addr_hex },
+                .{ .name = "POLY_SIGNATURE", .value = hmac_result.slice() },
                 .{ .name = "POLY_TIMESTAMP", .value = ts },
-                .{ .name = "POLY_SIGNATURE", .value = sig_hdr_buf[0..] },
+                .{ .name = "POLY_API_KEY", .value = creds.api_key[0..creds.api_key_len] },
+                .{ .name = "POLY_PASSPHRASE", .value = creds.passphrase[0..creds.passphrase_len] },
             }) catch |e| {
                 if (e == error.ClientError) {
                     log.warn("order_mgr", "CLOB cancel 429/client error, backoff {d}ms (attempt {d}/{d})", .{

@@ -8,6 +8,8 @@ pub const Provider = enum { gamma_markets };
 pub const ProbabilityEstimate = struct {
     market_id: [64]u8,
     market_id_len: usize,
+    condition_id: [128]u8,
+    condition_id_len: usize,
     probability: f64,
     confidence: f64,
     provider: Provider,
@@ -72,9 +74,15 @@ pub const NewsClient = struct {
             }
             @memcpy(mid[0..mid_len], market.id[0..mid_len]);
 
+            var cid: [128]u8 = undefined;
+            const cid_len = @min(market.condition_id.len, 128);
+            @memcpy(cid[0..cid_len], market.condition_id[0..cid_len]);
+
             self.cached_estimates[count] = ProbabilityEstimate{
                 .market_id = mid,
                 .market_id_len = mid_len,
+                .condition_id = cid,
+                .condition_id_len = cid_len,
                 .probability = prob,
                 .confidence = 0.8,
                 .provider = .gamma_markets,

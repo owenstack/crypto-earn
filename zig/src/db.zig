@@ -48,12 +48,22 @@ const MIGRATION_004 =
     \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(4);
 ;
 
+/// Embedded migration: market trading metadata for Polymarket CLOB order construction.
+const MIGRATION_005 =
+    \\ALTER TABLE markets ADD COLUMN condition_id TEXT DEFAULT '';
+    \\ALTER TABLE markets ADD COLUMN clob_token_ids TEXT DEFAULT '[]';
+    \\ALTER TABLE markets ADD COLUMN outcomes TEXT DEFAULT '[]';
+    \\ALTER TABLE markets ADD COLUMN neg_risk INTEGER DEFAULT 0;
+    \\ALTER TABLE markets ADD COLUMN min_tick_size TEXT DEFAULT '0.01';
+    \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(5);
+;
+
 pub const DB = struct {
     handle: *c.sqlite3,
 
     pub fn open(path: [:0]const u8) !DB {
         var handle: ?*c.sqlite3 = null;
-        const rc = c.sqlite3_open(path.ptr, &handle);
+        const rc = c.sqlite3_open_v2(path.ptr, &handle, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_FULLMUTEX, null);
         if (rc != c.SQLITE_OK) {
             log.err("db", "sqlite3_open failed: rc={d}", .{rc});
             return error.DBOpenFailed;
@@ -119,6 +129,33 @@ pub const DB = struct {
         if (!self.migrationApplied(4)) {
             log.info("db", "applying migration 004", .{});
             try self.execZ(MIGRATION_004 ++ &[_:0]u8{});
+        }
+        // Check if migration 005 has been applied.
+        if (!self.migrationApplied(5)) {
+            log.info("db", "applying migration 005", .{});
+            // List of ALTER TABLE statements for migration 005
+            const alters = [_][:0]const u8{
+                "ALTER TABLE markets ADD COLUMN condition_id TEXT DEFAULT '';",
+                "ALTER TABLE markets ADD COLUMN clob_token_ids TEXT DEFAULT '[]';",
+                "ALTER TABLE markets ADD COLUMN outcomes TEXT DEFAULT '[]';",
+                "ALTER TABLE markets ADD COLUMN neg_risk INTEGER DEFAULT 0;",
+                "ALTER TABLE markets ADD COLUMN min_tick_size TEXT DEFAULT '0.01';",
+            };
+            for (alters) |sql| {
+                self.execZ(sql) catch |err| {
+                    const sqlite_err = std.mem.span(c.sqlite3_errmsg(self.handle));
+                    const duplicate_col = std.mem.indexOf(u8, sqlite_err, "duplicate column name") != null;
+                    if (err == error.DBExecFailed and duplicate_col) {
+                        log.info("db", "migration 005: column already exists; skipping ALTER TABLE: {s}", .{sql});
+                        continue;
+                    } else {
+                        log.err("db", "migration 005 ALTER TABLE failed: zig_err={s} sqlite_err={s} sql={s}", .{ @errorName(err), sqlite_err, sql });
+                        return err;
+                    }
+                };
+            }
+            // Only after all alters succeed/are skipped, mark migration 5 as applied
+            try self.execZ("INSERT OR IGNORE INTO schema_migrations(version)VALUES(5);");
         }
         log.info("db", "migrations complete", .{});
     }

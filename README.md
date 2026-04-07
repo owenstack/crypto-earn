@@ -72,7 +72,25 @@ Optional/common keys:
 - `LOG_LEVEL` (example: `info`)
 - `NODE_ENV` (example: `development`)
 
-## Quick Start (local)
+## Quick Start (Docker — recommended)
+
+```sh
+cp .env.example .env
+# Edit .env with real values (TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_CHAT_IDS, etc.)
+
+# Build and start both services
+docker compose up -d --build
+
+# View logs
+docker compose logs -f
+
+# Stop
+docker compose down
+```
+
+The Zig engine runs migrations automatically on startup. Data is persisted in a Docker volume (`engine-data`).
+
+## Quick Start (local, no Docker)
 
 ```sh
 cp .env.example .env
@@ -85,80 +103,33 @@ cd zig && zig build run
 cd ts && bun run dev
 ```
 
-## EC2 Deployment (systemd)
-
-### Prerequisites
-
-- EC2 instance (Ubuntu 22.04+ recommended)
-- SSH access with sudo privileges
-
-### First-time setup
+## Operational Commands (Docker)
 
 ```sh
-# Clone to /opt/cex-zig
-sudo git clone https://github.com/owenstack/crypto-earn.git /opt/cex-zig
-cd /opt/cex-zig
-
-# Provision: installs deps, creates cex-engine user, installs systemd units
-sudo scripts/provision.sh
-
-# Configure environment
-sudo cp .env.example .env
-sudo nano .env  # Set real values
-sudo chown cex-engine:cex-engine .env
-sudo chmod 0640 .env
-```
-
-### Deploy
-
-```sh
-scripts/deploy.sh --restart-services
-```
-
-### Verify
-
-```sh
-scripts/verify.sh
-```
-
-## Operational Commands
-
-```sh
-# Start / stop / restart services
-sudo systemctl start cex-engine cex-control
-sudo systemctl stop cex-engine cex-control
-sudo systemctl restart cex-engine cex-control
-
-# Status
-sudo systemctl status cex-engine cex-control
+# Start / stop / restart
+docker compose up -d
+docker compose down
+docker compose restart
 
 # Logs (follow)
-sudo journalctl -u cex-engine -f
-sudo journalctl -u cex-control -f
+docker compose logs -f engine
+docker compose logs -f control
 
-# Run database migrations (DB_PATH is required)
-# Option 1: pass DB_PATH as a CLI argument
-scripts/migrate.sh /opt/cex-zig/zig/data/cex.db
+# Rebuild after code changes
+docker compose up -d --build
 
-# Option 2: export DB_PATH in the environment
-export DB_PATH=/opt/cex-zig/zig/data/cex.db
-scripts/migrate.sh
-
-# Post-deploy validation (end-to-end)
-scripts/e2e-test.sh
-
-# Latency profiling
-scripts/latency-profile.sh
+# Shell into a running container
+docker compose exec engine sh
+docker compose exec control bash
 ```
 
 ## Rollback
 
-1. Stop services: `sudo systemctl stop cex-engine cex-control`
+1. Stop services: `docker compose down`
 2. Checkout previous tag/commit: `git checkout <previous-tag>`
-3. Rebuild: `cd zig && zig build -Doptimize=ReleaseFast`
-4. Restart: `sudo systemctl start cex-engine cex-control`
+3. Rebuild and start: `docker compose up -d --build`
 
-> **Note:** Migration rollback is not automated. SQLite — restore from backup if needed.
+> **Note:** Migration rollback is not automated. Back up the `engine-data` volume if needed.
 
 ## Security Model
 

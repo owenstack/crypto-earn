@@ -44,8 +44,10 @@ pub const WebSocketClient = struct {
     max_reconnect_delay_ms: u64,
     callback: ?PriceCallback,
     should_stop: std.atomic.Value(bool),
+    mu: std.Thread.Mutex,
+    live_client: ?*ws_lib.Client,
 
-    const INITIAL_RECONNECT_MS: u64 = 250;
+    const INITIAL_RECONNECT_MS: u64 = 1_000;
     const MAX_RECONNECT_MS: u64 = 30_000;
 
     pub fn init(allocator: std.mem.Allocator) WebSocketClient {
@@ -57,6 +59,8 @@ pub const WebSocketClient = struct {
             .max_reconnect_delay_ms = MAX_RECONNECT_MS,
             .callback = null,
             .should_stop = std.atomic.Value(bool).init(false),
+            .mu = .{},
+            .live_client = null,
         };
     }
 
@@ -75,8 +79,12 @@ pub const WebSocketClient = struct {
         self.callback = cb;
     }
 
-    /// Add a subscription for an asset_id. Will be sent when connected.
+    /// Add a subscription for an asset_id. Thread-safe.
+    /// If a live connection exists, sends a dynamic subscribe message immediately.
     pub fn subscribe(self: *WebSocketClient, asset_id: []const u8) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
         // Avoid duplicate subscriptions
         for (self.subscriptions.items) |existing| {
             if (std.mem.eql(u8, existing, asset_id)) return;
@@ -84,9 +92,22 @@ pub const WebSocketClient = struct {
         const copy = try self.allocator.dupe(u8, asset_id);
         try self.subscriptions.append(self.allocator, copy);
         log.info("ws", "subscribed to {s}", .{asset_id[0..@min(asset_id.len, 20)]});
+
+        // If connected, send a dynamic subscribe for this single asset
+        if (self.live_client) |client| {
+            var dyn_buf: [4096]u8 = undefined;
+            const dyn_msg = buildDynamicSubscribe(&dyn_buf, asset_id) catch return;
+            var mut_buf: [4096]u8 = undefined;
+            const len = dyn_msg.len;
+            @memcpy(mut_buf[0..len], dyn_msg);
+            client.write(mut_buf[0..len]) catch |e| {
+                log.err("ws", "failed to send dynamic subscribe: {s}", .{@errorName(e)});
+            };
+        }
     }
 
     /// Build the subscription JSON message for all tracked asset_ids.
+    /// Caller must hold `mu` when called from multi-threaded context.
     pub fn buildSubscriptionMessage(self: *WebSocketClient, buf: []u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const writer = fbs.writer();
@@ -103,12 +124,12 @@ pub const WebSocketClient = struct {
     fn buildDynamicSubscribe(buf: []u8, asset_id: []const u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const writer = fbs.writer();
-        try writer.print("{{\"assets_ids\":[\"{s}\"],\"operation\":\"subscribe\"}}", .{asset_id});
+        try writer.print("{{\"assets_ids\":[\"{s}\"],\"operation\":\"subscribe\",\"custom_feature_enabled\":true}}", .{asset_id});
         return fbs.getWritten();
     }
 
     /// Connect and run the WebSocket read loop. Blocks.
-    /// On disconnect, reconnects with exponential backoff (250ms -> 30s).
+    /// On disconnect, reconnects with exponential backoff (1s -> 30s).
     /// Call from a dedicated thread.
     pub fn connectAndRun(self: *WebSocketClient) void {
         while (!self.should_stop.load(.seq_cst)) {
@@ -134,6 +155,7 @@ pub const WebSocketClient = struct {
             .host = WS_HOST,
             .port = 443,
             .tls = true,
+            .max_size = 8 * 1024 * 1024,
         });
         defer client.deinit();
 
@@ -144,19 +166,36 @@ pub const WebSocketClient = struct {
 
         self.state = .connected;
         self.resetBackoff();
-        log.info("ws", "connected, sending subscriptions ({d} assets)", .{self.subscriptions.items.len});
+
+        // Register live client so subscribe() can send dynamic messages
+        self.mu.lock();
+        self.live_client = &client;
+        const sub_count = self.subscriptions.items.len;
+        self.mu.unlock();
+
+        defer {
+            self.mu.lock();
+            self.live_client = null;
+            self.mu.unlock();
+        }
+
+        log.info("ws", "connected, sending subscriptions ({d} assets)", .{sub_count});
 
         // Send initial subscription for all tracked assets
-        if (self.subscriptions.items.len > 0) {
+        if (sub_count > 0) {
             var sub_buf: [65536]u8 = undefined;
+            self.mu.lock();
             const sub_msg = self.buildSubscriptionMessage(&sub_buf) catch |e| {
+                self.mu.unlock();
                 log.err("ws", "failed to build subscription message: {s}", .{@errorName(e)});
                 return e;
             };
-            // websocket.zig client.write takes []u8 (mutable for masking)
+            // Copy before releasing lock since sub_msg points into sub_buf (safe, but be explicit)
             var mut_buf: [65536]u8 = undefined;
             const len = sub_msg.len;
             @memcpy(mut_buf[0..len], sub_msg);
+            self.mu.unlock();
+
             client.write(mut_buf[0..len]) catch |e| {
                 log.err("ws", "failed to send subscription: {s}", .{@errorName(e)});
                 return e;
@@ -164,13 +203,48 @@ pub const WebSocketClient = struct {
             log.info("ws", "subscription message sent", .{});
         }
 
-        // Read loop — blocks until disconnect or error
-        var handler = Handler{ .ws_client = self };
-        try client.readLoop(&handler);
+        // Read loop with periodic PING heartbeats (Polymarket requires PING every 10s)
+        try client.readTimeout(5_000); // 5s read timeout so we can interleave PINGs
+        var last_ping_ns: i128 = std.time.nanoTimestamp();
+        const ping_interval_ns: i128 = 8 * std.time.ns_per_s; // Send PING every 8s (server expects <10s)
+
+        while (!self.should_stop.load(.seq_cst)) {
+            // Send PING if interval elapsed
+            const now_ns = std.time.nanoTimestamp();
+            if (now_ns - last_ping_ns >= ping_interval_ns) {
+                var ping_buf = [_]u8{ 'P', 'I', 'N', 'G' };
+                client.write(&ping_buf) catch |e| {
+                    log.err("ws", "failed to send PING: {s}", .{@errorName(e)});
+                    return e;
+                };
+                last_ping_ns = now_ns;
+            }
+
+            // Try to read a message (returns null on timeout)
+            const message = client.read() catch |err| switch (err) {
+                error.Closed => return,
+                else => return err,
+            } orelse continue;
+
+            defer client.done(message);
+
+            switch (message.type) {
+                .text, .binary => {
+                    self.handleMessage(message.data);
+                },
+                .close => return,
+                .ping, .pong => {},
+            }
+        }
     }
 
     /// Parse incoming WebSocket message and invoke callback.
     fn handleMessage(self: *WebSocketClient, data: []const u8) void {
+        // Skip PONG heartbeat responses (text "PONG" from Polymarket)
+        if (data.len == 4 and std.mem.eql(u8, data, "PONG")) return;
+        // Skip empty arrays (server sends "[]" on subscription ack)
+        if (data.len <= 2 and std.mem.eql(u8, data[0..@min(data.len, 2)], "[]")) return;
+
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, data, .{}) catch {
             log.warn("ws", "failed to parse WS message", .{});
             return;
@@ -203,17 +277,6 @@ pub const WebSocketClient = struct {
     fn resetBackoff(self: *WebSocketClient) void {
         self.reconnect_delay_ms = INITIAL_RECONNECT_MS;
     }
-};
-
-/// Handler for incoming WebSocket messages from the karlseguin/websocket.zig read loop.
-const Handler = struct {
-    ws_client: *WebSocketClient,
-
-    pub fn serverMessage(self: *Handler, data: []u8) !void {
-        self.ws_client.handleMessage(data);
-    }
-
-    pub fn close(_: *Handler) void {}
 };
 
 fn parseEventType(s: []const u8) EventType {
@@ -272,36 +335,27 @@ fn handleBookEvent(self: *WebSocketClient, root: std.json.ObjectMap) void {
 }
 
 fn handlePriceChangeEvent(self: *WebSocketClient, root: std.json.ObjectMap) void {
-    const asset_id = jsonStr(root, "asset_id");
     const market = jsonStr(root, "market");
     const timestamp = jsonStr(root, "timestamp");
 
-    // price_change events include price_changes[] with best_bid, best_ask
-    if (root.get("changes")) |changes_val| {
+    // price_change events: asset_id, best_bid, best_ask are inside each price_changes[] entry
+    if (root.get("price_changes")) |changes_val| {
         if (changes_val == .array) {
             for (changes_val.array.items) |change| {
                 if (change == .object) {
+                    const change_asset_id = jsonStr(change.object, "asset_id");
                     const best_bid = jsonStr(change.object, "best_bid");
                     const best_ask = jsonStr(change.object, "best_ask");
 
                     if (self.callback) |cb| {
-                        // Use JSON timestamp if present, else heap-allocate
-                        var ts_heap: ?[]u8 = null;
-                        const ts_final = if (timestamp.len > 0) timestamp else blk: {
-                            var ts_buf: [32]u8 = undefined;
-                            const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch "0";
-                            ts_heap = self.allocator.dupe(u8, ts_str) catch null;
-                            break :blk if (ts_heap) |h| h else "0";
-                        };
                         cb(.{
-                            .asset_id = asset_id,
+                            .asset_id = change_asset_id,
                             .market = market,
                             .best_bid = best_bid,
                             .best_ask = best_ask,
-                            .timestamp = ts_final,
+                            .timestamp = timestamp,
                             .event_type = "price_change",
                         });
-                        if (ts_heap) |h| self.allocator.free(h);
                     }
                 }
             }
@@ -316,22 +370,14 @@ fn handleLastTradeEvent(self: *WebSocketClient, root: std.json.ObjectMap) void {
     const timestamp = jsonStr(root, "timestamp");
 
     if (self.callback) |cb| {
-        var ts_heap: ?[]u8 = null;
-        const ts_final = if (timestamp.len > 0) timestamp else blk: {
-            var ts_buf: [32]u8 = undefined;
-            const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch "0";
-            ts_heap = self.allocator.dupe(u8, ts_str) catch null;
-            break :blk if (ts_heap) |h| h else "0";
-        };
         cb(.{
             .asset_id = asset_id,
             .market = market,
             .best_bid = price,
             .best_ask = price,
-            .timestamp = ts_final,
+            .timestamp = timestamp,
             .event_type = "last_trade_price",
         });
-        if (ts_heap) |h| self.allocator.free(h);
     }
 }
 
@@ -343,22 +389,14 @@ fn handleBestBidAskEvent(self: *WebSocketClient, root: std.json.ObjectMap) void 
     const timestamp = jsonStr(root, "timestamp");
 
     if (self.callback) |cb| {
-        var ts_heap: ?[]u8 = null;
-        const ts_final = if (timestamp.len > 0) timestamp else blk: {
-            var ts_buf: [32]u8 = undefined;
-            const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch "0";
-            ts_heap = self.allocator.dupe(u8, ts_str) catch null;
-            break :blk if (ts_heap) |h| h else "0";
-        };
         cb(.{
             .asset_id = asset_id,
             .market = market,
             .best_bid = best_bid,
             .best_ask = best_ask,
-            .timestamp = ts_final,
+            .timestamp = timestamp,
             .event_type = "best_bid_ask",
         });
-        if (ts_heap) |h| self.allocator.free(h);
     }
 }
 
@@ -413,7 +451,7 @@ test "websocket: buildSubscriptionMessage" {
 test "websocket: exponential backoff constants" {
     var ws_client = WebSocketClient.init(std.testing.allocator);
     defer ws_client.deinit();
-    try std.testing.expectEqual(@as(u64, 250), ws_client.reconnect_delay_ms);
+    try std.testing.expectEqual(@as(u64, 1_000), ws_client.reconnect_delay_ms);
     try std.testing.expectEqual(@as(u64, 30_000), ws_client.max_reconnect_delay_ms);
 }
 

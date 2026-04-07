@@ -24,6 +24,9 @@ const news_sources = @import("news_sources.zig");
 // Phase 4 modules
 const ipc = @import("ipc.zig");
 
+// Polymarket auth module
+const polymarket_auth = @import("polymarket_auth.zig");
+
 // ─── Logger tests ───────────────────────────────────────────────────────────
 
 test "logger: init sets start time and uptimeMs returns non-negative" {
