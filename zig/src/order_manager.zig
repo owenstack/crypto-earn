@@ -83,6 +83,8 @@ pub const OrderManager = struct {
     halted: std.atomic.Value(bool),
     paused: std.atomic.Value(bool),
     should_stop: std.atomic.Value(bool),
+    lastFeeRateByToken: std.StringHashMap(u256),
+    defaultFeeRateBps: u256,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -98,6 +100,8 @@ pub const OrderManager = struct {
             .halted = std.atomic.Value(bool).init(false),
             .paused = std.atomic.Value(bool).init(false),
             .should_stop = std.atomic.Value(bool).init(false),
+            .lastFeeRateByToken = std.StringHashMap(u256).init(allocator),
+            .defaultFeeRateBps = 1000, // Set a sensible default, can be overridden
         };
     }
 
@@ -185,7 +189,7 @@ pub const OrderManager = struct {
         };
 
         // Submit to CLOB with 429 retry
-        const submit_result = self.submitToCLOB(market_id, side, size, price, order_type, client_order_id);
+        const submit_result = self.submitToCLOB(market_id, side, size, price, order_type);
         if (!submit_result) {
             self.database.updateOrderStatus(client_order_id, "rejected") catch {};
             return .{ .failed = .{ .reason = "clob_submission_failed" } };
@@ -328,7 +332,7 @@ pub const OrderManager = struct {
         const max_age_seconds: i64 = @as(i64, @intCast(self.config.max_order_age_hours)) * 3600;
         const cutoff = std.time.timestamp() - max_age_seconds;
 
-        const sql = "SELECT id FROM orders WHERE status='placed' AND created_at < ?;" ++ &[_:0]u8{};
+        const sql = "SELECT id, status FROM orders WHERE status IN ('placed','pending') AND created_at < ?;" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
             log.err("order_mgr", "scanStaleOrders failed: unable to prepare stale-order query", .{});
@@ -356,9 +360,17 @@ pub const OrderManager = struct {
             const order_id = std.mem.span(order_id_ptr);
             if (order_id.len == 0) continue;
 
-            if (!self.cancelOnCLOB(order_id)) {
-                log.err("order_mgr", "failed stale-order cancel on CLOB: {s}", .{order_id});
-                continue;
+            const status_raw = c.sqlite3_column_text(stmt, 1);
+            const status_str = if (status_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+            const is_pending = std.mem.eql(u8, status_str, "pending");
+
+            // Pending orders were never submitted to CLOB — just mark cancelled locally.
+            // Placed orders need CLOB cancellation first.
+            if (!is_pending) {
+                if (!self.cancelOnCLOB(order_id)) {
+                    log.err("order_mgr", "failed stale-order cancel on CLOB: {s}", .{order_id});
+                    continue;
+                }
             }
 
             if (!applyCancelledUpdate(upd_stmt.?, order_id)) {
@@ -427,10 +439,7 @@ pub const OrderManager = struct {
         size: []const u8,
         price: []const u8,
         order_type: []const u8,
-        client_order_id: []const u8,
     ) bool {
-        // Use order_type and client_order_id in JSON body below
-
         const creds = self.config.api_creds orelse {
             log.err("order_mgr", "no API credentials — cannot submit order", .{});
             return false;
@@ -442,6 +451,27 @@ pub const OrderManager = struct {
             log.err("order_mgr", "failed to resolve token_id for market={s} side={s}", .{ market_id, side });
             return false;
         };
+
+        // Fetch per-market fee rate from CLOB API, with fallback to cache or default
+        var fee_rate_bps: u256 = 0;
+        var used_fallback = false;
+        var fetch_err: ?anyerror = null;
+        if (self.fetchFeeRate(token_id)) |rate| {
+            fee_rate_bps = rate;
+            // Update cache
+            _ = self.lastFeeRateByToken.put(token_id, rate);
+        } else |err| {
+            _ = try self.lastFeeRateByToken.put(token_id, rate);
+            if (self.lastFeeRateByToken.get(token_id)) |cached| {
+                fee_rate_bps = cached;
+                used_fallback = true;
+                log.warn("order_mgr", "fee rate fetch failed for token {s}: {any}; using cached value {d}", .{ token_id, err, cached });
+            } else {
+                fee_rate_bps = self.defaultFeeRateBps;
+                used_fallback = true;
+                log.warn("order_mgr", "fee rate fetch failed for token {s}: {any}; using default value {d}", .{ token_id, err, self.defaultFeeRateBps });
+            }
+        }
 
         // Parse price/size as f64
         const price_f = std.fmt.parseFloat(f64, price) catch {
@@ -468,12 +498,13 @@ pub const OrderManager = struct {
         const maker = self.config.funder_address orelse self.config.signer_address;
 
         // Build CTF Order struct
-        // Use nanoTimestamp() for high 128 bits, cryptographically secure random for low 128 bits
-        const nano: u128 = @intCast(std.time.nanoTimestamp());
-        var rand_bytes: [16]u8 = undefined;
+        // Salt: match SDK pattern — timestamp * random(), fits in u64 for JSON integer compat
+        const ts_sec: u64 = @intCast(std.time.timestamp());
+        var rand_bytes: [8]u8 = undefined;
         std.crypto.random.bytes(&rand_bytes);
-        const rand_low = std.mem.readInt(u128, &rand_bytes, .big);
-        const salt: u256 = (@as(u256, nano) << @as(u8, 128)) | rand_low;
+        const rand_val = std.mem.readInt(u64, &rand_bytes, .big);
+        const safe_ts = @max(ts_sec, 1);
+        const salt: u256 = @as(u256, safe_ts) *% (rand_val % safe_ts + 1);
 
         const order = poly_auth.CtfOrder{
             .salt = salt,
@@ -485,7 +516,7 @@ pub const OrderManager = struct {
             .taker_amount = amounts.taker_amount,
             .expiration = 0,
             .nonce = 0,
-            .fee_rate_bps = 0,
+            .fee_rate_bps = fee_rate_bps,
             .side = side_u8,
             .signature_type = self.config.signature_type,
         };
@@ -530,10 +561,21 @@ pub const OrderManager = struct {
         var taker_amt_buf: [32]u8 = undefined;
         const taker_amt_str = std.fmt.bufPrint(&taker_amt_buf, "{d}", .{amounts.taker_amount}) catch "0";
 
+        var fee_rate_buf: [16]u8 = undefined;
+        const fee_rate_str = std.fmt.bufPrint(&fee_rate_buf, "{d}", .{fee_rate_bps}) catch "0";
+
         var body_buf: [2048]u8 = undefined;
-        // Use order_type and client_order_id in JSON body
+        // Map internal order types to CLOB-compatible types
+        const clob_order_type: []const u8 = if (std.mem.eql(u8, order_type, "limit") or std.mem.eql(u8, order_type, "GTC"))
+            "GTC"
+        else if (std.mem.eql(u8, order_type, "market") or std.mem.eql(u8, order_type, "FOK"))
+            "FOK"
+        else
+            order_type;
+        // owner = API key (UUID), not the signer address
+        const api_key = creds.api_key[0..creds.api_key_len];
         const json_body = std.fmt.bufPrint(&body_buf,
-            \\{{"order":{{"salt":"{s}","maker":"{s}","signer":"{s}","taker":"0x0000000000000000000000000000000000000000","tokenId":"{s}","makerAmount":"{s}","takerAmount":"{s}","expiration":"0","nonce":"0","feeRateBps":"0","side":"{s}","signatureType":{d},"signature":"{s}"}},"owner":"{s}","orderType":"{s}","clientOrderId":"{s}"}}
+            \\{{"order":{{"salt":{s},"maker":"{s}","signer":"{s}","taker":"0x0000000000000000000000000000000000000000","tokenId":"{s}","makerAmount":"{s}","takerAmount":"{s}","expiration":"0","nonce":"0","feeRateBps":"{s}","side":"{s}","signatureType":{d},"signature":"{s}"}},"owner":"{s}","orderType":"{s}"}}
         , .{
             salt_str,
             &maker_hex,
@@ -541,16 +583,18 @@ pub const OrderManager = struct {
             token_id,
             maker_amt_str,
             taker_amt_str,
+            fee_rate_str,
             if (side_u8 == 0) "BUY" else "SELL",
             self.config.signature_type,
             &order_sig_hex,
-            &addr_hex,
-            order_type,
-            client_order_id,
+            api_key,
+            clob_order_type,
         }) catch {
             log.err("order_mgr", "failed to format order JSON", .{});
             return false;
         };
+
+        log.debug("order_mgr", "CLOB payload: {s}", .{json_body});
 
         var client = http.HttpClient.init(self.allocator);
         defer client.deinit();
@@ -588,7 +632,7 @@ pub const OrderManager = struct {
                 .{ .name = "POLY_PASSPHRASE", .value = creds.passphrase[0..creds.passphrase_len] },
             }) catch |e| {
                 if (e == error.ClientError) {
-                    log.warn("order_mgr", "CLOB 429/client error, backoff {d}ms (attempt {d}/{d})", .{
+                    log.warn("order_mgr", "CLOB submission 429/client error, backoff {d}ms (attempt {d}/{d})", .{
                         delay_ms, attempt + 1, self.config.max_retry_attempts,
                     });
                     std.Thread.sleep(delay_ms * std.time.ns_per_ms);
@@ -616,7 +660,7 @@ pub const OrderManager = struct {
                 return true;
             }
 
-            log.err("order_mgr", "CLOB unexpected status: {d} body={s}", .{
+            log.err("order_mgr", "CLOB rejected: status={d} body={s}", .{
                 @intFromEnum(response.status), response.body,
             });
             return false;
@@ -639,7 +683,7 @@ pub const OrderManager = struct {
     }
 
     /// Resolve token_id from condition_id + side by looking up clob_token_ids in DB.
-    fn resolveTokenId(self: *OrderManager, market_id: []const u8, side: []const u8, buf: *[128]u8) ?[]const u8 {
+    fn resolveTokenId(self: *OrderManager, market_id: []const u8, _: []const u8, buf: *[128]u8) ?[]const u8 {
         // Query: SELECT clob_token_ids FROM markets WHERE condition_id = ? OR id = ? LIMIT 1
         const sql = "SELECT clob_token_ids FROM markets WHERE condition_id=? OR id=? LIMIT 1;" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
@@ -652,9 +696,9 @@ pub const OrderManager = struct {
         const raw_ptr = c.sqlite3_column_text(stmt, 0);
         const raw = if (raw_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else return null;
 
-        // Parse JSON array, pick index based on side: buy -> [0] (Yes), sell -> [1] (No)
-        const idx: usize = if (std.mem.eql(u8, side, "sell")) 1 else 0;
-        return extractJsonArrayElement(raw, idx, buf);
+        // Always use token [0] (Yes token). The order side (BUY/SELL) determines direction
+        // on the same token, not which token to pick.
+        return extractJsonArrayElement(raw, 0, buf);
     }
 
     /// Extract element at `idx` from a JSON string array like '["a","b"]'.
@@ -677,6 +721,47 @@ pub const OrderManager = struct {
             }
         }
         return null;
+    }
+
+    /// Fetch the per-market fee rate from GET /fee-rate?token_id=TOKEN_ID.
+    /// Returns the base_fee value (e.g. 0 or 1000), or error on failure.
+    fn fetchFeeRate(self: *OrderManager, token_id: []const u8) !u256 {
+        var url_buf: [256]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "{s}/fee-rate?token_id={s}", .{
+            CLOB_API_BASE,
+            token_id,
+        });
+
+        var client = http.HttpClient.init(self.allocator);
+        defer client.deinit();
+
+        var response = client.get(url) catch {
+            return error.FetchFailed;
+        };
+        defer response.deinit();
+
+        // Parse {"base_fee": 1000}
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{}) catch {
+            return error.ParseFailed;
+        };
+        defer parsed.deinit();
+
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => return error.InvalidResponse,
+        };
+
+        const base_fee = obj.get("base_fee") orelse return error.MissingBaseFee;
+        return switch (base_fee) {
+            .integer => |v| if (v >= 0) @intCast(v) else error.NegativeFee,
+            .float => |v| {
+                if (std.math.isNan(v) or std.math.isInf(v)) return 0;
+                if (v < 0) return 0;
+                if (v > std.math.floatMax(f64)) return 0;
+                return @intFromFloat(v);
+            },
+            else => error.InvalidBaseFeeType,
+        };
     }
 
     /// Cancel order on CLOB API before mutating local state.

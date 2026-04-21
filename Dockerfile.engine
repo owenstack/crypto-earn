@@ -29,7 +29,7 @@ COPY zig/ ./
 RUN mkdir -p /root/.cache/zig/p && \
     cp -r .cache/zig/p/* /root/.cache/zig/p/ 2>/dev/null || true
 
-RUN zig build -Doptimize=ReleaseFast
+RUN zig build -Doptimize=ReleaseSafe
 
 # --- Stage 2: Minimal runtime ---
 FROM debian:bookworm-slim

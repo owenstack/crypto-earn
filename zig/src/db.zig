@@ -81,7 +81,7 @@ pub const DB = struct {
         try self.execZ("PRAGMA journal_mode=WAL;");
         try self.execZ("PRAGMA synchronous=NORMAL;");
         try self.execZ("PRAGMA busy_timeout=5000;");
-        try self.execZ("PRAGMA foreign_keys=ON;");
+        try self.execZ("PRAGMA foreign_keys=OFF;");
         try self.execZ("PRAGMA cache_size=-8000;");
     }
 
@@ -220,8 +220,10 @@ pub const DB = struct {
             }
         }
 
-        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
-            log.err("db", "failed to execute insertOrder", .{});
+        const step_rc = c.sqlite3_step(stmt);
+        if (step_rc != c.SQLITE_DONE) {
+            const sqlite_err = std.mem.span(c.sqlite3_errmsg(self.handle));
+            log.err("db", "failed to execute insertOrder: rc={d} err={s}", .{ step_rc, sqlite_err });
             return error.DBExecFailed;
         }
     }

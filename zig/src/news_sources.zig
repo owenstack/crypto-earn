@@ -10,6 +10,8 @@ pub const ProbabilityEstimate = struct {
     market_id_len: usize,
     condition_id: [128]u8,
     condition_id_len: usize,
+    yes_token_id: [80]u8,
+    yes_token_id_len: usize,
     probability: f64,
     confidence: f64,
     provider: Provider,
@@ -27,8 +29,9 @@ pub const NewsClient = struct {
     last_fetch_ts: i64,
     cached_estimates: [MAX_CACHED]?ProbabilityEstimate,
     cached_count: usize,
+    mu: std.Thread.Mutex,
 
-    const MAX_CACHED = 128;
+    pub const MAX_CACHED = 128;
 
     pub fn init(allocator: std.mem.Allocator, config: NewsSourceConfig) NewsClient {
         return .{
@@ -37,12 +40,16 @@ pub const NewsClient = struct {
             .last_fetch_ts = 0,
             .cached_estimates = [_]?ProbabilityEstimate{null} ** MAX_CACHED,
             .cached_count = 0,
+            .mu = .{},
         };
     }
 
     /// Fetch probability estimate for a market from the configured provider.
     /// Uses cache if within TTL.
     pub fn getEstimate(self: *NewsClient, market_id: []const u8) ?ProbabilityEstimate {
+        self.mu.lock();
+        defer self.mu.unlock();
+
         const now = std.time.timestamp();
         for (self.cached_estimates) |slot| {
             if (slot) |est| {
@@ -58,8 +65,10 @@ pub const NewsClient = struct {
     }
 
     /// Update cache from Gamma market data (called when scanner refreshes).
+    /// Builds new cache off to the side, then publishes under lock.
     pub fn updateFromGammaMarkets(self: *NewsClient, markets: []const gamma.GammaMarket) void {
         const now = std.time.timestamp();
+        var next = [_]?ProbabilityEstimate{null} ** MAX_CACHED;
         var count: usize = 0;
 
         for (markets) |market| {
@@ -78,11 +87,21 @@ pub const NewsClient = struct {
             const cid_len = @min(market.condition_id.len, 128);
             @memcpy(cid[0..cid_len], market.condition_id[0..cid_len]);
 
-            self.cached_estimates[count] = ProbabilityEstimate{
+            // Extract Yes token ID (first element of clob_token_ids JSON array)
+            var ytid: [80]u8 = undefined;
+            var ytid_len: usize = 0;
+            if (extractFirstJsonString(market.clob_token_ids)) |token| {
+                ytid_len = @min(token.len, 80);
+                @memcpy(ytid[0..ytid_len], token[0..ytid_len]);
+            }
+
+            next[count] = ProbabilityEstimate{
                 .market_id = mid,
                 .market_id_len = mid_len,
                 .condition_id = cid,
                 .condition_id_len = cid_len,
+                .yes_token_id = ytid,
+                .yes_token_id_len = ytid_len,
                 .probability = prob,
                 .confidence = 0.8,
                 .provider = .gamma_markets,
@@ -91,15 +110,26 @@ pub const NewsClient = struct {
             count += 1;
         }
 
-        // Clear remaining slots
-        var i = count;
-        while (i < MAX_CACHED) : (i += 1) {
-            self.cached_estimates[i] = null;
-        }
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        self.cached_estimates = next;
         self.cached_count = count;
         self.last_fetch_ts = now;
 
         log.info("news", "updated cache from gamma: {d} estimates", .{count});
+    }
+
+    /// Copy a thread-safe snapshot of cached estimates. Returns the count.
+    pub fn snapshot(self: *NewsClient, out: *[MAX_CACHED]ProbabilityEstimate) usize {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        const count = self.cached_count;
+        for (0..count) |i| {
+            out[i] = self.cached_estimates[i].?;
+        }
+        return count;
     }
 
     /// Parse outcome_prices JSON string like "[\"0.55\",\"0.45\"]" to get the Yes probability.
@@ -127,3 +157,19 @@ pub const NewsClient = struct {
         return std.fmt.parseFloat(f64, price_str) catch null;
     }
 };
+
+/// Extract the first quoted string from a JSON array like '["abc","def"]'.
+/// Returns a slice into the input (no allocation).
+/// Note: Does not handle escape sequences; assumes simple unescaped strings.
+fn extractFirstJsonString(raw: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < raw.len) : (i += 1) {
+        if (raw[i] == '"') {
+            const start = i + 1;
+            i += 1;
+            while (i < raw.len and raw[i] != '"') : (i += 1) {}
+            return raw[start..i];
+        }
+    }
+    return null;
+}

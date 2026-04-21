@@ -8,7 +8,7 @@ pub const SignalDirection = enum { buy, sell };
 
 pub const Signal = struct {
     strategy: StrategyName,
-    market_id: [64]u8,
+    market_id: [68]u8,
     market_id_len: usize,
     direction: SignalDirection,
     price: f64,
@@ -40,9 +40,9 @@ pub const StrategyStats = struct {
 const MAX_ACTIVE_ORDERS = 64;
 
 pub const ActiveOrder = struct {
-    order_id: [64]u8,
+    order_id: [68]u8,
     order_id_len: usize,
-    market_id: [64]u8,
+    market_id: [68]u8,
     market_id_len: usize,
     strategy: StrategyName,
     direction: SignalDirection,
@@ -120,8 +120,8 @@ pub const StrategyEngine = struct {
         defer self.state_mu.unlock();
         self.news_stats.signals_emitted += 1;
 
-        var mid: [64]u8 = undefined;
-        const mid_len = @min(market_id.len, 64);
+        var mid: [68]u8 = undefined;
+        const mid_len = @min(market_id.len, 68);
         @memcpy(mid[0..mid_len], market_id[0..mid_len]);
 
         log.info("strategy", "news signal: market={s} dir={s} delta={d:.4} conf={d:.4}", .{
@@ -162,8 +162,8 @@ pub const StrategyEngine = struct {
         const ask_price = best_ask - spread * 0.25;
         const confidence = @min(1.0, spread / 0.1);
 
-        var mid: [64]u8 = undefined;
-        const mid_len = @min(market_id.len, 64);
+        var mid: [68]u8 = undefined;
+        const mid_len = @min(market_id.len, 68);
         @memcpy(mid[0..mid_len], market_id[0..mid_len]);
 
         self.state_mu.lock();
@@ -219,12 +219,12 @@ pub const StrategyEngine = struct {
         // Find first empty slot
         for (&self.active_orders) |*slot| {
             if (slot.* == null) {
-                var oid: [64]u8 = undefined;
-                const oid_len = @min(order_id.len, 64);
+                var oid: [68]u8 = undefined;
+                const oid_len = @min(order_id.len, 68);
                 @memcpy(oid[0..oid_len], order_id[0..oid_len]);
 
-                var mid: [64]u8 = undefined;
-                const mid_len = @min(market_id.len, 64);
+                var mid: [68]u8 = undefined;
+                const mid_len = @min(market_id.len, 68);
                 @memcpy(mid[0..mid_len], market_id[0..mid_len]);
 
                 slot.* = ActiveOrder{
@@ -298,7 +298,7 @@ pub const StrategyEngine = struct {
     }
 
     pub const CollapsedResult = struct {
-        order_ids: [MAX_ACTIVE_ORDERS][64]u8,
+        order_ids: [MAX_ACTIVE_ORDERS][68]u8,
         order_id_lens: [MAX_ACTIVE_ORDERS]usize,
         count: usize,
     };

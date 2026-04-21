@@ -27,6 +27,7 @@ pub const GammaMarket = struct {
     best_ask: f64,
     active: bool,
     accepting_orders: bool,
+    neg_risk: bool,
 };
 
 /// Poll markets from Gamma API via /events endpoint, filter by config, return filtered list.
@@ -142,6 +143,7 @@ pub fn pollMarkets(allocator: std.mem.Allocator, client: *http.HttpClient, confi
             .best_ask = jsonFloat(obj.get("bestAsk")),
             .active = is_active,
             .accepting_orders = accepting,
+            .neg_risk = jsonBool(obj.get("negRisk")),
         };
 
         try results.append(allocator, market);

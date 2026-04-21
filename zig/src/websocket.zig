@@ -133,6 +133,17 @@ pub const WebSocketClient = struct {
     /// Call from a dedicated thread.
     pub fn connectAndRun(self: *WebSocketClient) void {
         while (!self.should_stop.load(.seq_cst)) {
+            // Wait until we have at least one subscription before connecting
+            {
+                self.mu.lock();
+                const count = self.subscriptions.items.len;
+                self.mu.unlock();
+                if (count == 0) {
+                    std.Thread.sleep(2 * std.time.ns_per_s);
+                    continue;
+                }
+            }
+
             self.state = .connecting;
             log.info("ws", "connecting to Polymarket CLOB WebSocket...", .{});
 
@@ -183,20 +194,30 @@ pub const WebSocketClient = struct {
 
         // Send initial subscription for all tracked assets
         if (sub_count > 0) {
-            var sub_buf: [65536]u8 = undefined;
+            // Use heap allocation for large subscription buffers
+            const sub_buf = self.allocator.alloc(u8, 262144) catch |e| {
+                log.err("ws", "failed to allocate subscription buffer: {s}", .{@errorName(e)});
+                return e;
+            };
+            defer self.allocator.free(sub_buf);
+
             self.mu.lock();
-            const sub_msg = self.buildSubscriptionMessage(&sub_buf) catch |e| {
+            const sub_msg = self.buildSubscriptionMessage(sub_buf) catch |e| {
                 self.mu.unlock();
                 log.err("ws", "failed to build subscription message: {s}", .{@errorName(e)});
                 return e;
             };
-            // Copy before releasing lock since sub_msg points into sub_buf (safe, but be explicit)
-            var mut_buf: [65536]u8 = undefined;
             const len = sub_msg.len;
-            @memcpy(mut_buf[0..len], sub_msg);
+            const send_buf = self.allocator.alloc(u8, len) catch |e| {
+                self.mu.unlock();
+                log.err("ws", "failed to allocate send buffer: {s}", .{@errorName(e)});
+                return e;
+            };
+            @memcpy(send_buf[0..len], sub_msg);
             self.mu.unlock();
+            defer self.allocator.free(send_buf);
 
-            client.write(mut_buf[0..len]) catch |e| {
+            client.write(send_buf[0..len]) catch |e| {
                 log.err("ws", "failed to send subscription: {s}", .{@errorName(e)});
                 return e;
             };

@@ -69,7 +69,9 @@ pub const Scanner = struct {
 
         while (self.running.load(.seq_cst)) {
             self.pollOnce();
-            const sleep_ns: u64 = @as(u64, self.config.poll_interval_min) * 60 * std.time.ns_per_s;
+            // Use short retry interval (30s) if no markets loaded yet, normal interval otherwise
+            const sleep_s: u64 = if (self.markets.len == 0) 30 else @as(u64, self.config.poll_interval_min) * 60;
+            const sleep_ns: u64 = sleep_s * std.time.ns_per_s;
             std.Thread.sleep(sleep_ns);
         }
 
@@ -157,7 +159,7 @@ pub const Scanner = struct {
             db.c.sqlite3_bind_text(stmt, 6, m.condition_id.ptr, @intCast(m.condition_id.len), null) != db.c.SQLITE_OK or
             db.c.sqlite3_bind_text(stmt, 7, m.clob_token_ids.ptr, @intCast(m.clob_token_ids.len), null) != db.c.SQLITE_OK or
             db.c.sqlite3_bind_text(stmt, 8, m.outcomes.ptr, @intCast(m.outcomes.len), null) != db.c.SQLITE_OK or
-            db.c.sqlite3_bind_int(stmt, 9, 0) != db.c.SQLITE_OK or
+            db.c.sqlite3_bind_int(stmt, 9, if (m.neg_risk) @as(c_int, 1) else @as(c_int, 0)) != db.c.SQLITE_OK or
             db.c.sqlite3_bind_text(stmt, 10, default_min_tick.ptr, @intCast(default_min_tick.len), null) != db.c.SQLITE_OK)
             return error.DBExecFailed;
 

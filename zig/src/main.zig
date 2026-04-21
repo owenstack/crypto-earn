@@ -227,30 +227,36 @@ fn strategyWorker(ctx: *StrategyWorkerCtx) void {
 }
 
 fn evaluateNewsSignals(ctx: *StrategyWorkerCtx) void {
-    for (0..ctx.nc.cached_count) |i| {
-        if (ctx.nc.cached_estimates[i]) |est| {
-            const market_id = est.market_id[0..est.market_id_len];
-            const condition_id = est.condition_id[0..est.condition_id_len];
+    var snap: [news.NewsClient.MAX_CACHED]news.ProbabilityEstimate = undefined;
+    const snap_count = ctx.nc.snapshot(&snap);
 
-            // Query orderbook mid price using condition_id (matches WS market field)
-            const mid = queryLastMid(ctx.database, condition_id) orelse continue;
+    for (snap[0..snap_count]) |est| {
+        const condition_id = est.condition_id[0..est.condition_id_len];
+        const yes_token_id = est.yes_token_id[0..est.yes_token_id_len];
 
-            const implied_prob = priceToImpliedProb(mid);
+        // Skip markets where we don't have the Yes token ID
+        if (yes_token_id.len == 0) continue;
 
-            if (ctx.se.evaluateNewsRepricing(market_id, est.probability, implied_prob)) |signal| {
-                dispatchSignal(ctx, signal);
-            }
+        // Query orderbook mid price for the Yes token specifically
+        // (avoids comparing Yes probability against No-token price)
+        const mid = queryLastMidByAsset(ctx.database, yes_token_id) orelse continue;
 
-            // Check for collapsed edges — cancel orders where edge disappeared
-            const delta = @abs(est.probability - implied_prob);
-            const collapsed = ctx.se.findCollapsedEdgeOrders(market_id, delta);
-            for (0..collapsed.count) |ci| {
-                const oid = collapsed.order_ids[ci][0..collapsed.order_id_lens[ci]];
-                if (ctx.om.cancelOrder(oid)) {
-                    ctx.se.untrackOrder(oid);
-                    ctx.se.incrementCancels(.news_repricing);
-                    log.info("strategy_worker", "cancelled collapsed-edge order: {s}", .{oid});
-                }
+        const implied_prob = priceToImpliedProb(mid);
+
+        // Use condition_id as market_id for order submission (resolveTokenId matches on it)
+        if (ctx.se.evaluateNewsRepricing(condition_id, est.probability, implied_prob)) |signal| {
+            dispatchSignal(ctx, signal);
+        }
+
+        // Check for collapsed edges — cancel orders where edge disappeared
+        const delta = @abs(est.probability - implied_prob);
+        const collapsed = ctx.se.findCollapsedEdgeOrders(condition_id, delta);
+        for (0..collapsed.count) |ci| {
+            const oid = collapsed.order_ids[ci][0..collapsed.order_id_lens[ci]];
+            if (ctx.om.cancelOrder(oid)) {
+                ctx.se.untrackOrder(oid);
+                ctx.se.incrementCancels(.news_repricing);
+                log.info("strategy_worker", "cancelled collapsed-edge order: {s}", .{oid});
             }
         }
     }
@@ -285,8 +291,14 @@ fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
     const market_id = signal.market_id[0..signal.market_id_len];
     const side_str: []const u8 = if (signal.direction == .buy) "buy" else "sell";
 
+    // Round price to 0.01 tick size (Polymarket default min_tick_size)
+    const tick = 0.01;
+    const rounded_price = @round(signal.price / tick) * tick;
+    // Clamp to valid Polymarket price range (0.01 to 0.99)
+    const clamped_price = std.math.clamp(rounded_price, 0.01, 0.99);
+
     var price_buf: [32]u8 = undefined;
-    const price_str = std.fmt.bufPrint(&price_buf, "{d:.4}", .{signal.price}) catch "0";
+    const price_str = std.fmt.bufPrint(&price_buf, "{d:.2}", .{clamped_price}) catch "0";
     var size_buf: [32]u8 = undefined;
     const size_str = std.fmt.bufPrint(&size_buf, "{d:.2}", .{signal.size}) catch "0";
 
@@ -366,6 +378,18 @@ fn queryLastMid(database: *db.DB, market_id: []const u8) ?f64 {
     if (db.c.sqlite3_column_type(stmt, 0) == db.c.SQLITE_NULL) return null;
     const mid = db.c.sqlite3_column_double(stmt, 0);
     return mid;
+}
+
+/// Query the last mid price for a specific asset_id (token) from the orderbooks table.
+fn queryLastMidByAsset(database: *db.DB, asset_id: []const u8) ?f64 {
+    const sql = "SELECT mid_price FROM orderbooks WHERE asset_id=? ORDER BY created_at DESC LIMIT 1;" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    if (db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) != db.c.SQLITE_OK) return null;
+    defer _ = db.c.sqlite3_finalize(stmt);
+    if (db.c.sqlite3_bind_text(stmt, 1, asset_id.ptr, @intCast(asset_id.len), null) != db.c.SQLITE_OK) return null;
+    if (db.c.sqlite3_step(stmt) != db.c.SQLITE_ROW) return null;
+    if (db.c.sqlite3_column_type(stmt, 0) == db.c.SQLITE_NULL) return null;
+    return db.c.sqlite3_column_double(stmt, 0);
 }
 
 /// Global database handle for the WS callback (set before spawning WS thread).

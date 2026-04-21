@@ -13,6 +13,12 @@ services:
     volumes:
       - engine-data:/app/data
       - ipc:/ipc
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /ipc/cex-engine.sock"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
 
   control:
     build:
