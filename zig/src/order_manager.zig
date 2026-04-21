@@ -320,6 +320,7 @@ pub const OrderManager = struct {
                 continue;
             }
 
+            log.info("order_mgr", "cancelAll: cancelled order {s} on CLOB", .{order_id});
             cancelled_count += 1;
         }
 
@@ -455,13 +456,11 @@ pub const OrderManager = struct {
         // Fetch per-market fee rate from CLOB API, with fallback to cache or default
         var fee_rate_bps: u256 = 0;
         var used_fallback = false;
-        var fetch_err: ?anyerror = null;
         if (self.fetchFeeRate(token_id)) |rate| {
             fee_rate_bps = rate;
             // Update cache
-            _ = self.lastFeeRateByToken.put(token_id, rate);
+            self.lastFeeRateByToken.put(token_id, rate) catch {};
         } else |err| {
-            _ = try self.lastFeeRateByToken.put(token_id, rate);
             if (self.lastFeeRateByToken.get(token_id)) |cached| {
                 fee_rate_bps = cached;
                 used_fallback = true;
@@ -670,28 +669,28 @@ pub const OrderManager = struct {
         return false;
     }
 
-    /// Check if a market is neg-risk by querying the DB.
+    /// Check if a market is neg-risk by querying the DB (by Gamma market id).
     fn isNegRiskMarket(self: *OrderManager, market_id: []const u8) bool {
-        const sql = "SELECT neg_risk FROM markets WHERE condition_id=? OR id=? LIMIT 1;" ++ &[_:0]u8{};
+        const sql = "SELECT neg_risk FROM markets WHERE id=? LIMIT 1;" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return false;
         defer _ = c.sqlite3_finalize(stmt);
         if (c.sqlite3_bind_text(stmt, 1, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK) return false;
-        if (c.sqlite3_bind_text(stmt, 2, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK) return false;
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return false;
         return c.sqlite3_column_int(stmt, 0) != 0;
     }
 
-    /// Resolve token_id from condition_id + side by looking up clob_token_ids in DB.
+    /// Resolve token_id from market_id (Gamma id) by looking up clob_token_ids in DB.
     fn resolveTokenId(self: *OrderManager, market_id: []const u8, _: []const u8, buf: *[128]u8) ?[]const u8 {
-        // Query: SELECT clob_token_ids FROM markets WHERE condition_id = ? OR id = ? LIMIT 1
-        const sql = "SELECT clob_token_ids FROM markets WHERE condition_id=? OR id=? LIMIT 1;" ++ &[_:0]u8{};
+        const sql = "SELECT clob_token_ids FROM markets WHERE id=? LIMIT 1;" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return null;
         defer _ = c.sqlite3_finalize(stmt);
         if (c.sqlite3_bind_text(stmt, 1, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK) return null;
-        if (c.sqlite3_bind_text(stmt, 2, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK) return null;
-        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) {
+            log.warn("order_mgr", "resolveTokenId: no market found for id={s}", .{market_id});
+            return null;
+        }
 
         const raw_ptr = c.sqlite3_column_text(stmt, 0);
         const raw = if (raw_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else return null;
@@ -774,10 +773,10 @@ pub const OrderManager = struct {
             return false;
         };
 
-        const url = CLOB_API_BASE ++ "/order/cancel";
+        const url = CLOB_API_BASE ++ "/order";
 
         var payload_buf: [256]u8 = undefined;
-        const payload = std.fmt.bufPrint(&payload_buf, "{{\"order_id\":\"{s}\"}}", .{order_id}) catch {
+        const payload = std.fmt.bufPrint(&payload_buf, "{{\"orderID\":\"{s}\"}}", .{order_id}) catch {
             log.err("order_mgr", "failed to format cancel payload", .{});
             return false;
         };
@@ -808,14 +807,14 @@ pub const OrderManager = struct {
                 creds.secret[0..creds.secret_len],
                 ts,
                 "DELETE",
-                "/order/cancel",
+                "/order",
                 payload,
             ) catch |e| {
                 log.err("order_mgr", "failed to compute cancel HMAC: {s}", .{@errorName(e)});
                 return false;
             };
 
-            var response = client.postJsonWithHeaders(url, payload, &.{
+            var response = client.deleteJsonWithHeaders(url, payload, &.{
                 .{ .name = "POLY_ADDRESS", .value = &addr_hex },
                 .{ .name = "POLY_SIGNATURE", .value = hmac_result.slice() },
                 .{ .name = "POLY_TIMESTAMP", .value = ts },

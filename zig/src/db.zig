@@ -58,6 +58,16 @@ const MIGRATION_005 =
     \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(5);
 ;
 
+/// Embedded migration: remove UNIQUE from markets.symbol (slug collision fix).
+const MIGRATION_006 =
+    \\BEGIN TRANSACTION;
+    \\CREATE TABLE IF NOT EXISTS markets_new(id TEXT PRIMARY KEY,symbol TEXT NOT NULL,base TEXT NOT NULL,quote TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active',created_at INTEGER NOT NULL DEFAULT(unixepoch()),condition_id TEXT DEFAULT '',clob_token_ids TEXT DEFAULT '[]',outcomes TEXT DEFAULT '[]',neg_risk INTEGER DEFAULT 0,min_tick_size TEXT DEFAULT '0.01');
+    \\INSERT OR IGNORE INTO markets_new SELECT id,symbol,base,quote,status,created_at,condition_id,clob_token_ids,outcomes,neg_risk,min_tick_size FROM markets;
+    \\DROP TABLE IF EXISTS markets;
+    \\ALTER TABLE markets_new RENAME TO markets;
+    \\COMMIT;
+;
+
 pub const DB = struct {
     handle: *c.sqlite3,
 
@@ -156,6 +166,36 @@ pub const DB = struct {
             }
             // Only after all alters succeed/are skipped, mark migration 5 as applied
             try self.execZ("INSERT OR IGNORE INTO schema_migrations(version)VALUES(5);");
+        }
+        // Check if migration 006 has been applied.
+        if (!self.migrationApplied(6)) {
+            log.info("db", "applying migration 006", .{});
+            self.execZ(MIGRATION_006 ++ &[_:0]u8{}) catch |err| {
+                const sqlite_err = std.mem.span(c.sqlite3_errmsg(self.handle));
+                log.err("db", "migration 006 table recreation failed: zig_err={s} sqlite_err={s}", .{ @errorName(err), sqlite_err });
+                return err;
+            };
+            // Add gamma_id column and condition_id index to orderbooks (table may not exist yet)
+            const ob_alters = [_][:0]const u8{
+                "CREATE INDEX IF NOT EXISTS idx_orderbooks_market ON orderbooks(market);",
+                "ALTER TABLE orderbooks ADD COLUMN gamma_id TEXT DEFAULT NULL;",
+                "CREATE INDEX IF NOT EXISTS idx_orderbooks_condition_id ON orderbooks(condition_id);",
+            };
+
+            for (ob_alters) |sql| {
+                self.execZ(sql) catch |err| {
+                    const sqlite_err = std.mem.span(c.sqlite3_errmsg(self.handle));
+                    const duplicate_col = std.mem.indexOf(u8, sqlite_err, "duplicate column name") != null;
+                    const no_table = std.mem.indexOf(u8, sqlite_err, "no such table") != null;
+                    if (err == error.DBExecFailed and (duplicate_col or no_table)) {
+                        log.info("db", "migration 006: skipping orderbooks alter (table missing or column exists): {s}", .{sql});
+                    } else {
+                        log.err("db", "migration 006 orderbooks alter failed: zig_err={s} sqlite_err={s}", .{ @errorName(err), sqlite_err });
+                        return err;
+                    }
+                };
+            }
+            try self.execZ("INSERT OR IGNORE INTO schema_migrations(version)VALUES(6);");
         }
         log.info("db", "migrations complete", .{});
     }

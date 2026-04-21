@@ -1334,3 +1334,128 @@ test "strategy_engine: paused state blocks signal generation" {
     const signal3 = se.evaluateNewsRepricing("m1", 0.80, 0.50);
     try testing.expect(signal3 != null);
 }
+
+// ─── Phase 1B: Market registry slug-collision tests ─────────────────────────
+
+test "market_registry: two markets with same slug but different IDs both survive" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    // Ensure orderbooks table exists (needed for migration 006 index)
+    try database.execZ("CREATE TABLE IF NOT EXISTS orderbooks(id INTEGER PRIMARY KEY AUTOINCREMENT,market TEXT NOT NULL,asset_id TEXT NOT NULL,best_bid TEXT,best_ask TEXT,mid_price REAL,bids_json TEXT,asks_json TEXT,last_trade_price TEXT,tick_size TEXT,timestamp TEXT,created_at INTEGER NOT NULL DEFAULT(unixepoch()),gamma_id TEXT DEFAULT NULL);");
+
+    // Insert two markets with the same slug but different IDs
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote,status,condition_id,clob_token_ids) VALUES('market-1','same-slug','Q1','USDC','active','cond-1','[\"tok1\"]');");
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote,status,condition_id,clob_token_ids) VALUES('market-2','same-slug','Q2','USDC','active','cond-2','[\"tok2\"]');");
+
+    // Assert both rows survive
+    const count_sql = "SELECT COUNT(*) FROM markets WHERE symbol='same-slug';" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, count_sql.ptr, -1, &stmt, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(stmt);
+    try testing.expect(db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW);
+    try testing.expectEqual(@as(c_int, 2), db.c.sqlite3_column_int(stmt, 0));
+}
+
+test "market_registry: re-insert existing market ID updates mutable fields without duplicate" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("CREATE TABLE IF NOT EXISTS orderbooks(id INTEGER PRIMARY KEY AUTOINCREMENT,market TEXT NOT NULL,asset_id TEXT NOT NULL,best_bid TEXT,best_ask TEXT,mid_price REAL,bids_json TEXT,asks_json TEXT,last_trade_price TEXT,tick_size TEXT,timestamp TEXT,created_at INTEGER NOT NULL DEFAULT(unixepoch()),gamma_id TEXT DEFAULT NULL);");
+
+    // Insert a market
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote,status,condition_id,clob_token_ids) VALUES('m1','slug1','Q1','USDC','active','cond-1','[\"tok1\"]');");
+
+    // INSERT OR IGNORE should not create a duplicate
+    try database.execZ("INSERT OR IGNORE INTO markets(id,symbol,base,quote,status,condition_id,clob_token_ids) VALUES('m1','slug1','Q1','USDC','inactive','cond-1','[\"tok1\",\"tok2\"]');");
+
+    // UPDATE mutable fields
+    try database.execZ("UPDATE markets SET status='inactive',clob_token_ids='[\"tok1\",\"tok2\"]' WHERE id='m1';");
+
+    // Assert only one row and fields are updated
+    const count_sql = "SELECT COUNT(*) FROM markets WHERE id='m1';" ++ &[_:0]u8{};
+    var count_stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, count_sql.ptr, -1, &count_stmt, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(count_stmt);
+    try testing.expect(db.c.sqlite3_step(count_stmt) == db.c.SQLITE_ROW);
+    try testing.expectEqual(@as(c_int, 1), db.c.sqlite3_column_int(count_stmt, 0));
+
+    // Verify mutable fields updated
+    const val_sql = "SELECT status,clob_token_ids FROM markets WHERE id='m1';" ++ &[_:0]u8{};
+    var val_stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, val_sql.ptr, -1, &val_stmt, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(val_stmt);
+    try testing.expect(db.c.sqlite3_step(val_stmt) == db.c.SQLITE_ROW);
+
+    const status_ptr = db.c.sqlite3_column_text(val_stmt, 0);
+    const status = if (status_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+    try testing.expectEqualStrings("inactive", status);
+
+    const tokens_ptr = db.c.sqlite3_column_text(val_stmt, 1);
+    const tokens = if (tokens_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+    try testing.expectEqualStrings("[\"tok1\",\"tok2\"]", tokens);
+}
+
+// ─── Phase 1C: Identifier standardization tests ─────────────────────────────
+
+test "identifier: markets lookup by id only (no condition_id fallback)" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("CREATE TABLE IF NOT EXISTS orderbooks(id INTEGER PRIMARY KEY AUTOINCREMENT,market TEXT NOT NULL,asset_id TEXT NOT NULL,best_bid TEXT,best_ask TEXT,mid_price REAL,bids_json TEXT,asks_json TEXT,last_trade_price TEXT,tick_size TEXT,timestamp TEXT,created_at INTEGER NOT NULL DEFAULT(unixepoch()),gamma_id TEXT DEFAULT NULL);");
+
+    // Insert a market with known Gamma id and clob_token_ids
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote,status,condition_id,clob_token_ids) VALUES('gamma-123','test-slug','Q','USDC','active','cond-abc','[\"12345678901234567890\"]');");
+
+    // The new resolveTokenId query (WHERE id=?) should find by Gamma id
+    const sql_by_id = "SELECT clob_token_ids FROM markets WHERE id=? LIMIT 1;" ++ &[_:0]u8{};
+    var stmt1: ?*db.c.sqlite3_stmt = null;
+    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, sql_by_id.ptr, -1, &stmt1, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(stmt1);
+    _ = db.c.sqlite3_bind_text(stmt1, 1, "gamma-123", 9, null);
+    try testing.expect(db.c.sqlite3_step(stmt1) == db.c.SQLITE_ROW);
+    const tokens_ptr = db.c.sqlite3_column_text(stmt1, 0);
+    const tokens = if (tokens_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+    try testing.expectEqualStrings("[\"12345678901234567890\"]", tokens);
+
+    // Looking up by condition_id using the same query should NOT find anything
+    var stmt2: ?*db.c.sqlite3_stmt = null;
+    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, sql_by_id.ptr, -1, &stmt2, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(stmt2);
+    _ = db.c.sqlite3_bind_text(stmt2, 1, "cond-abc", 8, null);
+    try testing.expect(db.c.sqlite3_step(stmt2) != db.c.SQLITE_ROW);
+}
+
+test "identifier: orderbooks gamma_id column stores resolved market id" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("CREATE TABLE IF NOT EXISTS orderbooks(id INTEGER PRIMARY KEY AUTOINCREMENT,market TEXT NOT NULL,asset_id TEXT NOT NULL,best_bid TEXT,best_ask TEXT,mid_price REAL,bids_json TEXT,asks_json TEXT,last_trade_price TEXT,tick_size TEXT,timestamp TEXT,created_at INTEGER NOT NULL DEFAULT(unixepoch()),gamma_id TEXT DEFAULT NULL);");
+
+    // Insert with gamma_id
+    try database.execZ("INSERT INTO orderbooks(market,asset_id,best_bid,best_ask,mid_price,gamma_id) VALUES('cond-abc','tok1','0.45','0.55',0.50,'gamma-123');");
+
+    // Verify gamma_id is stored
+    const sql = "SELECT gamma_id FROM orderbooks WHERE market='cond-abc' LIMIT 1;" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(stmt);
+    try testing.expect(db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW);
+    const gid_ptr = db.c.sqlite3_column_text(stmt, 0);
+    const gid = if (gid_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+    try testing.expectEqualStrings("gamma-123", gid);
+
+    // Insert without gamma_id (NULL)
+    try database.execZ("INSERT INTO orderbooks(market,asset_id,best_bid,best_ask,mid_price) VALUES('cond-xyz','tok2','0.30','0.70',0.50);");
+
+    const sql2 = "SELECT gamma_id FROM orderbooks WHERE market='cond-xyz' LIMIT 1;" ++ &[_:0]u8{};
+    var stmt2: ?*db.c.sqlite3_stmt = null;
+    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, sql2.ptr, -1, &stmt2, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(stmt2);
+    try testing.expect(db.c.sqlite3_step(stmt2) == db.c.SQLITE_ROW);
+    try testing.expect(db.c.sqlite3_column_type(stmt2, 0) == db.c.SQLITE_NULL);
+}

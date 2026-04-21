@@ -231,11 +231,13 @@ fn evaluateNewsSignals(ctx: *StrategyWorkerCtx) void {
     const snap_count = ctx.nc.snapshot(&snap);
 
     for (snap[0..snap_count]) |est| {
-        const condition_id = est.condition_id[0..est.condition_id_len];
+        // Use the Gamma market_id (not condition_id) as the canonical identifier
+        const market_id = est.market_id[0..est.market_id_len];
         const yes_token_id = est.yes_token_id[0..est.yes_token_id_len];
 
-        // Skip markets where we don't have the Yes token ID
+        // Skip markets where we don't have the Yes token ID or market ID
         if (yes_token_id.len == 0) continue;
+        if (market_id.len == 0) continue;
 
         // Query orderbook mid price for the Yes token specifically
         // (avoids comparing Yes probability against No-token price)
@@ -243,14 +245,14 @@ fn evaluateNewsSignals(ctx: *StrategyWorkerCtx) void {
 
         const implied_prob = priceToImpliedProb(mid);
 
-        // Use condition_id as market_id for order submission (resolveTokenId matches on it)
-        if (ctx.se.evaluateNewsRepricing(condition_id, est.probability, implied_prob)) |signal| {
+        // Pass Gamma market_id so downstream placeOrder/resolveTokenId receives a Gamma id
+        if (ctx.se.evaluateNewsRepricing(market_id, est.probability, implied_prob)) |signal| {
             dispatchSignal(ctx, signal);
         }
 
         // Check for collapsed edges — cancel orders where edge disappeared
         const delta = @abs(est.probability - implied_prob);
-        const collapsed = ctx.se.findCollapsedEdgeOrders(condition_id, delta);
+        const collapsed = ctx.se.findCollapsedEdgeOrders(market_id, delta);
         for (0..collapsed.count) |ci| {
             const oid = collapsed.order_ids[ci][0..collapsed.order_id_lens[ci]];
             if (ctx.om.cancelOrder(oid)) {
@@ -263,15 +265,15 @@ fn evaluateNewsSignals(ctx: *StrategyWorkerCtx) void {
 }
 
 fn evaluateLpSignals(ctx: *StrategyWorkerCtx) void {
-    // Get the most recent bid/ask per market from the last 30 seconds
-    const sql = "SELECT market, best_bid, best_ask FROM orderbooks WHERE id IN (SELECT MAX(id) FROM orderbooks WHERE created_at >= unixepoch() - 30 GROUP BY market);" ++ &[_:0]u8{};
+    // Get the most recent bid/ask per market from the last 30 seconds, using gamma_id as the market identifier
+    const sql = "SELECT gamma_id, best_bid, best_ask FROM orderbooks WHERE gamma_id IS NOT NULL AND id IN (SELECT MAX(id) FROM orderbooks WHERE created_at >= unixepoch() - 30 AND gamma_id IS NOT NULL GROUP BY gamma_id);" ++ &[_:0]u8{};
     var stmt: ?*db.c.sqlite3_stmt = null;
     if (db.c.sqlite3_prepare_v2(ctx.database.handle, sql.ptr, -1, &stmt, null) != db.c.SQLITE_OK) return;
     defer _ = db.c.sqlite3_finalize(stmt);
 
     while (db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW) {
-        const mid_raw = db.c.sqlite3_column_text(stmt, 0);
-        const mid_span = if (mid_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else continue;
+        const gid_raw = db.c.sqlite3_column_text(stmt, 0);
+        const gid_span = if (gid_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else continue;
         const bid_raw = db.c.sqlite3_column_text(stmt, 1);
         const bid_span = if (bid_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else continue;
         const ask_raw = db.c.sqlite3_column_text(stmt, 2);
@@ -280,7 +282,8 @@ fn evaluateLpSignals(ctx: *StrategyWorkerCtx) void {
         const best_bid = std.fmt.parseFloat(f64, bid_span) catch continue;
         const best_ask = std.fmt.parseFloat(f64, ask_span) catch continue;
 
-        const lp_result = ctx.se.evaluateLiquidityProvision(mid_span, best_bid, best_ask);
+        // Pass gamma_id (Gamma market id) so placeOrder receives a Gamma id
+        const lp_result = ctx.se.evaluateLiquidityProvision(gid_span, best_bid, best_ask);
         for (lp_result.signals[0..lp_result.count]) |signal| {
             dispatchSignal(ctx, signal);
         }
@@ -417,7 +420,34 @@ fn wsPriceCallback(update: ws.PriceUpdate) void {
     const ask_f = std.fmt.parseFloat(f64, update.best_ask) catch return;
     const mid = (bid_f + ask_f) / 2.0;
 
-    const sql = "INSERT INTO orderbooks(market,asset_id,best_bid,best_ask,mid_price) VALUES(?,?,?,?,?);" ++ &[_:0]u8{};
+    // Resolve gamma_id (Gamma market id) from condition_id via markets table
+    var gamma_id_buf: [128]u8 = undefined;
+    var gamma_id_ptr: ?[*]const u8 = null;
+    var gamma_id_len: usize = 0;
+    {
+        const lookup_sql = "SELECT id FROM markets WHERE condition_id=? LIMIT 1;" ++ &[_:0]u8{};
+        var lookup_stmt: ?*db.c.sqlite3_stmt = null;
+        if (db.c.sqlite3_prepare_v2(database.handle, lookup_sql.ptr, -1, &lookup_stmt, null) == db.c.SQLITE_OK) {
+            defer _ = db.c.sqlite3_finalize(lookup_stmt);
+            const bind_rc = db.c.sqlite3_bind_text(lookup_stmt, 1, update.market.ptr, @intCast(update.market.len), null);
+            if (bind_rc != db.c.SQLITE_OK) {
+                log.warn("ws_feed", "failed to bind condition_id for gamma_id lookup: rc={d}", .{bind_rc});
+            } else if (db.c.sqlite3_step(lookup_stmt) == db.c.SQLITE_ROW) {
+                const gid_raw = db.c.sqlite3_column_text(lookup_stmt, 0);
+                if (gid_raw) |p| {
+                    const gid = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+                    const gid_len = @min(gid.len, gamma_id_buf.len);
+                    @memcpy(gamma_id_buf[0..gid_len], gid[0..gid_len]);
+                    gamma_id_ptr = &gamma_id_buf;
+                    gamma_id_len = gid_len;
+                }
+            } else {
+                log.warn("ws_feed", "no gamma_id found for condition_id={s}", .{update.market});
+            }
+        }
+    }
+
+    const sql = "INSERT INTO orderbooks(market,asset_id,best_bid,best_ask,mid_price,gamma_id) VALUES(?,?,?,?,?,?);" ++ &[_:0]u8{};
     var stmt: ?*db.c.sqlite3_stmt = null;
     const rc_prepare = db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null);
     if (rc_prepare != db.c.SQLITE_OK) {
@@ -432,6 +462,11 @@ fn wsPriceCallback(update: ws.PriceUpdate) void {
     _ = db.c.sqlite3_bind_text(stmt, 3, update.best_bid.ptr, @intCast(update.best_bid.len), null);
     _ = db.c.sqlite3_bind_text(stmt, 4, update.best_ask.ptr, @intCast(update.best_ask.len), null);
     _ = db.c.sqlite3_bind_double(stmt, 5, mid);
+    if (gamma_id_ptr) |gp| {
+        _ = db.c.sqlite3_bind_text(stmt, 6, gp, @intCast(gamma_id_len), null);
+    } else {
+        _ = db.c.sqlite3_bind_null(stmt, 6);
+    }
     const rc_step = db.c.sqlite3_step(stmt);
     if (rc_step != db.c.SQLITE_DONE and rc_step != db.c.SQLITE_OK) {
         const err_msg = std.mem.span(db.c.sqlite3_errmsg(database.handle));

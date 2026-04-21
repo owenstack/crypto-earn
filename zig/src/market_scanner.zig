@@ -140,31 +140,56 @@ pub const Scanner = struct {
     }
 
     fn persistMarket(self: *Scanner, m: gamma.GammaMarket) !void {
-        const sql =
-            "INSERT OR REPLACE INTO markets(id,symbol,base,quote,status,condition_id,clob_token_ids,outcomes,neg_risk,min_tick_size)" ++
-            "VALUES(?,?,?,?,?,?,?,?,?,?);" ++ &[_:0]u8{};
-        var stmt: ?*db.c.sqlite3_stmt = null;
-        if (db.c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != db.c.SQLITE_OK)
-            return error.DBExecFailed;
-        defer _ = db.c.sqlite3_finalize(stmt);
-
         const status = if (m.active) "active" else "inactive";
         const quote = "USDC";
         const default_min_tick = "0.01";
-        if (db.c.sqlite3_bind_text(stmt, 1, m.id.ptr, @intCast(m.id.len), null) != db.c.SQLITE_OK or
-            db.c.sqlite3_bind_text(stmt, 2, m.slug.ptr, @intCast(m.slug.len), null) != db.c.SQLITE_OK or
-            db.c.sqlite3_bind_text(stmt, 3, m.question.ptr, @intCast(m.question.len), null) != db.c.SQLITE_OK or
-            db.c.sqlite3_bind_text(stmt, 4, quote.ptr, @intCast(quote.len), null) != db.c.SQLITE_OK or
-            db.c.sqlite3_bind_text(stmt, 5, status.ptr, @intCast(status.len), null) != db.c.SQLITE_OK or
-            db.c.sqlite3_bind_text(stmt, 6, m.condition_id.ptr, @intCast(m.condition_id.len), null) != db.c.SQLITE_OK or
-            db.c.sqlite3_bind_text(stmt, 7, m.clob_token_ids.ptr, @intCast(m.clob_token_ids.len), null) != db.c.SQLITE_OK or
-            db.c.sqlite3_bind_text(stmt, 8, m.outcomes.ptr, @intCast(m.outcomes.len), null) != db.c.SQLITE_OK or
-            db.c.sqlite3_bind_int(stmt, 9, if (m.neg_risk) @as(c_int, 1) else @as(c_int, 0)) != db.c.SQLITE_OK or
-            db.c.sqlite3_bind_text(stmt, 10, default_min_tick.ptr, @intCast(default_min_tick.len), null) != db.c.SQLITE_OK)
-            return error.DBExecFailed;
 
-        if (db.c.sqlite3_step(stmt) != db.c.SQLITE_DONE)
-            return error.DBExecFailed;
+        // INSERT OR IGNORE: only inserts if id doesn't already exist.
+        {
+            const sql =
+                "INSERT OR IGNORE INTO markets(id,symbol,base,quote,status,condition_id,clob_token_ids,outcomes,neg_risk,min_tick_size)" ++
+                "VALUES(?,?,?,?,?,?,?,?,?,?);" ++ &[_:0]u8{};
+            var stmt: ?*db.c.sqlite3_stmt = null;
+            if (db.c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != db.c.SQLITE_OK)
+                return error.DBExecFailed;
+            defer _ = db.c.sqlite3_finalize(stmt);
+
+            if (db.c.sqlite3_bind_text(stmt, 1, m.id.ptr, @intCast(m.id.len), null) != db.c.SQLITE_OK or
+                db.c.sqlite3_bind_text(stmt, 2, m.slug.ptr, @intCast(m.slug.len), null) != db.c.SQLITE_OK or
+                db.c.sqlite3_bind_text(stmt, 3, m.question.ptr, @intCast(m.question.len), null) != db.c.SQLITE_OK or
+                db.c.sqlite3_bind_text(stmt, 4, quote.ptr, @intCast(quote.len), null) != db.c.SQLITE_OK or
+                db.c.sqlite3_bind_text(stmt, 5, status.ptr, @intCast(status.len), null) != db.c.SQLITE_OK or
+                db.c.sqlite3_bind_text(stmt, 6, m.condition_id.ptr, @intCast(m.condition_id.len), null) != db.c.SQLITE_OK or
+                db.c.sqlite3_bind_text(stmt, 7, m.clob_token_ids.ptr, @intCast(m.clob_token_ids.len), null) != db.c.SQLITE_OK or
+                db.c.sqlite3_bind_text(stmt, 8, m.outcomes.ptr, @intCast(m.outcomes.len), null) != db.c.SQLITE_OK or
+                db.c.sqlite3_bind_int(stmt, 9, if (m.neg_risk) @as(c_int, 1) else @as(c_int, 0)) != db.c.SQLITE_OK or
+                db.c.sqlite3_bind_text(stmt, 10, default_min_tick.ptr, @intCast(default_min_tick.len), null) != db.c.SQLITE_OK)
+                return error.DBExecFailed;
+
+            if (db.c.sqlite3_step(stmt) != db.c.SQLITE_DONE)
+                return error.DBExecFailed;
+        }
+
+        // UPDATE mutable fields for existing rows.
+        {
+            const upd =
+                "UPDATE markets SET status=?,clob_token_ids=?,outcomes=?,neg_risk=?,min_tick_size=? WHERE id=?;" ++ &[_:0]u8{};
+            var stmt: ?*db.c.sqlite3_stmt = null;
+            if (db.c.sqlite3_prepare_v2(self.database.handle, upd.ptr, -1, &stmt, null) != db.c.SQLITE_OK)
+                return error.DBExecFailed;
+            defer _ = db.c.sqlite3_finalize(stmt);
+
+            if (db.c.sqlite3_bind_text(stmt, 1, status.ptr, @intCast(status.len), null) != db.c.SQLITE_OK or
+                db.c.sqlite3_bind_text(stmt, 2, m.clob_token_ids.ptr, @intCast(m.clob_token_ids.len), null) != db.c.SQLITE_OK or
+                db.c.sqlite3_bind_text(stmt, 3, m.outcomes.ptr, @intCast(m.outcomes.len), null) != db.c.SQLITE_OK or
+                db.c.sqlite3_bind_int(stmt, 4, if (m.neg_risk) @as(c_int, 1) else @as(c_int, 0)) != db.c.SQLITE_OK or
+                db.c.sqlite3_bind_text(stmt, 5, default_min_tick.ptr, @intCast(default_min_tick.len), null) != db.c.SQLITE_OK or
+                db.c.sqlite3_bind_text(stmt, 6, m.id.ptr, @intCast(m.id.len), null) != db.c.SQLITE_OK)
+                return error.DBExecFailed;
+
+            if (db.c.sqlite3_step(stmt) != db.c.SQLITE_DONE)
+                return error.DBExecFailed;
+        }
     }
 
     fn persistMarkets(self: *Scanner) void {
