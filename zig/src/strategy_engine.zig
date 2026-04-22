@@ -38,6 +38,14 @@ pub const StrategyStats = struct {
 };
 
 const MAX_ACTIVE_ORDERS = 64;
+const MAX_INVENTORY_MARKETS = 64;
+
+pub const MarketInventory = struct {
+    market_id: [68]u8,
+    market_id_len: usize,
+    net_shares: f64,
+    cost_basis: f64,
+};
 
 pub const ActiveOrder = struct {
     order_id: [68]u8,
@@ -60,6 +68,9 @@ pub const StrategyEngine = struct {
     lp_stats: StrategyStats,
     active_orders: [MAX_ACTIVE_ORDERS]?ActiveOrder,
     active_order_count: usize,
+    market_inventory: [MAX_INVENTORY_MARKETS]?MarketInventory,
+    inventory_count: usize,
+    lp_max_position_usd: f64,
 
     pub fn init(config: StrategyConfig) StrategyEngine {
         return .{
@@ -72,6 +83,9 @@ pub const StrategyEngine = struct {
             .lp_stats = .{},
             .active_orders = [_]?ActiveOrder{null} ** MAX_ACTIVE_ORDERS,
             .active_order_count = 0,
+            .market_inventory = [_]?MarketInventory{null} ** MAX_INVENTORY_MARKETS,
+            .inventory_count = 0,
+            .lp_max_position_usd = 50.0,
         };
     }
 
@@ -157,6 +171,27 @@ pub const StrategyEngine = struct {
         if (self.paused.load(.seq_cst)) return .{ .signals = undefined, .count = 0 };
         const spread = best_ask - best_bid;
         if (spread < self.config.lp_min_spread) return .{ .signals = undefined, .count = 0 };
+
+        // Check per-market inventory limit
+        const mid_price = (best_bid + best_ask) / 2.0;
+        {
+            self.state_mu.lock();
+            defer self.state_mu.unlock();
+            for (self.market_inventory[0..self.inventory_count]) |slot| {
+                if (slot) |inv| {
+                    if (std.mem.eql(u8, inv.market_id[0..inv.market_id_len], market_id)) {
+                        const exposure = @abs(inv.net_shares) * mid_price;
+                        if (exposure >= self.lp_max_position_usd) {
+                            log.info("strategy", "LP signal blocked: inventory limit reached for {s} (exposure={d:.2} >= limit={d:.2})", .{
+                                market_id, exposure, self.lp_max_position_usd,
+                            });
+                            return .{ .signals = undefined, .count = 0 };
+                        }
+                        break;
+                    }
+                }
+            }
+        }
 
         const bid_price = best_bid + spread * 0.25;
         const ask_price = best_ask - spread * 0.25;
@@ -403,4 +438,125 @@ pub const StrategyEngine = struct {
             .liquidity_provision => self.lp_stats.cancels += 1,
         }
     }
+
+    /// Update per-market inventory on fill.
+    /// direction: .buy increments net_shares, .sell decrements.
+    pub fn updateInventory(self: *StrategyEngine, market_id: []const u8, direction: SignalDirection, fill_size: f64) void {
+        self.state_mu.lock();
+        defer self.state_mu.unlock();
+
+        const delta: f64 = if (direction == .buy) fill_size else -fill_size;
+
+        // Find existing entry
+        for (self.market_inventory[0..self.inventory_count]) |*slot| {
+            if (slot.*) |*inv| {
+                if (std.mem.eql(u8, inv.market_id[0..inv.market_id_len], market_id)) {
+                    inv.net_shares += delta;
+                    log.info("strategy", "inventory updated: {s} net_shares={d:.4}", .{ market_id, inv.net_shares });
+                    return;
+                }
+            }
+            // Not found, create new entry
+            if (self.inventory_count < MAX_INVENTORY_MARKETS) {
+                var mid: [68]u8 = undefined;
+                const mid_len = @min(market_id.len, 68);
+                @memcpy(mid[0..mid_len], market_id[0..mid_len]);
+
+                self.market_inventory[self.inventory_count] = MarketInventory{
+                    .market_id = mid,
+                    .market_id_len = mid_len,
+                    .net_shares = delta,
+                    .cost_basis = 0.0,
+                };
+                self.inventory_count += 1;
+                log.info("strategy", "inventory created: {s} net_shares={d:.4}", .{ market_id, delta });
+            } else {
+                log.warn("strategy", "cannot create inventory entry: capacity full ({d})", .{MAX_INVENTORY_MARKETS});
+            }
+        } else {
+            log.warn("strategy", "cannot create inventory entry: capacity full ({d})", .{MAX_INVENTORY_MARKETS});
+        }
+    }
+
+    /// Get a snapshot of inventory for IPC.
+    pub fn getInventorySnapshot(self: *StrategyEngine, buf: []u8) ![]const u8 {
+        self.state_mu.lock();
+        defer self.state_mu.unlock();
+
+        var fbs = std.io.fixedBufferStream(buf);
+        const writer = fbs.writer();
+        try writer.writeAll("{\"markets\":[");
+
+        var first = true;
+        for (self.market_inventory[0..self.inventory_count]) |slot| {
+            if (slot) |inv| {
+                if (!first) try writer.writeAll(",");
+                first = false;
+                var esc_buf: [140]u8 = undefined;
+                const esc = escapeJsonString(inv.market_id[0..inv.market_id_len], &esc_buf) catch inv.market_id[0..inv.market_id_len];
+                try writer.print("{{\"market_id\":\"{s}\",\"net_shares\":{d:.4},\"cost_basis\":{d:.4}}}", .{
+                    esc,
+                    inv.net_shares,
+                    inv.cost_basis,
+                });
+            }
+        }
+        try writer.writeAll("],\"lp_max_position_usd\":");
+        try writer.print("{d:.2}", .{self.lp_max_position_usd});
+        try writer.writeAll("}");
+        return fbs.getWritten();
+    }
+
+    /// Find the index of a tracked order by order_id (for linkPair after placement).
+    pub fn findOrderIndex(self: *StrategyEngine, order_id: []const u8) ?usize {
+        self.state_mu.lock();
+        defer self.state_mu.unlock();
+
+        for (self.active_orders, 0..) |slot, idx| {
+            if (slot) |order| {
+                if (std.mem.eql(u8, order.order_id[0..order.order_id_len], order_id)) {
+                    return idx;
+                }
+            }
+        }
+        return null;
+    }
 };
+
+fn escapeJsonString(src: []const u8, buf: []u8) ![]const u8 {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < src.len) : (i += 1) {
+        const c = src[i];
+        switch (c) {
+            '"' => {
+                buf[j] = '\\';
+                j += 1;
+                buf[j] = '"';
+                j += 1;
+            },
+            '\\' => {
+                buf[j] = '\\';
+                j += 1;
+                buf[j] = '\\';
+                j += 1;
+            },
+            0...0x1F => {
+                // Control chars as \\u00XX
+                if (j + 6 > buf.len) return error.BufferTooSmall;
+                buf[j .. j + 2].* = "\\u".*;
+                buf[j + 2] = '0';
+                buf[j + 3] = '0';
+                buf[j + 4] = "0123456789abcdef"[(c >> 4) & 0xF];
+                buf[j + 5] = "0123456789abcdef"[c & 0xF];
+                j += 6;
+            },
+            else => {
+                buf[j] = c;
+                j += 1;
+            },
+        }
+        if (j >= buf.len) return error.BufferTooSmall;
+    }
+    return buf[0..j];
+}

@@ -73,6 +73,11 @@ const MIGRATION_007 =
     \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(7);
 ;
 
+/// Embedded migration: LP inventory management and paired-leg cancel-on-fill.
+const MIGRATION_008 =
+    \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(8);
+;
+
 pub const DB = struct {
     handle: *c.sqlite3,
 
@@ -224,6 +229,32 @@ pub const DB = struct {
                 };
             }
             try self.execZ("INSERT OR IGNORE INTO schema_migrations(version)VALUES(7);");
+        }
+        // Check if migration 008 has been applied.
+        if (!self.migrationApplied(8)) {
+            log.info("db", "applying migration 008", .{});
+            const m008_alters = [_][:0]const u8{
+                "ALTER TABLE positions ADD COLUMN net_position_usd REAL DEFAULT 0.0;",
+                "ALTER TABLE orders ADD COLUMN lp_pair_order_id TEXT DEFAULT NULL;",
+            };
+            for (m008_alters) |sql| {
+                self.execZ(sql) catch |err| {
+                    const sqlite_err = std.mem.span(c.sqlite3_errmsg(self.handle));
+                    const duplicate_col = std.mem.indexOf(u8, sqlite_err, "duplicate column name") != null;
+                    if (err == error.DBExecFailed and duplicate_col) {
+                        log.info("db", "migration 008: column already exists; skipping ALTER TABLE: {s}", .{sql});
+                        continue;
+                    } else {
+                        log.err("db", "migration 008 ALTER TABLE failed: zig_err={s} sqlite_err={s} sql={s}", .{ @errorName(err), sqlite_err, sql });
+                        return err;
+                    }
+                };
+            }
+            // Seed default max_net_position_usd into runtime_config
+            self.execZ("INSERT OR IGNORE INTO runtime_config(key,value) VALUES('lp_max_position_usd','50.0');" ++ &[_:0]u8{}) catch |err| {
+                log.info("db", "migration 008: runtime_config seed skipped or failed: {s}", .{@errorName(err)});
+            };
+            try self.execZ("INSERT OR IGNORE INTO schema_migrations(version)VALUES(8);");
         }
         log.info("db", "migrations complete", .{});
     }

@@ -72,6 +72,10 @@ pub const T = struct {
     pub const reconcile_status = "reconcile.status";
     pub const reconcile_status_response = "reconcile.status.response";
 
+    // Phase 3: Inventory snapshot
+    pub const inventory_snapshot = "inventory.snapshot";
+    pub const inventory_snapshot_response = "inventory.snapshot.response";
+
     // Phase 5: Config/Pause/P&L messages
     pub const config_set = "config.set";
     pub const config_set_response = "config.set.response";

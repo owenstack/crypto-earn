@@ -8,9 +8,10 @@ const poly_auth = @import("polymarket_auth.zig");
 const risk = @import("risk_gate.zig");
 const portfolio = @import("portfolio_tracker.zig");
 const strategy = @import("strategy_engine.zig");
-const news = @import("news_sources.zig");
 const ws = @import("websocket.zig");
 const fill_poller = @import("fill_poller.zig");
+const kalshi_ws = @import("kalshi_ws.zig");
+const prob_provider = @import("probability_provider.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -118,13 +119,9 @@ pub fn main() !void {
     g_database = &database;
     log.info("engine", "websocket client ready", .{});
 
-    // Initialize news client (before scanner so it can feed probability estimates)
-    var nc = news.NewsClient.init(allocator, .{});
-
-    // Spawn market scanner thread
+    // Spawn market scanner thread (no longer feeds news client — Phase 3 removed that dependency)
     var scan = scanner.Scanner.init(allocator, &database, .{});
     scan.setWebSocketClient(&ws_client);
-    scan.setNewsClient(&nc);
     const scanner_thread = try std.Thread.spawn(.{}, scanner.Scanner.run, .{&scan});
     defer {
         scan.stop();
@@ -186,8 +183,39 @@ pub fn main() !void {
     log.info("engine", "fill poller WebSocket thread started", .{});
     log.info("engine", "fill poller REST polling thread started", .{});
 
+    // Initialize Kalshi WebSocket client (primary probability source)
+    var kws = kalshi_ws.KalshiWsClient.init(allocator, &database);
+    const kalshi_thread = try std.Thread.spawn(.{}, kalshi_ws.KalshiWsClient.run, .{&kws});
+    defer {
+        kws.stop();
+        kalshi_thread.join();
+    }
+    log.info("engine", "Kalshi WebSocket client started", .{});
+
+    // Initialize probability provider (Kalshi WS primary, HTTP polling fallback)
+    var pp = prob_provider.ProbabilityProvider.init(allocator, &database, &kws);
+    const pp_thread = try std.Thread.spawn(.{}, prob_provider.ProbabilityProvider.run, .{&pp});
+    defer {
+        pp.stop();
+        pp_thread.join();
+    }
+    log.info("engine", "probability provider started", .{});
+
     // Initialize strategy engine
     var se = strategy.StrategyEngine.init(.{});
+
+    // Load lp_max_position_usd from runtime_config
+    {
+        var lp_buf: [32]u8 = undefined;
+        if (database.getConfig("lp_max_position_usd", &lp_buf)) |val| {
+            if (std.fmt.parseFloat(f64, val)) |v| {
+                se.lp_max_position_usd = v;
+                log.info("engine", "lp_max_position_usd={d:.2}", .{v});
+            } else |_| {
+                log.warn("engine", "invalid lp_max_position_usd in runtime_config: {s}", .{val});
+            }
+        }
+    }
     log.info("engine", "strategy engine ready", .{});
 
     // Auto-enable strategies from environment
@@ -206,7 +234,7 @@ pub fn main() !void {
     var strategy_ctx = StrategyWorkerCtx{
         .se = &se,
         .om = &om,
-        .nc = &nc,
+        .pp = &pp,
         .database = &database,
         .should_stop = std.atomic.Value(bool).init(false),
     };
@@ -224,7 +252,7 @@ pub fn main() !void {
 const StrategyWorkerCtx = struct {
     se: *strategy.StrategyEngine,
     om: *order_mgr.OrderManager,
-    nc: *news.NewsClient,
+    pp: *prob_provider.ProbabilityProvider,
     database: *db.DB,
     should_stop: std.atomic.Value(bool),
 };
@@ -263,25 +291,19 @@ fn strategyWorker(ctx: *StrategyWorkerCtx) void {
 }
 
 fn evaluateNewsSignals(ctx: *StrategyWorkerCtx) void {
-    var snap: [news.NewsClient.MAX_CACHED]news.ProbabilityEstimate = undefined;
-    const snap_count = ctx.nc.snapshot(&snap);
+    var snap: [prob_provider.MAX_ESTIMATES]prob_provider.ExternalEstimate = undefined;
+    const snap_count = ctx.pp.snapshot(&snap);
 
     for (snap[0..snap_count]) |est| {
-        // Use the Gamma market_id (not condition_id) as the canonical identifier
         const market_id = est.market_id[0..est.market_id_len];
         const yes_token_id = est.yes_token_id[0..est.yes_token_id_len];
 
-        // Skip markets where we don't have the Yes token ID or market ID
         if (yes_token_id.len == 0) continue;
         if (market_id.len == 0) continue;
 
-        // Query orderbook mid price for the Yes token specifically
-        // (avoids comparing Yes probability against No-token price)
         const mid = queryLastMidByAsset(ctx.database, yes_token_id) orelse continue;
-
         const implied_prob = priceToImpliedProb(mid);
 
-        // Pass Gamma market_id so downstream placeOrder/resolveTokenId receives a Gamma id
         if (ctx.se.evaluateNewsRepricing(market_id, est.probability, implied_prob)) |signal| {
             dispatchSignal(ctx, signal);
         }

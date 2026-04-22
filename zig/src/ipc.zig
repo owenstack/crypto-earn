@@ -167,6 +167,7 @@ const DispatchKind = enum {
     pause,
     pnl_query,
     reconcile_status,
+    inventory_snapshot,
 };
 
 const DispatchEntry = struct {
@@ -195,6 +196,7 @@ const DISPATCH_TABLE = [_]DispatchEntry{
     .{ .msg_type = types.T.pause, .kind = .pause },
     .{ .msg_type = types.T.pnl_query, .kind = .pnl_query },
     .{ .msg_type = types.T.reconcile_status, .kind = .reconcile_status },
+    .{ .msg_type = types.T.inventory_snapshot, .kind = .inventory_snapshot },
 };
 
 fn resolveDispatchKind(msg_type: []const u8) ?DispatchKind {
@@ -280,6 +282,7 @@ fn dispatch(ctx: *Context, line: []const u8, writer: anytype, stream: std.net.St
         .pause => try handlePause(ctx, req_id, writer),
         .pnl_query => try handlePnlQuery(ctx, req_id, root, writer),
         .reconcile_status => try handleReconcileStatus(req_id, writer),
+        .inventory_snapshot => try handleInventorySnapshot(ctx, req_id, writer),
     }
 }
 
@@ -576,4 +579,17 @@ fn handleReconcileStatus(req_id: []const u8, writer: anytype) !void {
     // the reconciliation has completed (the engine wouldn't be accepting
     // IPC connections if it hadn't).
     try types.writeResponse(writer, req_id, types.T.reconcile_status_response, "{\"status\":\"complete\"}");
+}
+
+fn handleInventorySnapshot(ctx: *Context, req_id: []const u8, writer: anytype) !void {
+    if (ctx.strategy_engine) |se| {
+        var snap_buf: [4096]u8 = undefined;
+        const snap = se.getInventorySnapshot(&snap_buf) catch {
+            try types.writeError(writer, req_id, "inventory snapshot failed");
+            return;
+        };
+        try types.writeResponse(writer, req_id, types.T.inventory_snapshot_response, snap);
+        return;
+    }
+    try types.writeError(writer, req_id, "strategy engine not available");
 }
