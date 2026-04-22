@@ -100,7 +100,9 @@ function formatEvent(env: Envelope): string | null {
     case "event.order.placed":
       return `📝 <b>Order Placed</b>\n• ID: <code>${fmt(p.order_id)}</code>\n• Market: <code>${fmt(p.market_id)}</code>\n• Side: ${fmt(p.side)}\n• Size: ${fmt(p.size)} @ ${fmt(p.price)}`;
     case "event.order.filled":
-      return `✅ <b>Order Filled</b>\n• ID: <code>${fmt(p.order_id)}</code>\n• Market: <code>${fmt(p.market_id)}</code>\n• Side: ${fmt(p.side)}\n• Size: ${fmt(p.size)} @ ${fmt(p.price)}`;
+      return `✅ <b>Order Filled</b>\n• ID: <code>${fmt(p.order_id)}</code>\n• Market: <code>${fmt(p.market_id)}</code>\n• Side: ${fmt(p.side)}\n• Filled: ${fmt(p.fill_size)} @ ${fmt(p.fill_price)}\n• Realized P&L: ${fmt(p.realized_pnl, "N/A")}`;
+    case "event.order.partially_filled":
+      return `⏳ <b>Order Partially Filled</b>\n• ID: <code>${fmt(p.order_id)}</code>\n• Market: <code>${fmt(p.market_id)}</code>\n• Side: ${fmt(p.side)}\n• Filled: ${fmt(p.fill_size)} @ ${fmt(p.fill_price)}\n• Remaining: ${fmt(p.remaining_size)}`;
     case "event.order.cancelled":
       return `🗑️ <b>Order Cancelled</b>\n• ID: <code>${fmt(p.order_id)}</code>${p.market_id ? `\n• Market: <code>${fmt(p.market_id)}</code>` : ""}`;
     case "event.order.rejected":

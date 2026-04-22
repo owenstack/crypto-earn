@@ -27,6 +27,9 @@ const ipc = @import("ipc.zig");
 // Polymarket auth module
 const polymarket_auth = @import("polymarket_auth.zig");
 
+// Phase 2 PRD modules (fill detection)
+const fill_poller = @import("fill_poller.zig");
+
 // ─── Logger tests ───────────────────────────────────────────────────────────
 
 test "logger: init sets start time and uptimeMs returns non-negative" {
@@ -1458,4 +1461,121 @@ test "identifier: orderbooks gamma_id column stores resolved market id" {
     defer _ = db.c.sqlite3_finalize(stmt2);
     try testing.expect(db.c.sqlite3_step(stmt2) == db.c.SQLITE_ROW);
     try testing.expect(db.c.sqlite3_column_type(stmt2, 0) == db.c.SQLITE_NULL);
+}
+
+// ─── Phase 2 PRD: Fill detection and reconciliation tests ───────────────────
+
+test "db: migration 007 adds fill tracking columns to orders" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    // Verify new columns exist by inserting and querying
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
+    try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50", null);
+
+    // Check filled_size default
+    const sql = "SELECT filled_size, average_fill_price, last_checked_at FROM orders WHERE id='o1';" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(stmt);
+    try testing.expect(db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW);
+
+    const fs_ptr = db.c.sqlite3_column_text(stmt, 0);
+    const fs = if (fs_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+    try testing.expectEqualStrings("0", fs);
+
+    // average_fill_price should be NULL
+    try testing.expect(db.c.sqlite3_column_type(stmt, 1) == db.c.SQLITE_NULL);
+
+    // last_checked_at should be 0
+    try testing.expectEqual(@as(c_int, 0), db.c.sqlite3_column_int(stmt, 2));
+}
+
+test "db: updateOrderFillStatus updates fill columns" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
+    try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50", null);
+
+    try database.updateOrderFillStatus("o1", "partially_filled", "5.0", "0.50");
+
+    const sql = "SELECT status, filled_size, average_fill_price FROM orders WHERE id='o1';" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(stmt);
+    try testing.expect(db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW);
+
+    const status_ptr = db.c.sqlite3_column_text(stmt, 0);
+    const status = if (status_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+    try testing.expectEqualStrings("partially_filled", status);
+
+    const fs_ptr = db.c.sqlite3_column_text(stmt, 1);
+    const fs = if (fs_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+    try testing.expectEqualStrings("5.0", fs);
+
+    const fp_ptr = db.c.sqlite3_column_text(stmt, 2);
+    const fp = if (fp_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+    try testing.expectEqualStrings("0.50", fp);
+}
+
+test "order_manager: reconciliation gate blocks orders until set" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    var om = order_manager.OrderManager.init(testing.allocator, &database, .{}, .{});
+
+    // Should be blocked initially
+    try testing.expect(!om.reconciliation_complete.load(.seq_cst));
+
+    const result = om.placeOrder("m1", "buy", "10", "0.50", "limit", null);
+    switch (result) {
+        .rejected => |r| try testing.expectEqualStrings("reconciliation_pending", r.reason),
+        else => try testing.expect(false),
+    }
+
+    // After setting reconciliation complete, orders should pass the gate
+    om.reconciliation_complete.store(true, .seq_cst);
+    try testing.expect(om.reconciliation_complete.load(.seq_cst));
+
+    // Place order again: should no longer be blocked by reconciliation gate.
+    const result2 = om.placeOrder("m1", "buy", "10", "0.50", "limit", null);
+    switch (result2) {
+        .success => |s| {
+            // order_id should be non-empty
+            try testing.expect(s.order_id.len > 0);
+            om.allocator.free(s.order_id);
+        },
+        .failed => |f| try testing.expectEqualStrings("clob_submission_failed", f.reason),
+        .rejected => |r| try testing.expect(!std.mem.eql(u8, r.reason, "reconciliation_pending")),
+    }
+}
+
+test "ipc_types: Phase 2 PRD fill event type constants exist" {
+    try testing.expectEqualStrings("event.order.partially_filled", ipc_types.T.event_order_partially_filled);
+    try testing.expectEqualStrings("reconcile.status", ipc_types.T.reconcile_status);
+    try testing.expectEqualStrings("reconcile.status.response", ipc_types.T.reconcile_status_response);
+}
+
+test "db: updateOrderLastChecked updates timestamp" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
+    try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50", null);
+
+    try database.updateOrderLastChecked("o1");
+
+    const sql = "SELECT last_checked_at FROM orders WHERE id='o1';" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(stmt);
+    try testing.expect(db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW);
+
+    const checked_at = db.c.sqlite3_column_int64(stmt, 0);
+    try testing.expect(checked_at > 0);
 }

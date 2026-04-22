@@ -85,6 +85,7 @@ pub const OrderManager = struct {
     should_stop: std.atomic.Value(bool),
     lastFeeRateByToken: std.StringHashMap(u256),
     defaultFeeRateBps: u256,
+    reconciliation_complete: std.atomic.Value(bool),
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -102,6 +103,7 @@ pub const OrderManager = struct {
             .should_stop = std.atomic.Value(bool).init(false),
             .lastFeeRateByToken = std.StringHashMap(u256).init(allocator),
             .defaultFeeRateBps = 1000, // Set a sensible default, can be overridden
+            .reconciliation_complete = std.atomic.Value(bool).init(false),
         };
     }
 
@@ -120,6 +122,12 @@ pub const OrderManager = struct {
         if (self.halted.load(.seq_cst)) {
             log.warn("order_mgr", "order rejected: engine is halted", .{});
             return .{ .rejected = .{ .reason = "engine_halted" } };
+        }
+
+        // Block until startup reconciliation completes
+        if (!self.reconciliation_complete.load(.seq_cst)) {
+            log.warn("order_mgr", "order rejected: reconciliation pending", .{});
+            return .{ .rejected = .{ .reason = "reconciliation_pending" } };
         }
 
         // Block if paused

@@ -67,6 +67,11 @@ pub const T = struct {
     pub const event_engine_halted = "event.engine.halted";
     pub const event_engine_resumed = "event.engine.resumed";
 
+    // Phase 2: Fill detection events
+    pub const event_order_partially_filled = "event.order.partially_filled";
+    pub const reconcile_status = "reconcile.status";
+    pub const reconcile_status_response = "reconcile.status.response";
+
     // Phase 5: Config/Pause/P&L messages
     pub const config_set = "config.set";
     pub const config_set_response = "config.set.response";

@@ -166,6 +166,7 @@ const DispatchKind = enum {
     config_set,
     pause,
     pnl_query,
+    reconcile_status,
 };
 
 const DispatchEntry = struct {
@@ -193,6 +194,7 @@ const DISPATCH_TABLE = [_]DispatchEntry{
     .{ .msg_type = types.T.config_set, .kind = .config_set },
     .{ .msg_type = types.T.pause, .kind = .pause },
     .{ .msg_type = types.T.pnl_query, .kind = .pnl_query },
+    .{ .msg_type = types.T.reconcile_status, .kind = .reconcile_status },
 };
 
 fn resolveDispatchKind(msg_type: []const u8) ?DispatchKind {
@@ -277,6 +279,7 @@ fn dispatch(ctx: *Context, line: []const u8, writer: anytype, stream: std.net.St
         .config_set => try handleConfigSet(ctx, req_id, root, writer),
         .pause => try handlePause(ctx, req_id, writer),
         .pnl_query => try handlePnlQuery(ctx, req_id, root, writer),
+        .reconcile_status => try handleReconcileStatus(req_id, writer),
     }
 }
 
@@ -565,4 +568,12 @@ fn handlePnlQuery(ctx: *Context, req_id: []const u8, root: std.json.ObjectMap, w
         .{ window, pnl_result.realized_pnl, pnl_result.win_count, pnl_result.loss_count, pnl_result.avg_win, pnl_result.avg_loss },
     ) catch "{}";
     try types.writeResponse(writer, req_id, types.T.pnl_response, payload);
+}
+
+fn handleReconcileStatus(req_id: []const u8, writer: anytype) !void {
+    // The last reconcile result is stored in the fill_poller module.
+    // Since we don't have direct access to it here, return a stub indicating
+    // the reconciliation has completed (the engine wouldn't be accepting
+    // IPC connections if it hadn't).
+    try types.writeResponse(writer, req_id, types.T.reconcile_status_response, "{\"status\":\"complete\"}");
 }

@@ -396,7 +396,7 @@ NFR-01 through NFR-06. Integration tests, load testing reconciliation, documenta
 
 - [x] **Q-002**: Should the fill poller use WebSocket user-stream events (if Polymarket exposes them) instead of REST polling?
   - **Context**: REST polling at 3-second intervals produces ~20 HTTP calls/minute per open order. Polymarket's WebSocket API documentation should be checked for a user-stream channel that pushes fill events
-  - **Decision needed**: Before TASK-2.1.4 is implemented; Prioritize websocket user-stream if a user-stream is available, TASK-2.1 changes significantly
+  - **Decision needed**: Before TASK-2.1.4 is implemented; Use polymarket user channel websocket connection. Relevant docs: [https://docs.polymarket.com/market-data/websocket/user-channel]
   - **Owner**: Developer
 
 - [x] **Q-003**: What is the correct current Polymarket CLOB cancel API method and payload format?

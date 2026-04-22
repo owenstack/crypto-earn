@@ -23,7 +23,8 @@ export type RequestMessageType =
   | "event.unsubscribe"
   | "config.set"
   | "pause"
-  | "pnl.query";
+  | "pnl.query"
+  | "reconcile.status";
 
 export type ResponseMessageType =
   | "heartbeat.response"
@@ -53,7 +54,8 @@ export type ResponseMessageType =
   | "event.unsubscribe.response"
   | "config.set.response"
   | "pause.response"
-  | "pnl.response";
+  | "pnl.response"
+  | "reconcile.status.response";
 
 export type EventMessageType =
   | "event.order.placed"
@@ -318,6 +320,32 @@ export interface RiskRejectionEventPayload {
 export interface EngineStateEventPayload {
   status: "halted" | "resumed";
   cancelled_orders?: number;
+}
+
+// Phase 2: Fill detection payloads
+export interface OrderFilledEventPayload {
+  order_id: string;
+  market_id: string;
+  side: string;
+  fill_size: string;
+  fill_price: string;
+  realized_pnl: string;
+}
+
+export interface OrderPartiallyFilledEventPayload {
+  order_id: string;
+  market_id: string;
+  side: string;
+  fill_size: string;
+  fill_price: string;
+  remaining_size: string;
+}
+
+export interface ReconcileStatusPayload {
+  adopted: number;
+  closed: number;
+  unchanged: number;
+  status: "complete" | "failed";
 }
 
 // Phase 5: Config/Pause/P&L payloads

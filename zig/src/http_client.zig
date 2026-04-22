@@ -41,6 +41,59 @@ pub const HttpClient = struct {
         return self.doRequest(.GET, url, null);
     }
 
+    /// GET request with additional headers (for authenticated CLOB requests).
+    pub fn getWithHeaders(self: *HttpClient, url: []const u8, headers: []const std.http.Header) HttpError!Response {
+        const uri = std.Uri.parse(url) catch {
+            log.err("http", "invalid url: {s}", .{url});
+            return error.InvalidUrl;
+        };
+
+        var merged_headers: std.ArrayList(std.http.Header) = .empty;
+        defer merged_headers.deinit(self.allocator);
+
+        for (headers) |h| {
+            merged_headers.append(self.allocator, h) catch {
+                return error.RequestFailed;
+            };
+        }
+
+        var body_writer = std.Io.Writer.Allocating.init(self.allocator);
+        errdefer body_writer.deinit();
+
+        const result = self.client.fetch(.{
+            .location = .{ .uri = uri },
+            .method = .GET,
+            .response_writer = &body_writer.writer,
+            .headers = .{
+                .accept_encoding = .{ .override = "identity" },
+            },
+            .extra_headers = merged_headers.items,
+        }) catch {
+            log.err("http", "GET {s} failed", .{url});
+            return error.RequestFailed;
+        };
+
+        const status_class = result.status.class();
+        if (status_class == .server_error) {
+            log.err("http", "GET {s} -> {d}", .{ url, @intFromEnum(result.status) });
+            return error.ServerError;
+        }
+        if (status_class == .client_error) {
+            log.warn("http", "GET {s} -> {d}", .{ url, @intFromEnum(result.status) });
+            return error.ClientError;
+        }
+
+        const body = body_writer.toOwnedSlice() catch {
+            return error.RequestFailed;
+        };
+
+        return .{
+            .status = result.status,
+            .body = body,
+            .allocator = self.allocator,
+        };
+    }
+
     /// POST request with JSON body.
     pub fn postJson(self: *HttpClient, url: []const u8, json_body: []const u8) HttpError!Response {
         return self.doRequest(.POST, url, json_body);

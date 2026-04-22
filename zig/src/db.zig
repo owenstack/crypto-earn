@@ -68,6 +68,11 @@ const MIGRATION_006 =
     \\COMMIT;
 ;
 
+/// Embedded migration: fill tracking columns on orders table.
+const MIGRATION_007 =
+    \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(7);
+;
+
 pub const DB = struct {
     handle: *c.sqlite3,
 
@@ -196,6 +201,29 @@ pub const DB = struct {
                 };
             }
             try self.execZ("INSERT OR IGNORE INTO schema_migrations(version)VALUES(6);");
+        }
+        // Check if migration 007 has been applied.
+        if (!self.migrationApplied(7)) {
+            log.info("db", "applying migration 007", .{});
+            const fill_alters = [_][:0]const u8{
+                "ALTER TABLE orders ADD COLUMN filled_size TEXT DEFAULT '0';",
+                "ALTER TABLE orders ADD COLUMN average_fill_price TEXT DEFAULT NULL;",
+                "ALTER TABLE orders ADD COLUMN last_checked_at INTEGER DEFAULT 0;",
+            };
+            for (fill_alters) |sql| {
+                self.execZ(sql) catch |err| {
+                    const sqlite_err = std.mem.span(c.sqlite3_errmsg(self.handle));
+                    const duplicate_col = std.mem.indexOf(u8, sqlite_err, "duplicate column name") != null;
+                    if (err == error.DBExecFailed and duplicate_col) {
+                        log.info("db", "migration 007: column already exists; skipping ALTER TABLE: {s}", .{sql});
+                        continue;
+                    } else {
+                        log.err("db", "migration 007 ALTER TABLE failed: zig_err={s} sqlite_err={s} sql={s}", .{ @errorName(err), sqlite_err, sql });
+                        return err;
+                    }
+                };
+            }
+            try self.execZ("INSERT OR IGNORE INTO schema_migrations(version)VALUES(7);");
         }
         log.info("db", "migrations complete", .{});
     }
@@ -716,6 +744,50 @@ pub const DB = struct {
             .avg_win = c.sqlite3_column_double(stmt, 3),
             .avg_loss = c.sqlite3_column_double(stmt, 4),
         };
+    }
+
+    pub fn updateOrderFillStatus(self: DB, order_id: []const u8, status: []const u8, filled_size: []const u8, avg_fill_price: ?[]const u8) !void {
+        const sql = "UPDATE orders SET status=?, filled_size=?, average_fill_price=?, last_checked_at=unixepoch(), updated_at=unixepoch() WHERE id=?;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare updateOrderFillStatus", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, status.ptr, @intCast(status.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 2, filled_size.ptr, @intCast(filled_size.len), null) != c.SQLITE_OK)
+        {
+            return error.DBExecFailed;
+        }
+        if (avg_fill_price) |afp| {
+            if (c.sqlite3_bind_text(stmt, 3, afp.ptr, @intCast(afp.len), null) != c.SQLITE_OK) return error.DBExecFailed;
+        } else {
+            if (c.sqlite3_bind_null(stmt, 3) != c.SQLITE_OK) return error.DBExecFailed;
+        }
+        if (c.sqlite3_bind_text(stmt, 4, order_id.ptr, @intCast(order_id.len), null) != c.SQLITE_OK) return error.DBExecFailed;
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
+            log.err("db", "failed to execute updateOrderFillStatus", .{});
+            return error.DBExecFailed;
+        }
+    }
+
+    pub fn updateOrderLastChecked(self: DB, order_id: []const u8) !void {
+        const sql = "UPDATE orders SET last_checked_at=unixepoch() WHERE id=?;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare updateOrderLastChecked", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, order_id.ptr, @intCast(order_id.len), null) != c.SQLITE_OK) return error.DBExecFailed;
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
+            log.err("db", "failed to execute updateOrderLastChecked", .{});
+            return error.DBExecFailed;
+        }
     }
 
     /// Return journal_mode as a stack-allocated slice (for health check).

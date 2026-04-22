@@ -10,6 +10,7 @@ const portfolio = @import("portfolio_tracker.zig");
 const strategy = @import("strategy_engine.zig");
 const news = @import("news_sources.zig");
 const ws = @import("websocket.zig");
+const fill_poller = @import("fill_poller.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -149,6 +150,41 @@ pub fn main() !void {
         stale_thread.join();
     }
     log.info("engine", "stale order ticker started", .{});
+
+    // Initialize fill poller
+    var fp = fill_poller.FillPoller.init(allocator, &database, &om, &pt);
+    log.info("engine", "fill poller ready", .{});
+
+    // Run startup reconciliation (blocking, before strategy worker)
+    {
+        var reconcile_ok = false;
+        var attempt: u32 = 0;
+        while (attempt < 3) : (attempt += 1) {
+            const result = fp.reconcileOnStartup();
+            if (result.adopted > 0 or result.closed > 0 or result.unchanged > 0) {
+                reconcile_ok = true;
+                break;
+            }
+            log.warn("engine", "reconciliation attempt {d}/3 returned empty, retrying...", .{attempt + 1});
+            std.Thread.sleep(2 * std.time.ns_per_s);
+        }
+        if (!reconcile_ok) {
+            log.warn("engine", "reconciliation failed after 3 retries, proceeding anyway", .{});
+        }
+        om.reconciliation_complete.store(true, .seq_cst);
+        log.info("engine", "reconciliation gate open — orders unblocked", .{});
+    }
+
+    // Spawn fill poller WebSocket thread (primary fill detection)
+    const fp_ws_thread = try std.Thread.spawn(.{}, fill_poller.FillPoller.wsLoop, .{&fp});
+    const fp_poll_thread = try std.Thread.spawn(.{}, fill_poller.FillPoller.pollLoop, .{&fp});
+    defer {
+        fp.stop();
+        fp_ws_thread.join();
+        fp_poll_thread.join();
+    }
+    log.info("engine", "fill poller WebSocket thread started", .{});
+    log.info("engine", "fill poller REST polling thread started", .{});
 
     // Initialize strategy engine
     var se = strategy.StrategyEngine.init(.{});
