@@ -24,7 +24,8 @@ export type RequestMessageType =
   | "config.set"
   | "pause"
   | "pnl.query"
-  | "reconcile.status";
+  | "reconcile.status"
+  | "config.validate";
 
 export type ResponseMessageType =
   | "heartbeat.response"
@@ -55,7 +56,8 @@ export type ResponseMessageType =
   | "config.set.response"
   | "pause.response"
   | "pnl.response"
-  | "reconcile.status.response";
+  | "reconcile.status.response"
+  | "config.validate.response";
 
 export type EventMessageType =
   | "event.order.placed"
@@ -382,6 +384,13 @@ export interface PnlResponsePayload {
   loss_count: number;
   avg_win: string;
   avg_loss: string;
+}
+
+export interface ConfigValidateResponsePayload {
+  prob_source_url: { valid: boolean; value: string };
+  prob_source_poll_seconds: { valid: boolean; value: string };
+  prob_source_market_id_field: { valid: boolean; value: string };
+  prob_source_probability_field: { valid: boolean; value: string };
 }
 
 /** Build a request envelope with a random correlation ID. */

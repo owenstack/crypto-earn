@@ -166,6 +166,7 @@ const DispatchKind = enum {
     config_set,
     pause,
     pnl_query,
+    config_validate,
     reconcile_status,
     inventory_snapshot,
 };
@@ -196,6 +197,7 @@ const DISPATCH_TABLE = [_]DispatchEntry{
     .{ .msg_type = types.T.pause, .kind = .pause },
     .{ .msg_type = types.T.pnl_query, .kind = .pnl_query },
     .{ .msg_type = types.T.reconcile_status, .kind = .reconcile_status },
+    .{ .msg_type = types.T.config_validate, .kind = .config_validate },
     .{ .msg_type = types.T.inventory_snapshot, .kind = .inventory_snapshot },
 };
 
@@ -282,6 +284,7 @@ fn dispatch(ctx: *Context, line: []const u8, writer: anytype, stream: std.net.St
         .pause => try handlePause(ctx, req_id, writer),
         .pnl_query => try handlePnlQuery(ctx, req_id, root, writer),
         .reconcile_status => try handleReconcileStatus(req_id, writer),
+        .config_validate => try handleConfigValidate(ctx, req_id, writer),
         .inventory_snapshot => try handleInventorySnapshot(ctx, req_id, writer),
     }
 }
@@ -579,6 +582,69 @@ fn handleReconcileStatus(req_id: []const u8, writer: anytype) !void {
     // the reconciliation has completed (the engine wouldn't be accepting
     // IPC connections if it hadn't).
     try types.writeResponse(writer, req_id, types.T.reconcile_status_response, "{\"status\":\"complete\"}");
+}
+
+fn handleConfigValidate(ctx: *Context, req_id: []const u8, writer: anytype) !void {
+    // Validate prob_source_url
+    var url_buf: [512]u8 = undefined;
+    const url = ctx.database.getConfig("prob_source_url", &url_buf);
+    const url_valid = if (url) |u| u.len > 0 and (std.mem.startsWith(u8, u, "http://") or std.mem.startsWith(u8, u, "https://")) else false;
+
+    // Validate prob_source_poll_seconds
+    var poll_buf: [16]u8 = undefined;
+    const poll_str = ctx.database.getConfig("prob_source_poll_seconds", &poll_buf);
+    var poll_valid = false;
+    if (poll_str) |ps| {
+        if (std.fmt.parseInt(u32, ps, 10)) |v| {
+            poll_valid = v >= 10 and v <= 3600;
+        } else |_| {}
+    }
+
+    // Validate prob_source_market_id_field
+    var mid_field_buf: [64]u8 = undefined;
+    const mid_field = ctx.database.getConfig("prob_source_market_id_field", &mid_field_buf);
+    const mid_field_valid = if (mid_field) |f| f.len > 0 else false;
+
+    // Validate prob_source_probability_field
+    var prob_field_buf: [64]u8 = undefined;
+    const prob_field = ctx.database.getConfig("prob_source_probability_field", &prob_field_buf);
+    const prob_field_valid = if (prob_field) |f| f.len > 0 else false;
+
+    const ValidationResult = struct {
+        valid: bool,
+        value: []const u8,
+    };
+    const ConfigValidation = struct {
+        prob_source_url: ValidationResult,
+        prob_source_poll_seconds: ValidationResult,
+        prob_source_market_id_field: ValidationResult,
+        prob_source_probability_field: ValidationResult,
+    };
+
+    const result = std.json.Stringify.valueAlloc(ctx.allocator, ConfigValidation{
+        .prob_source_url = .{
+            .valid = url_valid,
+            .value = if (url) |u| u else "",
+        },
+        .prob_source_poll_seconds = .{
+            .valid = poll_valid,
+            .value = if (poll_str) |ps| ps else "",
+        },
+        .prob_source_market_id_field = .{
+            .valid = mid_field_valid,
+            .value = if (mid_field) |f| f else "",
+        },
+        .prob_source_probability_field = .{
+            .valid = prob_field_valid,
+            .value = if (prob_field) |f| f else "",
+        },
+    }, .{}) catch {
+        try types.writeError(writer, req_id, "config validation serialization failed");
+        return;
+    };
+    defer ctx.allocator.free(result);
+
+    try types.writeResponse(writer, req_id, types.T.config_validate_response, result);
 }
 
 fn handleInventorySnapshot(ctx: *Context, req_id: []const u8, writer: anytype) !void {

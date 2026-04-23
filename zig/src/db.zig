@@ -214,6 +214,7 @@ pub const DB = struct {
                 "ALTER TABLE orders ADD COLUMN filled_size TEXT DEFAULT '0';",
                 "ALTER TABLE orders ADD COLUMN average_fill_price TEXT DEFAULT NULL;",
                 "ALTER TABLE orders ADD COLUMN last_checked_at INTEGER DEFAULT 0;",
+                "ALTER TABLE fills ADD COLUMN detected_at INTEGER DEFAULT 0;",
             };
             for (fill_alters) |sql| {
                 self.execZ(sql) catch |err| {
@@ -350,7 +351,7 @@ pub const DB = struct {
     }
 
     pub fn insertFill(self: DB, id: []const u8, order_id: []const u8, size: []const u8, price: []const u8, fee: []const u8) !void {
-        const sql = "INSERT INTO fills(id,order_id,size,price,fee) VALUES(?,?,?,?,?);" ++ &[_:0]u8{};
+        const sql = "INSERT INTO fills(id,order_id,size,price,fee,detected_at) VALUES(?,?,?,?,?,unixepoch());" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
             log.err("db", "failed to prepare insertFill", .{});

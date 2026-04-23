@@ -533,7 +533,7 @@ test "probability_provider: kalshi rest response matches by title" {
 
     var kws = kalshi_ws.KalshiWsClient.init(std.testing.allocator, &database);
     var pp = ProbabilityProvider.init(std.testing.allocator, &database, &kws);
-    pp.parseKalshiRestResponse("{\"markets\":[{\"ticker\":\"KXFEDCUT\",\"title\":\"Will the Fed cut rates?\",\"yes_bid\":61,\"yes_ask\":65}]}");
+    _ = pp.parseKalshiRestResponse("{\"markets\":[{\"ticker\":\"KXFEDCUT\",\"title\":\"Will the Fed cut rates?\",\"yes_bid\":61,\"yes_ask\":65}]}") catch 0;
 
     try std.testing.expectEqual(@as(usize, 1), pp.estimate_count);
     try std.testing.expect(pp.estimates[0].?.probability > 0.62 and pp.estimates[0].?.probability < 0.64);

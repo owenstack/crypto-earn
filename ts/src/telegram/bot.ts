@@ -23,6 +23,7 @@ import type {
   PnlResponsePayload,
   PnlWindow,
   ConfigPayload,
+  ConfigValidateResponsePayload,
 } from "../ipc/types";
 
 export function createAllowedIds(raw: string): Set<number> {
@@ -201,6 +202,14 @@ export function createBot(ipc: IPCClient): Bot {
         `• New: \`${p.new_value}\``,
         { parse_mode: "Markdown" }
       );
+    } else if (subcommand === "validate") {
+      const res = await ipc.request<ConfigValidateResponsePayload>("config.validate");
+      const p = res.payload;
+      const lines = Object.entries(p).map(([key, val]) => {
+        const v = val as { valid: boolean; value: string };
+        return `• ${key}: ${v.valid ? "✅" : "❌"} \`${v.value || "(empty)"}\``;
+      });
+      await ctx.reply(`⚙️ *Config Validation*\n\n${lines.join("\n")}`, { parse_mode: "Markdown" });
     } else {
       // Default: get all config
       const res = await ipc.request("config.get");

@@ -86,6 +86,8 @@ pub const T = struct {
     pub const pause_response = "pause.response";
     pub const pnl_query = "pnl.query";
     pub const pnl_response = "pnl.response";
+    pub const config_validate = "config.validate";
+    pub const config_validate_response = "config.validate.response";
 };
 
 /// Write a complete JSON-lines response envelope to `writer`.

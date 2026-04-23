@@ -72,6 +72,8 @@ pub const FillPoller = struct {
     ws_connected: std.atomic.Value(bool),
     ws_disconnect_ts: std.atomic.Value(i64),
     last_reconcile_result: ?ReconcileResult,
+    consecutive_http_failures: u32,
+    circuit_breaker_until: i64,
 
     const WS_FALLBACK_TIMEOUT_S: i64 = 30;
     const POLL_INTERVAL_NS: u64 = 3 * std.time.ns_per_s;
@@ -92,6 +94,8 @@ pub const FillPoller = struct {
             .ws_connected = std.atomic.Value(bool).init(false),
             .ws_disconnect_ts = std.atomic.Value(i64).init(0),
             .last_reconcile_result = null,
+            .consecutive_http_failures = 0,
+            .circuit_breaker_until = 0,
         };
     }
 
@@ -167,7 +171,7 @@ pub const FillPoller = struct {
     }
 
     /// Parse order response JSON into FillCheckResult.
-    fn parseOrderResponse(body: []const u8) ?FillCheckResult {
+    pub fn parseOrderResponse(body: []const u8) ?FillCheckResult {
         var result: FillCheckResult = .{
             .status_buf = undefined,
             .status_len = 0,
@@ -221,6 +225,12 @@ pub const FillPoller = struct {
 
     /// Run a single fill check cycle for all open orders.
     pub fn runFillCheck(self: *FillPoller) void {
+        // Circuit-breaker: pause polling after consecutive failures
+        if (std.time.timestamp() < self.circuit_breaker_until) {
+            log.debug("fill_poller", "circuit-breaker active, skipping fill check", .{});
+            return;
+        }
+
         // Query all placed/partially_filled orders not checked recently
         const sql = "SELECT id, market_id, side, size, filled_size FROM orders WHERE status IN ('placed','partially_filled') AND last_checked_at < unixepoch() - 3 LIMIT 20;" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
@@ -286,9 +296,16 @@ pub const FillPoller = struct {
 
             const check = self.checkOrderFills(oid) orelse {
                 self.database.updateOrderLastChecked(oid) catch {};
+                self.consecutive_http_failures += 1;
+                if (self.consecutive_http_failures >= 5) {
+                    self.circuit_breaker_until = std.time.timestamp() + 60;
+                    log.warn("fill_poller", "circuit-breaker triggered: pausing polling for 60s after {d} consecutive failures", .{self.consecutive_http_failures});
+                    return;
+                }
                 continue;
             };
 
+            self.consecutive_http_failures = 0;
             self.database.updateOrderLastChecked(oid) catch {};
 
             const status = check.status();
@@ -347,6 +364,7 @@ pub const FillPoller = struct {
                     ipc.publishEvent(ipc_types.T.event_order_partially_filled, evt);
                     log.info("fill_poller", "order partially filled: {s} {s}@{s} (remaining {s})", .{ oid, fill_size, fill_price, remaining });
                 }
+                log.info("fill_poller", "fill_latency_ms: order={s} detected_at={d}", .{ oid, std.time.timestamp() * 1000 });
             } else if (std.mem.eql(u8, status, "CANCELED") or std.mem.eql(u8, status, "canceled")) {
                 // Order cancelled on CLOB, update local status
                 self.database.updateOrderStatus(oid, "cancelled") catch |e| {
@@ -617,6 +635,7 @@ pub const FillPoller = struct {
                 ipc.publishEvent(ipc_types.T.event_order_partially_filled, evt);
                 log.info("fill_poller", "WS: order partially filled: {s}", .{order_id[0..@min(order_id.len, 32)]});
             }
+            log.info("fill_poller", "fill_latency_ms: order={s} detected_at={d}", .{ order_id, std.time.timestamp() * 1000 });
         }
     }
 
