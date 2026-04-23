@@ -664,8 +664,8 @@ pub const FillPoller = struct {
         }
 
         // Use ArrayList for dynamic order id storage
-        var clob_order_ids = std.ArrayList([]const u8).init(self.allocator);
-        defer clob_order_ids.deinit();
+        var clob_order_ids: std.ArrayList([]const u8) = .empty;
+        defer clob_order_ids.deinit(self.allocator);
         var next_cursor: [256]u8 = undefined;
         var next_cursor_len: usize = 0;
 
@@ -756,9 +756,11 @@ pub const FillPoller = struct {
                 if (id_val != .string) continue;
                 // Copy id string into allocator-backed buffer
                 const id_str = id_val.string;
-                const id_copy = try self.allocator.alloc(u8, id_str.len);
-                std.mem.copy(u8, id_copy, id_str);
-                clob_order_ids.append(id_copy) catch |e| {
+                const id_copy = self.allocator.dupe(u8, id_str) catch |e| {
+                    log.err("fill_poller", "reconciliation: failed to copy order id: {s}", .{@errorName(e)});
+                    break;
+                };
+                clob_order_ids.append(self.allocator, id_copy) catch |e| {
                     log.err("fill_poller", "reconciliation: failed to append order id: {s}", .{@errorName(e)});
                     self.allocator.free(id_copy);
                 };
@@ -809,14 +811,14 @@ pub const FillPoller = struct {
                 if (hmac_result) |hmac| {
                     var client = http.HttpClient.init(self.allocator);
                     defer client.deinit();
-                    const response = client.getWithHeaders(order_url.?, &.{
+                    var response = client.getWithHeaders(order_url.?, &.{
                         .{ .name = "POLY_ADDRESS", .value = &addr_hex },
                         .{ .name = "POLY_SIGNATURE", .value = hmac.slice() },
                         .{ .name = "POLY_TIMESTAMP", .value = ts.? },
                         .{ .name = "POLY_API_KEY", .value = creds.api_key[0..creds.api_key_len] },
                         .{ .name = "POLY_PASSPHRASE", .value = creds.passphrase[0..creds.passphrase_len] },
                     }) catch null;
-                    if (response) |resp| {
+                    if (response) |*resp| {
                         defer resp.deinit();
                         if (resp.status.class() == .success) {
                             // Parse JSON for market_id, size, price, side, type

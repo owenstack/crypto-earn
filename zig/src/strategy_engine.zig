@@ -544,7 +544,7 @@ fn escapeJsonString(src: []const u8, buf: []u8) ![]const u8 {
             0...0x1F => {
                 // Control chars as \\u00XX
                 if (j + 6 > buf.len) return error.BufferTooSmall;
-                buf[j .. j + 2].* = "\\u".*;
+                std.mem.copyForwards(u8, buf[j .. j + 2], "\\u");
                 buf[j + 2] = '0';
                 buf[j + 3] = '0';
                 buf[j + 4] = "0123456789abcdef"[(c >> 4) & 0xF];

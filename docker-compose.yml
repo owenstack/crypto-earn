@@ -27,11 +27,13 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
+      DB_PATH: /app/data/cex.db
       IPC_SOCKET: /ipc/cex-engine.sock
       NODE_ENV: production
     ports:
       - "${DASHBOARD_PORT:-3000}:3000"
     volumes:
+      - engine-data:/app/data:ro
       - ipc:/ipc
     depends_on:
       engine:

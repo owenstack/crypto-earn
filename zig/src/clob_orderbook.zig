@@ -164,7 +164,8 @@ pub const CREATE_ORDERBOOKS_TABLE =
     \\  last_trade_price TEXT,
     \\  tick_size TEXT,
     \\  timestamp TEXT,
-    \\  created_at INTEGER NOT NULL DEFAULT(unixepoch())
+    \\  created_at INTEGER NOT NULL DEFAULT(unixepoch()),
+    \\  gamma_id TEXT DEFAULT NULL
     \\);
     \\CREATE INDEX IF NOT EXISTS idx_orderbooks_asset ON orderbooks(asset_id);
     \\CREATE INDEX IF NOT EXISTS idx_orderbooks_created ON orderbooks(created_at DESC);
