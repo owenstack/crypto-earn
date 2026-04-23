@@ -122,13 +122,11 @@ pub const ProbabilityProvider = struct {
                     }
                 }
             }
-
-            self.fallback_active.store(true, .seq_cst);
-            self.pollKalshiRest(api_key.?);
-            return;
         }
 
         self.fallback_active.store(true, .seq_cst);
+        if (self.pollKalshiRest()) return;
+
         self.pollManifold();
     }
 
@@ -170,36 +168,29 @@ pub const ProbabilityProvider = struct {
         return next_count;
     }
 
-    fn pollKalshiRest(self: *ProbabilityProvider, api_key: []const u8) void {
+    fn pollKalshiRest(self: *ProbabilityProvider) bool {
         var client = http.HttpClient.init(self.allocator);
         defer client.deinit();
 
-        var auth_buf: [512]u8 = undefined;
-        var headers = [_]std.http.Header{
-            .{
-                .name = "KALSHI-ACCESS-KEY",
-                .value = std.fmt.bufPrint(&auth_buf, "{s}", .{api_key}) catch api_key,
-            },
-        };
-
-        var response = client.getWithHeaders(KALSHI_REST_URL, &headers) catch {
+        var response = client.get(KALSHI_REST_URL) catch {
             log.err("prob_provider", "Kalshi REST poll failed", .{});
-            return;
+            return false;
         };
         defer response.deinit();
 
         const parsed_count = self.parseKalshiRestResponse(response.body) catch |err| {
             log.err("prob_provider", "Kalshi REST parse failed: {s}", .{@errorName(err)});
-            return;
+            return false;
         };
 
         if (parsed_count == 0) {
             log.warn("prob_provider", "Kalshi REST parse produced zero estimates", .{});
-            return;
+            return false;
         }
 
         self.last_poll_ts = std.time.timestamp();
         self.current_mode = .kalshi_rest;
+        return true;
     }
 
     fn pollManifold(self: *ProbabilityProvider) void {
