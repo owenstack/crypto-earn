@@ -78,6 +78,14 @@ const MIGRATION_008 =
     \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(8);
 ;
 
+/// Embedded migration: dry-run signal tracking table.
+const MIGRATION_009 =
+    \\CREATE TABLE IF NOT EXISTS dry_run_signals(id INTEGER PRIMARY KEY AUTOINCREMENT,market_id TEXT NOT NULL,strategy TEXT NOT NULL,direction TEXT NOT NULL,price REAL NOT NULL,size REAL NOT NULL,delta REAL NOT NULL,confidence REAL NOT NULL,signal_ts INTEGER NOT NULL,best_bid REAL,best_ask REAL,created_at INTEGER NOT NULL DEFAULT(unixepoch()));
+    \\CREATE INDEX IF NOT EXISTS idx_dry_run_signals_ts ON dry_run_signals(signal_ts);
+    \\CREATE INDEX IF NOT EXISTS idx_dry_run_signals_market ON dry_run_signals(market_id);
+    \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(9);
+;
+
 pub const DB = struct {
     handle: *c.sqlite3,
 
@@ -189,7 +197,7 @@ pub const DB = struct {
             const ob_alters = [_][:0]const u8{
                 "CREATE INDEX IF NOT EXISTS idx_orderbooks_market ON orderbooks(market);",
                 "ALTER TABLE orderbooks ADD COLUMN gamma_id TEXT DEFAULT NULL;",
-                "CREATE INDEX IF NOT EXISTS idx_orderbooks_condition_id ON orderbooks(condition_id);",
+                "CREATE INDEX IF NOT EXISTS idx_orderbooks_gamma_id ON orderbooks(gamma_id);",
             };
 
             for (ob_alters) |sql| {
@@ -256,6 +264,10 @@ pub const DB = struct {
                 log.info("db", "migration 008: runtime_config seed skipped or failed: {s}", .{@errorName(err)});
             };
             try self.execZ("INSERT OR IGNORE INTO schema_migrations(version)VALUES(8);");
+        }
+        if (!self.migrationApplied(9)) {
+            log.info("db", "applying migration 009", .{});
+            try self.execZ(MIGRATION_009 ++ &[_:0]u8{});
         }
         log.info("db", "migrations complete", .{});
     }
@@ -835,5 +847,146 @@ pub const DB = struct {
             return buf[0..n];
         }
         return "unknown";
+    }
+
+    /// Insert a dry-run signal record for later analysis.
+    pub fn insertDryRunSignal(
+        self: DB,
+        market_id: []const u8,
+        strategy_name: []const u8,
+        direction: []const u8,
+        price: f64,
+        size: f64,
+        delta: f64,
+        confidence: f64,
+        signal_ts: i64,
+        best_bid: ?f64,
+        best_ask: ?f64,
+    ) !void {
+        const sql = "INSERT INTO dry_run_signals(market_id,strategy,direction,price,size,delta,confidence,signal_ts,best_bid,best_ask) VALUES(?,?,?,?,?,?,?,?,?,?);" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare insertDryRunSignal", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 2, strategy_name.ptr, @intCast(strategy_name.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 3, direction.ptr, @intCast(direction.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 4, price) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 5, size) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 6, delta) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 7, confidence) != c.SQLITE_OK or
+            c.sqlite3_bind_int64(stmt, 8, signal_ts) != c.SQLITE_OK)
+        {
+            log.err("db", "failed to bind insertDryRunSignal parameters", .{});
+            return error.DBExecFailed;
+        }
+        if (best_bid) |bb| {
+            _ = c.sqlite3_bind_double(stmt, 9, bb);
+        } else {
+            _ = c.sqlite3_bind_null(stmt, 9);
+        }
+        if (best_ask) |ba| {
+            _ = c.sqlite3_bind_double(stmt, 10, ba);
+        } else {
+            _ = c.sqlite3_bind_null(stmt, 10);
+        }
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
+            log.err("db", "failed to execute insertDryRunSignal", .{});
+            return error.DBExecFailed;
+        }
+    }
+
+    /// Analyze dry-run signals: persistence rate and hypothetical P&L.
+    /// Writes a JSON report to the provided buffer.
+    /// Persistence check: a signal is "persistent" if another signal for the same
+    /// market+direction exists >= 15 seconds after it.
+    pub fn analyzeDryRunSignals(self: DB, buf: []u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const writer = fbs.writer();
+
+        // Total signals
+        var total: i64 = 0;
+        {
+            const sql = "SELECT COUNT(*) FROM dry_run_signals;" ++ &[_:0]u8{};
+            var stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+                total = c.sqlite3_column_int64(stmt, 0);
+            }
+        }
+
+        // Persistent signals (>15s): a signal is persistent if there exists another
+        // signal for the same market+strategy+direction at least 15 seconds later.
+        var persistent: i64 = 0;
+        {
+            const sql = "SELECT COUNT(*) FROM dry_run_signals s WHERE EXISTS (SELECT 1 FROM dry_run_signals s2 WHERE s2.market_id=s.market_id AND s2.strategy=s.strategy AND s2.direction=s.direction AND s2.signal_ts >= s.signal_ts + 15 LIMIT 1);" ++ &[_:0]u8{};
+            var stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+                persistent = c.sqlite3_column_int64(stmt, 0);
+            }
+        }
+
+        // Hypothetical P&L: for each signal, optimistic fill = at signal price,
+        // pessimistic fill = at signal price +/- half spread (worse by half spread).
+        // For buy: profit if market moved up from entry; for sell: profit if market moved down.
+        // We approximate final price as the latest signal price for that market.
+        var optimistic_pnl: f64 = 0.0;
+        var pessimistic_pnl: f64 = 0.0;
+        {
+            const sql =
+                \\SELECT s.direction, s.price, s.size, s.best_bid, s.best_ask,
+                \\  (SELECT s2.price FROM dry_run_signals s2 WHERE s2.market_id=s.market_id ORDER BY s2.signal_ts DESC LIMIT 1) AS latest_price
+                \\FROM dry_run_signals s;
+            ++ &[_:0]u8{};
+            var stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+            defer _ = c.sqlite3_finalize(stmt);
+
+            while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+                const dir_raw = c.sqlite3_column_text(stmt, 0);
+                const dir = if (dir_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else continue;
+                const entry_price = c.sqlite3_column_double(stmt, 1);
+                const size = c.sqlite3_column_double(stmt, 2);
+                const has_bid = c.sqlite3_column_type(stmt, 3) != c.SQLITE_NULL;
+                const has_ask = c.sqlite3_column_type(stmt, 4) != c.SQLITE_NULL;
+                const latest_price = c.sqlite3_column_double(stmt, 5);
+
+                const half_spread = if (has_bid and has_ask)
+                    (c.sqlite3_column_double(stmt, 4) - c.sqlite3_column_double(stmt, 3)) / 2.0
+                else
+                    0.01; // default spread assumption
+
+                const is_buy = std.mem.eql(u8, dir, "buy");
+                if (is_buy) {
+                    optimistic_pnl += (latest_price - entry_price) * size;
+                    pessimistic_pnl += (latest_price - (entry_price + half_spread)) * size;
+                } else {
+                    optimistic_pnl += (entry_price - latest_price) * size;
+                    pessimistic_pnl += ((entry_price - half_spread) - latest_price) * size;
+                }
+            }
+        }
+
+        const persistence_pct: f64 = if (total > 0) @as(f64, @floatFromInt(persistent)) / @as(f64, @floatFromInt(total)) * 100.0 else 0.0;
+
+        try writer.print(
+            "{{\"total_signals\":{d},\"persistent_signals\":{d},\"persistence_pct\":{d:.1},\"optimistic_pnl\":{d:.4},\"pessimistic_pnl\":{d:.4},\"diagnosis\":\"{s}\"}}",
+            .{
+                total,
+                persistent,
+                persistence_pct,
+                optimistic_pnl,
+                pessimistic_pnl,
+                if (optimistic_pnl < 0) "signal_broken" else if (pessimistic_pnl < 0) "fill_rate_problem" else "viable",
+            },
+        );
+        return fbs.getWritten();
     }
 };

@@ -88,6 +88,10 @@ pub const T = struct {
     pub const pnl_response = "pnl.response";
     pub const config_validate = "config.validate";
     pub const config_validate_response = "config.validate.response";
+
+    // Dry-run analysis
+    pub const dry_run_analysis = "dry_run.analysis";
+    pub const dry_run_analysis_response = "dry_run.analysis.response";
 };
 
 /// Write a complete JSON-lines response envelope to `writer`.

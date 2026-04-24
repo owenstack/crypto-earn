@@ -230,6 +230,15 @@ pub fn main() !void {
         }
     }
 
+    // Dry-run mode: log signals without placing real orders
+    const dry_run = if (std.posix.getenv("DRY_RUN")) |v|
+        (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true"))
+    else
+        false;
+    if (dry_run) {
+        log.info("engine", "DRY-RUN mode enabled — no orders will be placed", .{});
+    }
+
     // Spawn strategy worker thread
     var strategy_ctx = StrategyWorkerCtx{
         .se = &se,
@@ -237,6 +246,7 @@ pub fn main() !void {
         .pp = &pp,
         .database = &database,
         .should_stop = std.atomic.Value(bool).init(false),
+        .dry_run = dry_run,
     };
     const strategy_thread = try std.Thread.spawn(.{}, strategyWorker, .{&strategy_ctx});
     defer {
@@ -255,6 +265,7 @@ const StrategyWorkerCtx = struct {
     pp: *prob_provider.ProbabilityProvider,
     database: *db.DB,
     should_stop: std.atomic.Value(bool),
+    dry_run: bool,
 };
 
 /// Strategy worker: periodically evaluates enabled strategies and dispatches signals.
@@ -349,6 +360,65 @@ fn evaluateLpSignals(ctx: *StrategyWorkerCtx) void {
 }
 
 fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
+    if (ctx.dry_run) {
+        const dr_market_id = signal.market_id[0..signal.market_id_len];
+        const dr_side: []const u8 = if (signal.direction == .buy) "buy" else "sell";
+
+        // Look up current best bid/ask for delta and spread
+        var dr_bid: ?f64 = null;
+        var dr_ask: ?f64 = null;
+        {
+            const ob_sql = "SELECT best_bid, best_ask FROM orderbooks WHERE gamma_id=? ORDER BY created_at DESC LIMIT 1;" ++ &[_:0]u8{};
+            var ob_stmt: ?*db.c.sqlite3_stmt = null;
+            if (db.c.sqlite3_prepare_v2(ctx.database.handle, ob_sql.ptr, -1, &ob_stmt, null) == db.c.SQLITE_OK) {
+                defer _ = db.c.sqlite3_finalize(ob_stmt);
+                if (db.c.sqlite3_bind_text(ob_stmt, 1, dr_market_id.ptr, @intCast(dr_market_id.len), null) == db.c.SQLITE_OK) {
+                    if (db.c.sqlite3_step(ob_stmt) == db.c.SQLITE_ROW) {
+                        const bid_raw = db.c.sqlite3_column_text(ob_stmt, 0);
+                        const ask_raw = db.c.sqlite3_column_text(ob_stmt, 1);
+                        if (bid_raw) |p| {
+                            dr_bid = std.fmt.parseFloat(f64, std.mem.span(@as([*c]const u8, @ptrCast(p)))) catch null;
+                        }
+                        if (ask_raw) |p| {
+                            dr_ask = std.fmt.parseFloat(f64, std.mem.span(@as([*c]const u8, @ptrCast(p)))) catch null;
+                        }
+                    }
+                }
+            }
+        }
+
+        const dr_mid = if (dr_bid != null and dr_ask != null) (dr_bid.? + dr_ask.?) / 2.0 else signal.price;
+        const dr_delta = @abs(signal.price - dr_mid);
+
+        log.info("dry_run", "signal: market={s} strategy={s} dir={s} price={d:.4} size={d:.2} delta={d:.4} conf={d:.4} bid={d:.4} ask={d:.4}", .{
+            dr_market_id,
+            @tagName(signal.strategy),
+            dr_side,
+            signal.price,
+            signal.size,
+            dr_delta,
+            signal.confidence,
+            dr_bid orelse 0.0,
+            dr_ask orelse 0.0,
+        });
+
+        ctx.database.insertDryRunSignal(
+            dr_market_id,
+            @tagName(signal.strategy),
+            dr_side,
+            signal.price,
+            signal.size,
+            dr_delta,
+            signal.confidence,
+            signal.timestamp,
+            dr_bid,
+            dr_ask,
+        ) catch |e| {
+            log.err("dry_run", "failed to persist dry-run signal: {s}", .{@errorName(e)});
+        };
+        return;
+    }
+
     const market_id = signal.market_id[0..signal.market_id_len];
     const side_str: []const u8 = if (signal.direction == .buy) "buy" else "sell";
 

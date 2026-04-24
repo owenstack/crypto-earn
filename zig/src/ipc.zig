@@ -169,6 +169,7 @@ const DispatchKind = enum {
     config_validate,
     reconcile_status,
     inventory_snapshot,
+    dry_run_analysis,
 };
 
 const DispatchEntry = struct {
@@ -199,6 +200,7 @@ const DISPATCH_TABLE = [_]DispatchEntry{
     .{ .msg_type = types.T.reconcile_status, .kind = .reconcile_status },
     .{ .msg_type = types.T.config_validate, .kind = .config_validate },
     .{ .msg_type = types.T.inventory_snapshot, .kind = .inventory_snapshot },
+    .{ .msg_type = types.T.dry_run_analysis, .kind = .dry_run_analysis },
 };
 
 fn resolveDispatchKind(msg_type: []const u8) ?DispatchKind {
@@ -286,6 +288,7 @@ fn dispatch(ctx: *Context, line: []const u8, writer: anytype, stream: std.net.St
         .reconcile_status => try handleReconcileStatus(req_id, writer),
         .config_validate => try handleConfigValidate(ctx, req_id, writer),
         .inventory_snapshot => try handleInventorySnapshot(ctx, req_id, writer),
+        .dry_run_analysis => try handleDryRunAnalysis(ctx, req_id, writer),
     }
 }
 
@@ -658,4 +661,13 @@ fn handleInventorySnapshot(ctx: *Context, req_id: []const u8, writer: anytype) !
         return;
     }
     try types.writeError(writer, req_id, "strategy engine not available");
+}
+
+fn handleDryRunAnalysis(ctx: *Context, req_id: []const u8, writer: anytype) !void {
+    var buf: [2048]u8 = undefined;
+    const result = ctx.database.analyzeDryRunSignals(&buf) catch {
+        try types.writeError(writer, req_id, "dry-run analysis failed");
+        return;
+    };
+    try types.writeResponse(writer, req_id, types.T.dry_run_analysis_response, result);
 }
