@@ -2,6 +2,7 @@ const std = @import("std");
 const log = @import("logger.zig");
 const db = @import("db.zig");
 const ipc = @import("ipc.zig");
+const ipc_types = @import("ipc_types.zig");
 const scanner = @import("market_scanner.zig");
 const order_mgr = @import("order_manager.zig");
 const poly_auth = @import("polymarket_auth.zig");
@@ -236,7 +237,19 @@ pub fn main() !void {
     else
         false;
     if (dry_run) {
-        log.info("engine", "DRY-RUN mode enabled — no orders will be placed", .{});
+        log.info("engine", "DRY-RUN mode enabled -- no orders will be placed", .{});
+
+        // Seed initial simulated balance for dry-run profitability analysis
+        const dry_run_initial_balance = if (std.posix.getenv("DRY_RUN_INITIAL_BALANCE")) |v|
+            std.fmt.parseFloat(f64, v) catch 10.0
+        else
+            10.0; // Default $10
+
+        // Insert initial balance snapshot so risk gate and P&L calculations work
+        database.insertBalanceSnapshot(dry_run_initial_balance, 0.0, 0.0, 0.0) catch |e| {
+            log.warn("engine", "failed to seed dry-run initial balance: {s}", .{@errorName(e)});
+        };
+        log.info("engine", "dry-run initial balance: ${d:.2}", .{dry_run_initial_balance});
     }
 
     // Spawn strategy worker thread
@@ -244,6 +257,7 @@ pub fn main() !void {
         .se = &se,
         .om = &om,
         .pp = &pp,
+        .pt = &pt,
         .database = &database,
         .should_stop = std.atomic.Value(bool).init(false),
         .dry_run = dry_run,
@@ -255,6 +269,17 @@ pub fn main() !void {
     }
     log.info("engine", "strategy worker started", .{});
 
+    // Spawn DB retention/vacuum ticker. Runs hourly to prune high-churn rows
+    // (orderbooks, risk_events, balance_snapshots, etc) so the database
+    // doesn't grow unbounded over long deployments.
+    var retention_should_stop = std.atomic.Value(bool).init(false);
+    const retention_thread = try std.Thread.spawn(.{}, dbRetentionTicker, .{ &database, &retention_should_stop });
+    defer {
+        retention_should_stop.store(true, .seq_cst);
+        retention_thread.join();
+    }
+    log.info("engine", "db retention ticker started", .{});
+
     // Start IPC server (blocks)
     try ipc.serve(allocator, socket_path, &database, &om, &pt, &se);
 }
@@ -263,9 +288,18 @@ const StrategyWorkerCtx = struct {
     se: *strategy.StrategyEngine,
     om: *order_mgr.OrderManager,
     pp: *prob_provider.ProbabilityProvider,
+    pt: *portfolio.PortfolioTracker,
     database: *db.DB,
     should_stop: std.atomic.Value(bool),
     dry_run: bool,
+    /// True when the engine has reached max_open_orders or balance commitment
+    /// cap. While set, dispatchSignal silently skips submission so we focus on
+    /// managing existing orders. Cleared when capacity frees (a fill closes
+    /// an order or balance grows).
+    saturated: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Counter ticking 5s per increment; used to throttle balance/stats DB
+    /// inserts so they happen ~1/min instead of every 5s.
+    persist_tick: u64 = 0,
 };
 
 /// Strategy worker: periodically evaluates enabled strategies and dispatches signals.
@@ -294,8 +328,15 @@ fn strategyWorker(ctx: *StrategyWorkerCtx) void {
             evaluateLpSignals(ctx);
         }
 
-        // Persist strategy stats periodically
-        persistStrategyStats(ctx);
+        // Persist strategy stats + balance snapshot at most once per minute.
+        // Writing every 5s caused the DB to grow ~17k rows/day per table; once
+        // a minute is plenty for downstream analytics and risk-gate balance
+        // checks (which require <600s freshness anyway).
+        ctx.persist_tick +%= 1;
+        if (ctx.persist_tick % 12 == 0) {
+            persistStrategyStats(ctx);
+            persistBalanceSnapshot(ctx);
+        }
     }
 
     log.info("strategy_worker", "strategy evaluation loop stopped", .{});
@@ -351,6 +392,9 @@ fn evaluateLpSignals(ctx: *StrategyWorkerCtx) void {
         const best_bid = std.fmt.parseFloat(f64, bid_span) catch continue;
         const best_ask = std.fmt.parseFloat(f64, ask_span) catch continue;
 
+        // Per-market cooldown: skip if we signaled this market within the last 60 seconds
+        if (ctx.se.checkLpCooldown(gid_span, 60)) continue;
+
         // Pass gamma_id (Gamma market id) so placeOrder receives a Gamma id
         const lp_result = ctx.se.evaluateLiquidityProvision(gid_span, best_bid, best_ask);
         for (lp_result.signals[0..lp_result.count]) |signal| {
@@ -364,28 +408,9 @@ fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
         const dr_market_id = signal.market_id[0..signal.market_id_len];
         const dr_side: []const u8 = if (signal.direction == .buy) "buy" else "sell";
 
-        // Look up current best bid/ask for delta and spread
-        var dr_bid: ?f64 = null;
-        var dr_ask: ?f64 = null;
-        {
-            const ob_sql = "SELECT best_bid, best_ask FROM orderbooks WHERE gamma_id=? ORDER BY created_at DESC LIMIT 1;" ++ &[_:0]u8{};
-            var ob_stmt: ?*db.c.sqlite3_stmt = null;
-            if (db.c.sqlite3_prepare_v2(ctx.database.handle, ob_sql.ptr, -1, &ob_stmt, null) == db.c.SQLITE_OK) {
-                defer _ = db.c.sqlite3_finalize(ob_stmt);
-                if (db.c.sqlite3_bind_text(ob_stmt, 1, dr_market_id.ptr, @intCast(dr_market_id.len), null) == db.c.SQLITE_OK) {
-                    if (db.c.sqlite3_step(ob_stmt) == db.c.SQLITE_ROW) {
-                        const bid_raw = db.c.sqlite3_column_text(ob_stmt, 0);
-                        const ask_raw = db.c.sqlite3_column_text(ob_stmt, 1);
-                        if (bid_raw) |p| {
-                            dr_bid = std.fmt.parseFloat(f64, std.mem.span(@as([*c]const u8, @ptrCast(p)))) catch null;
-                        }
-                        if (ask_raw) |p| {
-                            dr_ask = std.fmt.parseFloat(f64, std.mem.span(@as([*c]const u8, @ptrCast(p)))) catch null;
-                        }
-                    }
-                }
-            }
-        }
+        // Use bid/ask from the signal to avoid re-querying (values may drift between reads)
+        const dr_bid: ?f64 = if (signal.best_bid > 0) signal.best_bid else null;
+        const dr_ask: ?f64 = if (signal.best_ask > 0) signal.best_ask else null;
 
         const dr_mid = if (dr_bid != null and dr_ask != null) (dr_bid.? + dr_ask.?) / 2.0 else signal.price;
         const dr_delta = @abs(signal.price - dr_mid);
@@ -418,6 +443,14 @@ fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
         };
         return;
     }
+
+    // Saturation gate: if we're at max open orders or have already committed
+    // ~70% of balance, suppress new submissions. This prevents notification
+    // spam (one notification per signal otherwise) and tells the engine to
+    // focus on managing existing orders. Capacity naturally returns when a
+    // fill closes an order or balance grows from realized profits — the next
+    // signal then transitions us back out of saturated state.
+    if (checkSaturation(ctx)) return;
 
     const market_id = signal.market_id[0..signal.market_id_len];
     const side_str: []const u8 = if (signal.direction == .buy) "buy" else "sell";
@@ -478,6 +511,95 @@ fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
     }
 }
 
+/// Returns true if the engine is at capacity (max open orders OR balance
+/// commitment ratio reached) and should suppress new order submissions.
+/// Emits exactly one IPC event on transition into saturation, and one on
+/// transition back out — never per-signal.
+fn checkSaturation(ctx: *StrategyWorkerCtx) bool {
+    const open_count = ctx.database.queryOpenOrderCount() catch 0;
+    const max_orders = ctx.om.risk_config.max_open_orders;
+
+    var at_capacity = open_count >= max_orders;
+    var reason: []const u8 = "max_open_orders";
+    var balance_committed: f64 = 0.0;
+    var balance_limit: f64 = 0.0;
+
+    if (!at_capacity) {
+        // Also treat the 70% balance-commitment ratio as a saturation
+        // condition. The risk gate would reject these too, but checking
+        // up-front avoids spamming risk_events / event_risk_rejection.
+        const exposure = ctx.database.queryOpenExposureUsd() catch 0.0;
+        const max_age = ctx.om.risk_config.balance_snapshot_max_age_seconds;
+        if (ctx.database.queryLatestUsdcBalance(max_age) catch null) |bal| {
+            if (bal > 0) {
+                balance_limit = bal * ctx.om.risk_config.max_balance_commitment_ratio;
+                balance_committed = exposure;
+                if (exposure >= balance_limit) {
+                    at_capacity = true;
+                    reason = "balance_commitment";
+                }
+            }
+        }
+    }
+
+    if (at_capacity) {
+        // Fire one notification on transition into saturation.
+        const was_sat = ctx.saturated.swap(true, .seq_cst);
+        if (!was_sat) {
+            log.info(
+                "strategy_worker",
+                "engine SATURATED ({s}): open_orders={d}/{d} exposure={d:.2}/{d:.2}; pausing new submissions until capacity frees",
+                .{ reason, open_count, max_orders, balance_committed, balance_limit },
+            );
+            var evt_buf: [256]u8 = undefined;
+            const evt = std.fmt.bufPrint(
+                &evt_buf,
+                "{{\"reason\":\"{s}\",\"open_orders\":{d},\"max_open_orders\":{d},\"committed_usd\":{d:.2},\"limit_usd\":{d:.2}}}",
+                .{ reason, open_count, max_orders, balance_committed, balance_limit },
+            ) catch "{}";
+            ipc.publishEvent(ipc_types.T.event_engine_saturated, evt);
+        }
+        return true;
+    }
+
+    // Capacity available — clear the flag (one event on transition).
+    const was_sat = ctx.saturated.swap(false, .seq_cst);
+    if (was_sat) {
+        log.info(
+            "strategy_worker",
+            "engine capacity restored: open_orders={d}/{d}; resuming new submissions",
+            .{ open_count, max_orders },
+        );
+        var evt_buf: [128]u8 = undefined;
+        const evt = std.fmt.bufPrint(
+            &evt_buf,
+            "{{\"open_orders\":{d},\"max_open_orders\":{d}}}",
+            .{ open_count, max_orders },
+        ) catch "{}";
+        ipc.publishEvent(ipc_types.T.event_engine_capacity_restored, evt);
+    }
+    return false;
+}
+
+/// Periodic database retention task — prunes old high-churn rows and
+/// reclaims disk space. Runs once on startup and then every hour.
+fn dbRetentionTicker(database: *db.DB, should_stop: *std.atomic.Value(bool)) void {
+    const interval_ns: u64 = 60 * 60 * std.time.ns_per_s; // 1 hour
+    if (should_stop.load(.seq_cst)) return;
+    database.runRetention();
+
+    while (!should_stop.load(.seq_cst)) {
+        // Sleep in 1s slices so shutdown is responsive.
+        var slept: u64 = 0;
+        while (slept < interval_ns and !should_stop.load(.seq_cst)) {
+            std.Thread.sleep(std.time.ns_per_s);
+            slept += std.time.ns_per_s;
+        }
+        if (should_stop.load(.seq_cst)) break;
+        database.runRetention();
+    }
+}
+
 fn persistStrategyStats(ctx: *StrategyWorkerCtx) void {
     const ns = ctx.se.getStats(.news_repricing);
     ctx.database.insertStrategyStats(
@@ -496,6 +618,16 @@ fn persistStrategyStats(ctx: *StrategyWorkerCtx) void {
         ls.orders_rejected,
         ls.cancels,
         ls.realized_pnl_estimate,
+    ) catch {};
+}
+
+fn persistBalanceSnapshot(ctx: *StrategyWorkerCtx) void {
+    const snap = ctx.pt.getSnapshot();
+    ctx.database.insertBalanceSnapshot(
+        snap.usdc_balance,
+        snap.total_exposure_usd,
+        snap.unrealized_pnl,
+        snap.realized_pnl_today,
     ) catch {};
 }
 

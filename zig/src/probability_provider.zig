@@ -169,21 +169,58 @@ pub const ProbabilityProvider = struct {
     }
 
     fn pollKalshiRest(self: *ProbabilityProvider) bool {
+        // Use configurable series tickers to avoid pulling 1000s of irrelevant sports markets.
+        // runtime_config key "kalshi_series_tickers": comma-separated, e.g. "KXFED,KXBITCOIN,KXGDP"
+        // If empty/unset, falls back to unfiltered endpoint (usually unhelpful).
+        var series_buf: [512]u8 = undefined;
+        const series_cfg = self.database.getConfig("kalshi_series_tickers", &series_buf);
+
         var client = http.HttpClient.init(self.allocator);
         defer client.deinit();
 
-        var response = client.get(KALSHI_REST_URL) catch {
-            log.err("prob_provider", "Kalshi REST poll failed", .{});
-            return false;
-        };
-        defer response.deinit();
+        var acc = [_]?ExternalEstimate{null} ** MAX_ESTIMATES;
+        var acc_count: usize = 0;
 
-        const parsed_count = self.parseKalshiRestResponse(response.body) catch |err| {
-            log.err("prob_provider", "Kalshi REST parse failed: {s}", .{@errorName(err)});
-            return false;
-        };
+        if (series_cfg) |series_str| {
+            // Poll each series ticker individually
+            var it = std.mem.splitScalar(u8, series_str, ',');
+            while (it.next()) |raw_ticker| {
+                const ticker = std.mem.trim(u8, raw_ticker, " ");
+                if (ticker.len == 0) continue;
 
-        if (parsed_count == 0) {
+                var url_buf: [256]u8 = undefined;
+                const url = std.fmt.bufPrint(&url_buf, KALSHI_REST_URL ++ "?status=open&limit=200&series_ticker={s}", .{ticker}) catch continue;
+
+                var response = client.get(url) catch {
+                    log.warn("prob_provider", "Kalshi REST poll failed for series {s}", .{ticker});
+                    continue;
+                };
+                defer response.deinit();
+
+                _ = self.parseKalshiRestInto(response.body, &acc, &acc_count) catch |err| {
+                    log.warn("prob_provider", "Kalshi REST parse failed for series {s}: {s}", .{ ticker, @errorName(err) });
+                    continue;
+                };
+            }
+        } else {
+            // Fallback: unfiltered (mostly sports MVE markets, low signal)
+            var response = client.get(KALSHI_REST_URL ++ "?status=open&limit=200") catch {
+                log.err("prob_provider", "Kalshi REST poll failed", .{});
+                return false;
+            };
+            defer response.deinit();
+
+            _ = self.parseKalshiRestInto(response.body, &acc, &acc_count) catch |err| {
+                log.err("prob_provider", "Kalshi REST parse failed: {s}", .{@errorName(err)});
+                return false;
+            };
+        }
+
+        if (acc_count > 0) {
+            self.publishEstimates(acc, acc_count);
+        }
+
+        if (acc_count == 0) {
             log.warn("prob_provider", "Kalshi REST parse produced zero estimates", .{});
             return false;
         }
@@ -208,19 +245,27 @@ pub const ProbabilityProvider = struct {
         self.current_mode = .manifold;
     }
 
-    fn parseKalshiRestResponse(self: *ProbabilityProvider, body: []const u8) !usize {
+    /// Parse Kalshi REST response and append estimates to an accumulator array.
+    /// Returns number of estimates appended. Does NOT call publishEstimates.
+    fn parseKalshiRestInto(
+        self: *ProbabilityProvider,
+        body: []const u8,
+        acc: *[MAX_ESTIMATES]?ExternalEstimate,
+        acc_count: *usize,
+    ) !usize {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
         defer parsed.deinit();
 
         const items = extractArray(parsed.value, &.{ "markets", "data" }) orelse
             return error.MissingMarketsArray;
 
-        var next = [_]?ExternalEstimate{null} ** MAX_ESTIMATES;
-        var count: usize = 0;
+        var added: usize = 0;
+        var skip_no_prob: usize = 0;
+        var skip_no_market: usize = 0;
         const now = std.time.timestamp();
 
         for (items) |item| {
-            if (count >= MAX_ESTIMATES) break;
+            if (acc_count.* >= MAX_ESTIMATES) break;
             const obj = switch (item) {
                 .object => |o| o,
                 else => continue,
@@ -230,22 +275,40 @@ pub const ProbabilityProvider = struct {
             const slug = objectString(obj, "slug");
             const title = objectString(obj, "title") orelse objectString(obj, "question");
             const subtitle = objectString(obj, "subtitle");
-            const probability = extractProbability(obj) orelse continue;
+            const probability = extractProbability(obj) orelse {
+                skip_no_prob += 1;
+                continue;
+            };
 
             var market_id_buf: [64]u8 = undefined;
-            const market_id = self.resolveMarketId(slug, title, subtitle, &market_id_buf) orelse continue;
+            const market_id = self.queryKalshiMappedMarketId(ticker, &market_id_buf) orelse
+                self.resolveMarketId(slug, title, subtitle, &market_id_buf) orelse {
+                skip_no_market += 1;
+                continue;
+            };
 
             if (self.kalshi) |kws| {
                 kws.upsertAutoMapping(ticker, market_id);
             }
 
-            next[count] = self.buildEstimate(market_id, probability, 0.85, "kalshi_rest", now);
-            count += 1;
+            acc[acc_count.*] = self.buildEstimate(market_id, probability, 0.85, "kalshi_rest", now);
+            acc_count.* += 1;
+            added += 1;
         }
 
-        self.publishEstimates(next, count);
-        log.info("prob_provider", "parsed {d} estimates from Kalshi REST", .{count});
-        return count;
+        log.info("prob_provider", "Kalshi REST: {d} items, {d} published (skipped: {d} no-prob, {d} no-market)", .{
+            items.len, added, skip_no_prob, skip_no_market,
+        });
+        return added;
+    }
+
+    /// Backward-compatible wrapper used by tests.
+    fn parseKalshiRestResponse(self: *ProbabilityProvider, body: []const u8) !usize {
+        var acc = [_]?ExternalEstimate{null} ** MAX_ESTIMATES;
+        var count: usize = 0;
+        const added = try self.parseKalshiRestInto(body, &acc, &count);
+        self.publishEstimates(acc, count);
+        return added;
     }
 
     fn parseManifoldResponse(self: *ProbabilityProvider, body: []const u8) void {
@@ -265,6 +328,8 @@ pub const ProbabilityProvider = struct {
 
         var next = [_]?ExternalEstimate{null} ** MAX_ESTIMATES;
         var count: usize = 0;
+        var skip_no_prob: usize = 0;
+        var skip_no_market: usize = 0;
         const now = std.time.timestamp();
 
         for (items) |item| {
@@ -274,18 +339,32 @@ pub const ProbabilityProvider = struct {
                 else => continue,
             };
 
-            const probability = extractProbability(obj) orelse continue;
+            // Skip non-binary markets (MULTIPLE_CHOICE, etc.) - they don't have a simple probability
+            const outcome_type = objectString(obj, "outcomeType");
+            if (outcome_type) |ot| {
+                if (!std.mem.eql(u8, ot, "BINARY")) continue;
+            }
+
+            const probability = extractProbability(obj) orelse {
+                skip_no_prob += 1;
+                continue;
+            };
             const slug = objectString(obj, "slug") orelse objectString(obj, "id");
             const question = objectString(obj, "question");
             var market_id_buf: [64]u8 = undefined;
-            const market_id = self.resolveMarketId(slug, question, null, &market_id_buf) orelse continue;
+            const market_id = self.resolveMarketId(slug, question, null, &market_id_buf) orelse {
+                skip_no_market += 1;
+                continue;
+            };
 
             next[count] = self.buildEstimate(market_id, probability, 0.70, "manifold", now);
             count += 1;
         }
 
         self.publishEstimates(next, count);
-        log.info("prob_provider", "parsed {d} estimates from Manifold", .{count});
+        log.info("prob_provider", "Manifold: {d} items, {d} published (skipped: {d} no-prob, {d} no-market)", .{
+            items.len, count, skip_no_prob, skip_no_market,
+        });
     }
 
     fn publishEstimates(self: *ProbabilityProvider, next: [MAX_ESTIMATES]?ExternalEstimate, count: usize) void {
@@ -348,6 +427,34 @@ pub const ProbabilityProvider = struct {
             if (self.queryMarketIdByQuestion(candidate, out)) |market_id| return market_id;
         }
 
+        return null;
+    }
+
+    fn queryKalshiMappedMarketId(self: *ProbabilityProvider, ticker: []const u8, out: *[64]u8) ?[]const u8 {
+        var map_buf: [4096]u8 = undefined;
+        const market_map = self.database.getConfig("kalshi_market_map", &map_buf) orelse return null;
+
+        // Parse JSON map: {"TICKER":"gamma-id",...}
+        // Search for "ticker":"value" pattern (same logic as kalshi_ws lookupTickerMapping)
+        var i: usize = 0;
+        while (i + ticker.len + 4 < market_map.len) : (i += 1) {
+            if (market_map[i] != '"') continue;
+            if (i + 1 + ticker.len + 1 >= market_map.len) continue;
+            if (!std.mem.eql(u8, market_map[i + 1 .. i + 1 + ticker.len], ticker)) continue;
+            if (market_map[i + 1 + ticker.len] != '"') continue;
+
+            var j = i + 1 + ticker.len + 1;
+            while (j < market_map.len and (market_map[j] == ':' or market_map[j] == ' ')) : (j += 1) {}
+            if (j >= market_map.len or market_map[j] != '"') return null;
+
+            const start = j + 1;
+            var end = start;
+            while (end < market_map.len and market_map[end] != '"') : (end += 1) {}
+            const val = market_map[start..end];
+            if (val.len > out.len) return null;
+            @memcpy(out[0..val.len], val);
+            return out[0..val.len];
+        }
         return null;
     }
 
@@ -453,6 +560,14 @@ fn objectNumber(obj: std.json.ObjectMap, key: []const u8) ?f64 {
 }
 
 fn extractProbability(obj: std.json.ObjectMap) ?f64 {
+    // Kalshi REST uses "yes_bid_dollars" / "yes_ask_dollars" (string dollar amounts like "0.61")
+    const bid_dollars = objectNumber(obj, "yes_bid_dollars");
+    const ask_dollars = objectNumber(obj, "yes_ask_dollars");
+    if (bid_dollars != null and ask_dollars != null) {
+        const prob = normalizeProbability((bid_dollars.? + ask_dollars.?) / 2.0) orelse return null;
+        return prob;
+    }
+
     const bid = objectNumber(obj, "yes_bid");
     const ask = objectNumber(obj, "yes_ask");
     if (bid != null and ask != null) {
@@ -463,6 +578,7 @@ fn extractProbability(obj: std.json.ObjectMap) ?f64 {
     const candidates = [_][]const u8{
         "probability",
         "last_price",
+        "last_price_dollars",
         "yes_price",
         "yes_bid",
         "yes_ask",

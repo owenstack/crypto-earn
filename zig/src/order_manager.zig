@@ -153,25 +153,14 @@ pub const OrderManager = struct {
             .client_order_id = client_order_id,
         };
 
-        // MANDATORY risk gate check
+        // MANDATORY risk gate check.
+        // Note: risk.validateOrder already persists the rejection AND publishes
+        // the event_risk_rejection IPC event. We don't double-publish here.
         const validation = risk.validateOrder(order_request, self.database, self.risk_config);
         switch (validation) {
             .reject => |rejection| {
                 const reason_name = risk.rejectionReasonName(rejection.reason);
                 log.warn("order_mgr", "risk gate rejected: {s}", .{reason_name});
-                // Publish risk rejection event
-                const rej_evt_payload = std.json.Stringify.valueAlloc(self.allocator, .{
-                    .order_id = client_order_id,
-                    .market_id = market_id,
-                    .side = side,
-                    .check_name = rejection.check_name,
-                    .reason = reason_name,
-                }, .{}) catch |e| {
-                    log.err("order_mgr", "failed to serialize risk rejection event: {s}", .{@errorName(e)});
-                    return .{ .rejected = .{ .reason = reason_name } };
-                };
-                defer self.allocator.free(rej_evt_payload);
-                ipc.publishEvent(ipc_types.T.event_risk_rejection, rej_evt_payload);
                 return .{ .rejected = .{ .reason = reason_name } };
             },
             .pass => {},

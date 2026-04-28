@@ -111,6 +111,65 @@ pub const DB = struct {
         try self.execZ("PRAGMA busy_timeout=5000;");
         try self.execZ("PRAGMA foreign_keys=OFF;");
         try self.execZ("PRAGMA cache_size=-8000;");
+        // auto_vacuum=INCREMENTAL allows reclaiming space from deleted rows
+        // when `PRAGMA incremental_vacuum;` is called periodically. This is a
+        // no-op if the database already exists with a different auto_vacuum
+        // mode, but new databases benefit immediately.
+        try self.execZ("PRAGMA auto_vacuum=INCREMENTAL;");
+        // Cap WAL growth so it doesn't balloon between checkpoints.
+        try self.execZ("PRAGMA wal_autocheckpoint=1000;");
+        try self.execZ("PRAGMA journal_size_limit=67108864;"); // 64 MiB
+    }
+
+    /// Retention table descriptor.
+    const RetentionRule = struct {
+        sql: [:0]const u8,
+        label: []const u8,
+    };
+
+    /// Periodic retention task. Deletes rows older than the per-table cutoff
+    /// from high-churn tables, then runs an incremental vacuum + WAL
+    /// checkpoint to reclaim disk space. Safe to run concurrently with normal
+    /// operation thanks to WAL mode.
+    pub fn runRetention(self: DB) void {
+        const rules = [_]RetentionRule{
+            // Orderbook snapshots: keep last 1 hour. Strategy worker only ever
+            // reads the most recent row per asset, so anything older is dead
+            // weight.
+            .{ .sql = "DELETE FROM orderbooks WHERE created_at < unixepoch() - 3600;", .label = "orderbooks" },
+            // Risk events: keep 7 days for audit/debugging.
+            .{ .sql = "DELETE FROM risk_events WHERE created_at < unixepoch() - 7*86400;", .label = "risk_events" },
+            // Balance snapshots: keep 7 days at fine grain (worker now writes
+            // 1/min instead of 1/5s, so this is plenty).
+            .{ .sql = "DELETE FROM balance_snapshots WHERE snapshot_at < unixepoch() - 7*86400;", .label = "balance_snapshots" },
+            // Strategy stats: keep 7 days.
+            .{ .sql = "DELETE FROM strategy_stats WHERE snapshot_at < unixepoch() - 7*86400;", .label = "strategy_stats" },
+            // Strategy signals: keep 3 days.
+            .{ .sql = "DELETE FROM strategy_signals WHERE created_at < unixepoch() - 3*86400;", .label = "strategy_signals" },
+            // Engine logs: keep 3 days.
+            .{ .sql = "DELETE FROM logs WHERE created_at < unixepoch() - 3*86400;", .label = "logs" },
+            // Dry-run signals: keep 7 days.
+            .{ .sql = "DELETE FROM dry_run_signals WHERE created_at < unixepoch() - 7*86400;", .label = "dry_run_signals" },
+        };
+
+        for (rules) |rule| {
+            self.execZ(rule.sql) catch |e| {
+                log.warn("db", "retention DELETE failed for {s}: {s}", .{ rule.label, @errorName(e) });
+                continue;
+            };
+            const changed = c.sqlite3_changes(self.handle);
+            if (changed > 0) {
+                log.info("db", "retention pruned {d} rows from {s}", .{ changed, rule.label });
+            }
+        }
+
+        // Reclaim freed pages and truncate WAL.
+        self.execZ("PRAGMA incremental_vacuum;") catch |e| {
+            log.warn("db", "incremental_vacuum failed: {s}", .{@errorName(e)});
+        };
+        self.execZ("PRAGMA wal_checkpoint(TRUNCATE);") catch |e| {
+            log.warn("db", "wal_checkpoint failed: {s}", .{@errorName(e)});
+        };
     }
 
     pub fn execZ(self: DB, sql: [:0]const u8) !void {
@@ -443,6 +502,74 @@ pub const DB = struct {
             return error.DBExecFailed;
         }
         return c.sqlite3_column_double(stmt, 0);
+    }
+
+    /// Query the latest USDC balance from balance_snapshots.
+    /// Returns null if no snapshot exists or it's older than max_age_seconds.
+    pub fn queryLatestUsdcBalance(self: DB, max_age_seconds: i64) !?f64 {
+        const sql = "SELECT CAST(usdc_balance AS REAL), snapshot_at FROM balance_snapshots ORDER BY snapshot_at DESC LIMIT 1;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare queryLatestUsdcBalance", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_ROW) {
+            // proceed
+        } else if (rc == c.SQLITE_DONE) {
+            return null; // no snapshots
+        } else {
+            const err_msg = c.sqlite3_errmsg(self.handle);
+            log.err("db", "failed to execute queryLatestUsdcBalance: {s}", .{err_msg});
+            return error.DBExecFailed;
+        }
+
+        const balance = c.sqlite3_column_double(stmt, 0);
+        const snapshot_at = c.sqlite3_column_int64(stmt, 1);
+        const now = std.time.timestamp();
+
+        if (now - snapshot_at > max_age_seconds) {
+            log.warn("db", "balance snapshot stale: age={d}s max={d}s", .{ now - snapshot_at, max_age_seconds });
+            return null;
+        }
+
+        return balance;
+    }
+
+    /// Insert a USDC balance snapshot.
+    pub fn insertBalanceSnapshot(self: DB, usdc_balance: f64, total_exposure: f64, unrealized_pnl: f64, realized_pnl: f64) !void {
+        const sql = "INSERT INTO balance_snapshots(usdc_balance, total_exposure, unrealized_pnl, realized_pnl) VALUES(?,?,?,?);" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare insertBalanceSnapshot", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        var bal_buf: [32]u8 = undefined;
+        const bal_str = std.fmt.bufPrint(&bal_buf, "{d:.6}", .{usdc_balance}) catch return error.FormatFailed;
+        var exp_buf: [32]u8 = undefined;
+        const exp_str = std.fmt.bufPrint(&exp_buf, "{d:.6}", .{total_exposure}) catch return error.FormatFailed;
+        var upnl_buf: [32]u8 = undefined;
+        const upnl_str = std.fmt.bufPrint(&upnl_buf, "{d:.6}", .{unrealized_pnl}) catch return error.FormatFailed;
+        var rpnl_buf: [32]u8 = undefined;
+        const rpnl_str = std.fmt.bufPrint(&rpnl_buf, "{d:.6}", .{realized_pnl}) catch return error.FormatFailed;
+
+        if (c.sqlite3_bind_text(stmt, 1, bal_str.ptr, @intCast(bal_str.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 2, exp_str.ptr, @intCast(exp_str.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 3, upnl_str.ptr, @intCast(upnl_str.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 4, rpnl_str.ptr, @intCast(rpnl_str.len), null) != c.SQLITE_OK)
+        {
+            log.err("db", "failed to bind insertBalanceSnapshot parameters", .{});
+            return error.DBExecFailed;
+        }
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
+            log.err("db", "failed to execute insertBalanceSnapshot", .{});
+            return error.DBExecFailed;
+        }
     }
 
     pub fn queryPositionByMarketDirection(self: DB, market_id: []const u8, side: []const u8) !bool {

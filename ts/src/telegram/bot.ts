@@ -114,6 +114,22 @@ function formatEvent(env: Envelope): string | null {
       return `🛑 <b>Engine HALTED</b>${p.cancelled_orders !== undefined ? `\n• Cancelled orders: ${fmt(p.cancelled_orders, "0")}` : ""}`;
     case "event.engine.resumed":
       return `✅ <b>Engine Resumed</b>`;
+    case "event.engine.saturated":
+      return (
+        `🚦 <b>Engine at Capacity</b>\n` +
+        `• Reason: ${fmt(p.reason)}\n` +
+        `• Open orders: ${fmt(p.open_orders, "?")} / ${fmt(p.max_open_orders, "?")}\n` +
+        (p.committed_usd !== undefined && Number(p.committed_usd) > 0
+          ? `• Committed: $${fmt(p.committed_usd)} / $${fmt(p.limit_usd)} (70%)\n`
+          : "") +
+        `Holding off on new orders. Will reuse profit + freed capital once existing orders close.`
+      );
+    case "event.engine.capacity_restored":
+      return (
+        `🟢 <b>Capacity Restored</b>\n` +
+        `• Open orders: ${fmt(p.open_orders, "?")} / ${fmt(p.max_open_orders, "?")}\n` +
+        `Resuming new submissions.`
+      );
     default:
       return null;
   }

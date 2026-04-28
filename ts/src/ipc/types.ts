@@ -67,7 +67,10 @@ export type EventMessageType =
   | "event.order.rejected"
   | "event.risk.rejection"
   | "event.engine.halted"
-  | "event.engine.resumed";
+export interface EngineStateEventPayload {
+  status: "halted" | "resumed" | "saturated" | "capacity_restored";
+  cancelled_orders?: number;
+}
 
 export type MessageType = RequestMessageType | ResponseMessageType | EventMessageType;
 
@@ -320,7 +323,7 @@ export interface RiskRejectionEventPayload {
 }
 
 export interface EngineStateEventPayload {
-  status: "halted" | "resumed";
+  status: "halted" | "resumed" | "saturated" | "capacity_restored";
   cancelled_orders?: number;
 }
 

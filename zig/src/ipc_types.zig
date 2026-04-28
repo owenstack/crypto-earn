@@ -66,6 +66,12 @@ pub const T = struct {
     pub const event_risk_rejection = "event.risk.rejection";
     pub const event_engine_halted = "event.engine.halted";
     pub const event_engine_resumed = "event.engine.resumed";
+    /// Emitted ONCE when the engine reaches capacity (max_open_orders or
+    /// balance commitment ratio). Strategy worker stops issuing new orders
+    /// until capacity frees (a fill closes an order or balance grows).
+    pub const event_engine_saturated = "event.engine.saturated";
+    /// Emitted ONCE when capacity returns after a saturated period.
+    pub const event_engine_capacity_restored = "event.engine.capacity_restored";
 
     // Phase 2: Fill detection events
     pub const event_order_partially_filled = "event.order.partially_filled";

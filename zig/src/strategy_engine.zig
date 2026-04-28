@@ -15,6 +15,8 @@ pub const Signal = struct {
     size: f64,
     confidence: f64,
     timestamp: i64,
+    best_bid: f64,
+    best_ask: f64,
 };
 
 pub const StrategyConfig = struct {
@@ -70,6 +72,10 @@ pub const StrategyEngine = struct {
     active_order_count: usize,
     market_inventory: [MAX_INVENTORY_MARKETS]?MarketInventory,
     inventory_count: usize,
+    lp_cooldown_markets: [MAX_INVENTORY_MARKETS][68]u8,
+    lp_cooldown_lens: [MAX_INVENTORY_MARKETS]usize,
+    lp_cooldown_ts: [MAX_INVENTORY_MARKETS]i64,
+    lp_cooldown_count: usize,
     lp_max_position_usd: f64,
 
     pub fn init(config: StrategyConfig) StrategyEngine {
@@ -85,6 +91,10 @@ pub const StrategyEngine = struct {
             .active_order_count = 0,
             .market_inventory = [_]?MarketInventory{null} ** MAX_INVENTORY_MARKETS,
             .inventory_count = 0,
+            .lp_cooldown_markets = [_][68]u8{[_]u8{0} ** 68} ** MAX_INVENTORY_MARKETS,
+            .lp_cooldown_lens = [_]usize{0} ** MAX_INVENTORY_MARKETS,
+            .lp_cooldown_ts = [_]i64{0} ** MAX_INVENTORY_MARKETS,
+            .lp_cooldown_count = 0,
             .lp_max_position_usd = 50.0,
         };
     }
@@ -154,6 +164,8 @@ pub const StrategyEngine = struct {
             .size = self.config.news_order_size,
             .confidence = confidence,
             .timestamp = std.time.timestamp(),
+            .best_bid = 0.0,
+            .best_ask = 0.0,
         };
     }
 
@@ -223,6 +235,8 @@ pub const StrategyEngine = struct {
                     .size = self.config.lp_order_size,
                     .confidence = confidence,
                     .timestamp = std.time.timestamp(),
+                    .best_bid = best_bid,
+                    .best_ask = best_ask,
                 },
                 Signal{
                     .strategy = .liquidity_provision,
@@ -233,10 +247,45 @@ pub const StrategyEngine = struct {
                     .size = self.config.lp_order_size,
                     .confidence = confidence,
                     .timestamp = std.time.timestamp(),
+                    .best_bid = best_bid,
+                    .best_ask = best_ask,
                 },
             },
             .count = 2,
         };
+    }
+
+    /// Check if a market is in LP cooldown. If not, mark it as cooling down.
+    /// Returns true if the market is currently in cooldown (signal should be suppressed).
+    pub fn checkLpCooldown(self: *StrategyEngine, market_id: []const u8, cooldown_seconds: i64) bool {
+        const now = std.time.timestamp();
+        self.state_mu.lock();
+        defer self.state_mu.unlock();
+
+        // Check existing cooldowns
+        for (0..self.lp_cooldown_count) |i| {
+            if (std.mem.eql(u8, self.lp_cooldown_markets[i][0..self.lp_cooldown_lens[i]], market_id)) {
+                if (now - self.lp_cooldown_ts[i] < cooldown_seconds) {
+                    return true; // still in cooldown
+                }
+                // Cooldown expired, update timestamp
+                self.lp_cooldown_ts[i] = now;
+                return false;
+            }
+        }
+
+        // Not found, add new entry
+        if (self.lp_cooldown_count < MAX_INVENTORY_MARKETS) {
+            const mid_len = @min(market_id.len, 68);
+            @memcpy(self.lp_cooldown_markets[self.lp_cooldown_count][0..mid_len], market_id[0..mid_len]);
+            self.lp_cooldown_lens[self.lp_cooldown_count] = mid_len;
+            self.lp_cooldown_ts[self.lp_cooldown_count] = now;
+            self.lp_cooldown_count += 1;
+            return false;
+        } else {
+            log.warn("strategy", "LP cooldown tracking full: cannot track market {s}, suppressing signal", .{market_id});
+            return true;
+        }
     }
 
     /// Track an order placed by a strategy (for cancel-on-collapse and LP pair lifecycle).

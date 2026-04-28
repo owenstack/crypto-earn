@@ -12,6 +12,8 @@ pub const RiskConfig = struct {
     max_daily_drawdown_usd: f64 = 200.0,
     max_open_orders: u32 = 20,
     allow_duplicate_positions: bool = false,
+    max_balance_commitment_ratio: f64 = 0.70,
+    balance_snapshot_max_age_seconds: i64 = 600,
 };
 
 pub const OrderRequest = struct {
@@ -31,6 +33,7 @@ pub const RejectionReason = enum {
     max_daily_drawdown_exceeded,
     max_open_orders_exceeded,
     duplicate_position,
+    balance_commitment_exceeded,
 };
 
 pub const ValidationResult = union(enum) {
@@ -103,6 +106,41 @@ pub fn validateOrder(request: OrderRequest, database: *db.DB, config: RiskConfig
         };
         persistRejection(database, request, rejection);
         return .{ .reject = rejection };
+    }
+
+    // Check 2b: Balance commitment ratio (only when balance snapshots are available)
+    const balance_opt = database.queryLatestUsdcBalance(config.balance_snapshot_max_age_seconds) catch {
+        const rejection = Rejection{
+            .reason = .db_error,
+            .check_name = "db_query_latest_usdc_balance_failed",
+            .limit_value = 0.0,
+            .actual_value = 0.0,
+        };
+        persistRejection(database, request, rejection);
+        return .{ .reject = rejection };
+    };
+    if (balance_opt) |usdc_balance| {
+        if (usdc_balance <= 0) {
+            const rejection = Rejection{
+                .reason = .invalid_input, // or add a new enum value if desired
+                .check_name = "invalid_balance_snapshot",
+                .limit_value = 0.0,
+                .actual_value = usdc_balance,
+            };
+            persistRejection(database, request, rejection);
+            return .{ .reject = rejection };
+        }
+        const balance_limit = usdc_balance * config.max_balance_commitment_ratio;
+        if (current_exposure + notional > balance_limit) {
+            const rejection = Rejection{
+                .reason = .balance_commitment_exceeded,
+                .check_name = "max_balance_commitment_ratio",
+                .limit_value = balance_limit,
+                .actual_value = current_exposure + notional,
+            };
+            persistRejection(database, request, rejection);
+            return .{ .reject = rejection };
+        }
     }
 
     // Check 3: Max daily drawdown
@@ -206,6 +244,7 @@ pub fn rejectionReasonName(reason: RejectionReason) []const u8 {
         .max_daily_drawdown_exceeded => "MaxDailyDrawdownExceeded",
         .max_open_orders_exceeded => "MaxOpenOrdersExceeded",
         .duplicate_position => "DuplicatePosition",
+        .balance_commitment_exceeded => "BalanceCommitmentExceeded",
     };
 }
 

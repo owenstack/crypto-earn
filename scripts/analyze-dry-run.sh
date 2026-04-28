@@ -73,7 +73,7 @@ SQL
 echo "" >> "$REPORT"
 
 echo "── 5. LP PROFITABILITY ESTIMATE ──────────────────────────────" >> "$REPORT"
-echo "(Assumes each LP pair captures 50% of quoted spread)" >> "$REPORT"
+echo "(Per distinct market, with fill-rate sensitivity)" >> "$REPORT"
 sqlite3 "$DB" <<'SQL' >> "$REPORT"
 .mode column
 .headers on
@@ -86,19 +86,37 @@ WITH lp_pairs AS (
     size,
     (best_ask - best_bid) as spread,
     price,
-    direction
+    direction,
+    ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY signal_ts) as rn
   FROM dry_run_signals
   WHERE strategy = 'liquidity_provision'
     AND direction = 'buy'
     AND best_bid > 0 AND best_ask > 0
+),
+distinct_markets AS (
+  SELECT
+    market_id,
+    COUNT(*) as signal_repeats,
+    AVG(spread) as avg_spread,
+    AVG(size) as avg_size,
+    AVG(spread * size * 0.5) as avg_profit_per_fill
+  FROM lp_pairs
+  GROUP BY market_id
+),
+summary AS (
+  SELECT
+    COUNT(*) as distinct_market_count,
+    (SELECT COUNT(*) FROM lp_pairs) as raw_pair_count,
+    ROUND(AVG(avg_spread), 4) as avg_spread,
+    ROUND(AVG(signal_repeats), 1) as avg_repeats_per_market,
+    ROUND(SUM(avg_profit_per_fill), 2) as profit_if_all_fill_once,
+    ROUND(SUM(avg_profit_per_fill) * 0.05, 2) as profit_at_5pct_fill,
+    ROUND(SUM(avg_profit_per_fill) * 0.10, 2) as profit_at_10pct_fill,
+    ROUND(SUM(avg_profit_per_fill) * 0.25, 2) as profit_at_25pct_fill,
+    ROUND(SUM(avg_size) * 2, 2) as total_notional_if_all_fill
+  FROM distinct_markets
 )
-SELECT
-  COUNT(*) as pair_count,
-  ROUND(SUM(spread * size * 0.5), 2) as gross_profit_est,
-  ROUND(SUM(spread * size * 0.5) - COUNT(*) * 2 * 5.0 * 0.001, 2) as net_after_fees,
-  ROUND(AVG(spread * size * 0.5), 4) as avg_profit_per_pair,
-  ROUND(SUM(size) * 2, 2) as total_volume_usd
-FROM lp_pairs;
+SELECT * FROM summary;
 SQL
 echo "" >> "$REPORT"
 
@@ -179,7 +197,8 @@ sqlite3 "$DB" <<'SQL' >> "$REPORT"
 WITH stats AS (
   SELECT
     COUNT(*) as total,
-    SUM(CASE WHEN strategy='liquidity_provision' THEN 1 ELSE 0 END) as lp_total,
+    COUNT(DISTINCT CASE WHEN strategy='liquidity_provision' THEN market_id END) as lp_distinct_markets,
+    SUM(CASE WHEN strategy='liquidity_provision' THEN 1 ELSE 0 END) as lp_raw_signals,
     SUM(CASE WHEN strategy='news_repricing' THEN 1 ELSE 0 END) as nr_total,
     AVG(CASE WHEN strategy='liquidity_provision' AND direction='buy' AND best_bid > 0 AND best_ask > 0 
          THEN (best_ask - best_bid) * size * 0.5 END) as avg_lp_profit_per_pair,
@@ -187,13 +206,23 @@ WITH stats AS (
   FROM dry_run_signals
 )
 SELECT
-  'Total signals: ' || total,
-  'LP signals: ' || lp_total || ' (' || ROUND(lp_total * 1.0 / NULLIF(total, 0) * 100, 1) || '%)',
-  'News signals: ' || nr_total || ' (' || ROUND(nr_total * 1.0 / NULLIF(total, 0) * 100, 1) || '%)',
+  'Total raw signals: ' || total,
+  'LP distinct markets: ' || lp_distinct_markets || ' (raw signals: ' || lp_raw_signals || ', ' || ROUND(lp_raw_signals * 1.0 / NULLIF(lp_distinct_markets, 0), 0) || 'x oversample)',
+  'News signals: ' || nr_total,
   'Duration: ' || hours || ' hours',
-  'Avg LP profit/pair: $' || ROUND(COALESCE(avg_lp_profit_per_pair, 0), 4),
-  'Est. daily LP gross (24h extrapolation): $' || 
-    ROUND(COALESCE(avg_lp_profit_per_pair * lp_total / 2.0 / NULLIF(hours, 0) * 24, 0), 2)
+  'Avg LP profit/pair (if filled): $' || ROUND(COALESCE(avg_lp_profit_per_pair, 0), 4),
+  'Per-market profit @ 10% fill: $' || (
+    SELECT ROUND(COALESCE(SUM(avg_profit_per_fill) * 0.10, 0), 2)
+    FROM (
+      SELECT AVG((best_ask - best_bid) * size * 0.5) as avg_profit_per_fill
+      FROM dry_run_signals
+      WHERE strategy = 'liquidity_provision'
+        AND direction = 'buy'
+        AND best_bid > 0 AND best_ask > 0
+      GROUP BY market_id
+    )
+  ),
+  'WARNING: Fill rate is unknown — these are theoretical maximums'
 FROM stats;
 SQL
 echo "" >> "$REPORT"
