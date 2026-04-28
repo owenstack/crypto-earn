@@ -249,6 +249,9 @@ pub fn main() !void {
         database.insertBalanceSnapshot(dry_run_initial_balance, 0.0, 0.0, 0.0) catch |e| {
             log.warn("engine", "failed to seed dry-run initial balance: {s}", .{@errorName(e)});
         };
+        // Re-sync portfolio tracker so in-memory usdc_balance reflects the
+        // freshly-seeded snapshot (init ran earlier when no snapshot existed).
+        pt.syncFromDB();
         log.info("engine", "dry-run initial balance: ${d:.2}", .{dry_run_initial_balance});
     }
 

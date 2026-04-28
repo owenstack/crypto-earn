@@ -145,6 +145,7 @@ export function createBot(ipc: IPCClient): Bot {
     await ctx.reply(
       "🤖 *CEX Engine Control*\n\n" +
       "/status — engine status\n" +
+      "/balance — cash balance & P&L summary\n" +
       "/portfolio — open positions\n" +
       "/orders — open orders\n" +
       "/config — get or set config\n" +
@@ -171,6 +172,29 @@ export function createBot(ipc: IPCClient): Bot {
       `• Engine: \`${p.engine}\`\n` +
       `• DB: \`${p.db}\`\n` +
       `• Uptime: \`${(p.uptime_ms / 1000).toFixed(1)}s\``,
+      { parse_mode: "Markdown" }
+    );
+  }));
+
+  bot.command("balance", guard(async ctx => {
+    if (!ipc.connected) { await ctx.reply("🔴 Engine IPC offline."); return; }
+    const res = await ipc.request<PortfolioPayload>("portfolio");
+    const p = res.payload;
+    if (p.usdc_balance === undefined) {
+      await ctx.reply("⚠️ Balance unavailable (portfolio tracker not initialized).");
+      return;
+    }
+    const fmtNum = (n: number | undefined) => (n ?? 0).toFixed(2);
+    const positionCount = p.positions?.length ?? 0;
+    await ctx.reply(
+      `💰 *Balance & P&L*\n` +
+      "```\n" +
+      `Cash (USDC):       $${fmtNum(p.usdc_balance)}\n` +
+      `Exposure:          $${fmtNum(p.total_exposure_usd)}\n` +
+      `Unrealized P&L:    $${fmtNum(p.unrealized_pnl)}\n` +
+      `Realized (today):  $${fmtNum(p.realized_pnl_today)}\n` +
+      `Open positions:    ${positionCount}\n` +
+      "```",
       { parse_mode: "Markdown" }
     );
   }));

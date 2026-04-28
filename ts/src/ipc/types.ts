@@ -84,7 +84,15 @@ export interface Envelope<P = unknown> {
 
 export interface HeartbeatPayload  { status: "ok"; uptime_ms: number }
 export interface StatusPayload     { engine: string; db: string; uptime_ms: number }
-export interface PortfolioPayload  { positions: unknown[]; note?: string }
+export interface PortfolioPayload  {
+  positions: unknown[];
+  note?: string;
+  total_exposure_usd?: string;
+  unrealized_pnl?: string;
+  realized_pnl_today?: string;
+  usdc_balance?: string;
+  error?: string;
+}
 export interface OrdersPayload     {
   orders: unknown[];
   note?: string;
