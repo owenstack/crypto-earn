@@ -274,8 +274,9 @@ pub const StrategyEngine = struct {
             }
         }
 
-        // Not found, add new entry
+        // Not found, need to add or replace an entry
         if (self.lp_cooldown_count < MAX_INVENTORY_MARKETS) {
+            // There is space, add new entry
             const mid_len = @min(market_id.len, 68);
             @memcpy(self.lp_cooldown_markets[self.lp_cooldown_count][0..mid_len], market_id[0..mid_len]);
             self.lp_cooldown_lens[self.lp_cooldown_count] = mid_len;
@@ -283,8 +284,35 @@ pub const StrategyEngine = struct {
             self.lp_cooldown_count += 1;
             return false;
         } else {
-            log.warn("strategy", "LP cooldown tracking full: cannot track market {s}, suppressing signal", .{market_id});
-            return true;
+            // At capacity: scan for expired entry
+            var expired_index: ?usize = null;
+            for (0..MAX_INVENTORY_MARKETS) |i| {
+                if (now - self.lp_cooldown_ts[i] >= cooldown_seconds) {
+                    expired_index = i;
+                    break;
+                }
+            }
+            var victim_index: usize = 0;
+            if (expired_index) |idx| {
+                victim_index = idx;
+            } else {
+                // No expired entry, evict the oldest (smallest timestamp)
+                var min_ts = self.lp_cooldown_ts[0];
+                victim_index = 0;
+                for (1..MAX_INVENTORY_MARKETS) |i| {
+                    if (self.lp_cooldown_ts[i] < min_ts) {
+                        min_ts = self.lp_cooldown_ts[i];
+                        victim_index = i;
+                    }
+                }
+            }
+            // Overwrite victim slot
+            const mid_len = @min(market_id.len, 68);
+            @memcpy(self.lp_cooldown_markets[victim_index][0..mid_len], market_id[0..mid_len]);
+            self.lp_cooldown_lens[victim_index] = mid_len;
+            self.lp_cooldown_ts[victim_index] = now;
+            // Do NOT increment lp_cooldown_count (reused slot)
+            return false;
         }
     }
 

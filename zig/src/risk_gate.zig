@@ -10,11 +10,43 @@ pub const RiskConfig = struct {
     max_position_usd: f64 = 500.0,
     max_portfolio_exposure_usd: f64 = 5000.0,
     max_daily_drawdown_usd: f64 = 200.0,
-    max_open_orders: u32 = 20,
+    /// Hard upper bound (safety cap). The *effective* max open orders is
+    /// derived from the latest balance snapshot via dynamicMaxOpenOrders().
+    /// This static value is only used as a fallback ceiling and when no
+    /// balance data is available.
+    max_open_orders: u32 = 200,
     allow_duplicate_positions: bool = false,
+    /// Fraction of the user's USDC balance the bot is allowed to commit to
+    /// open orders at any given time.
     max_balance_commitment_ratio: f64 = 0.70,
     balance_snapshot_max_age_seconds: i64 = 600,
+    /// Nominal per-order notional in USD used to compute dynamicMaxOpenOrders
+    /// from balance. Intentionally small (matches default lp/news order size
+    /// of $5–$10) so the dynamic cap scales sensibly with account size.
+    nominal_order_notional_usd: f64 = 5.0,
 };
+
+/// Compute the effective max open orders from the user's USDC balance.
+/// Formula: floor(balance * commitment_ratio / nominal_order_notional).
+///
+/// - If `balance` is null (no snapshot yet), returns `static_cap` so the
+///   engine can still operate from a cold start.
+/// - The result is clamped to `[1, static_cap]` so a dust balance never
+///   blocks the bot from any orders, and the static cap acts as a hard
+///   safety ceiling.
+pub fn dynamicMaxOpenOrders(
+    balance: ?f64,
+    commitment_ratio: f64,
+    nominal_order_notional_usd: f64,
+    static_cap: u32,
+) u32 {
+    const bal = balance orelse return static_cap;
+    if (bal <= 0 or commitment_ratio <= 0 or nominal_order_notional_usd <= 0) return static_cap;
+    const raw = (bal * commitment_ratio) / nominal_order_notional_usd;
+    if (!std.math.isFinite(raw) or raw < 1.0) return 1;
+    if (raw >= @as(f64, @floatFromInt(static_cap))) return static_cap;
+    return @intFromFloat(@floor(raw));
+}
 
 pub const OrderRequest = struct {
     market_id: []const u8,
@@ -165,7 +197,9 @@ pub fn validateOrder(request: OrderRequest, database: *db.DB, config: RiskConfig
         return .{ .reject = rejection };
     }
 
-    // Check 4: Max open orders
+    // Check 4: Max open orders (balance-derived; falls back to static cap
+    // when no balance snapshot is available so the engine still works on
+    // cold start and in unit tests).
     const open_orders = database.queryOpenOrderCount() catch {
         const rejection = Rejection{
             .reason = .db_error,
@@ -176,11 +210,17 @@ pub fn validateOrder(request: OrderRequest, database: *db.DB, config: RiskConfig
         persistRejection(database, request, rejection);
         return .{ .reject = rejection };
     };
-    if (open_orders >= config.max_open_orders) {
+    const effective_max_orders = dynamicMaxOpenOrders(
+        balance_opt,
+        config.max_balance_commitment_ratio,
+        config.nominal_order_notional_usd,
+        config.max_open_orders,
+    );
+    if (open_orders >= effective_max_orders) {
         const rejection = Rejection{
             .reason = .max_open_orders_exceeded,
             .check_name = "max_open_orders",
-            .limit_value = @floatFromInt(config.max_open_orders),
+            .limit_value = @floatFromInt(effective_max_orders),
             .actual_value = @floatFromInt(open_orders),
         };
         persistRejection(database, request, rejection);

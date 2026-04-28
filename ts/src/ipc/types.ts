@@ -66,7 +66,7 @@ export type EventMessageType =
   | "event.order.cancelled"
   | "event.order.rejected"
   | "event.risk.rejection"
-  | "event.engine.halted"
+  | "event.engine.halted" | "event.engine.resumed" | "event.engine.saturated" | "event.engine.capacity_restored"
 export interface EngineStateEventPayload {
   status: "halted" | "resumed" | "saturated" | "capacity_restored";
   cancelled_orders?: number;

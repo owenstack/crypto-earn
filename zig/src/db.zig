@@ -133,23 +133,35 @@ pub const DB = struct {
     /// operation thanks to WAL mode.
     pub fn runRetention(self: DB) void {
         const rules = [_]RetentionRule{
-            // Orderbook snapshots: keep last 1 hour. Strategy worker only ever
-            // reads the most recent row per asset, so anything older is dead
-            // weight.
-            .{ .sql = "DELETE FROM orderbooks WHERE created_at < unixepoch() - 3600;", .label = "orderbooks" },
-            // Risk events: keep 7 days for audit/debugging.
-            .{ .sql = "DELETE FROM risk_events WHERE created_at < unixepoch() - 7*86400;", .label = "risk_events" },
-            // Balance snapshots: keep 7 days at fine grain (worker now writes
-            // 1/min instead of 1/5s, so this is plenty).
-            .{ .sql = "DELETE FROM balance_snapshots WHERE snapshot_at < unixepoch() - 7*86400;", .label = "balance_snapshots" },
-            // Strategy stats: keep 7 days.
-            .{ .sql = "DELETE FROM strategy_stats WHERE snapshot_at < unixepoch() - 7*86400;", .label = "strategy_stats" },
-            // Strategy signals: keep 3 days.
-            .{ .sql = "DELETE FROM strategy_signals WHERE created_at < unixepoch() - 3*86400;", .label = "strategy_signals" },
-            // Engine logs: keep 3 days.
-            .{ .sql = "DELETE FROM logs WHERE created_at < unixepoch() - 3*86400;", .label = "logs" },
-            // Dry-run signals: keep 7 days.
-            .{ .sql = "DELETE FROM dry_run_signals WHERE created_at < unixepoch() - 7*86400;", .label = "dry_run_signals" },
+            // Orderbook snapshots: only the latest row per asset is ever
+            // queried. Keep last 10 minutes so the table never accumulates
+            // more than a few thousand rows even at high tick rates.
+            .{ .sql = "DELETE FROM orderbooks WHERE created_at < unixepoch() - 600;", .label = "orderbooks" },
+            // Per-asset dedup: keep only the most recent row per asset_id.
+            // This bounds the steady-state row count to N (number of subscribed
+            // assets), regardless of WS update frequency.
+            .{ .sql = "DELETE FROM orderbooks WHERE id NOT IN (SELECT MAX(id) FROM orderbooks GROUP BY asset_id);", .label = "orderbooks_dedup" },
+            // Risk events: keep 2 days for audit/debugging.
+            .{ .sql = "DELETE FROM risk_events WHERE created_at < unixepoch() - 2*86400;", .label = "risk_events" },
+            // Balance snapshots: keep 2 days. Worker writes ~1/5min so this
+            // is ~576 rows total.
+            .{ .sql = "DELETE FROM balance_snapshots WHERE snapshot_at < unixepoch() - 2*86400;", .label = "balance_snapshots" },
+            // Strategy stats: keep 2 days.
+            .{ .sql = "DELETE FROM strategy_stats WHERE snapshot_at < unixepoch() - 2*86400;", .label = "strategy_stats" },
+            // Strategy signals: keep 2 days.
+            .{ .sql = "DELETE FROM strategy_signals WHERE created_at < unixepoch() - 2*86400;", .label = "strategy_signals" },
+            // Engine logs: keep 1 day (most logs go to stdout / docker logs;
+            // this table is currently unused but pruned defensively).
+            .{ .sql = "DELETE FROM logs WHERE created_at < unixepoch() - 86400;", .label = "logs" },
+            // Dry-run signals: keep 3 days.
+            .{ .sql = "DELETE FROM dry_run_signals WHERE created_at < unixepoch() - 3*86400;", .label = "dry_run_signals" },
+            // Closed orders > 30 days: archive by deletion. Open orders are
+            // never deleted regardless of age.
+            .{ .sql = "DELETE FROM orders WHERE status IN ('cancelled','rejected','filled') AND updated_at < unixepoch() - 30*86400;", .label = "orders_closed" },
+            // Fills tied to deleted orders (cleanup orphans).
+            .{ .sql = "DELETE FROM fills WHERE filled_at < unixepoch() - 30*86400 AND order_id NOT IN (SELECT id FROM orders);", .label = "fills_orphans" },
+            // Config change audit log: keep 30 days.
+            .{ .sql = "DELETE FROM config_changes WHERE changed_at < unixepoch() - 30*86400;", .label = "config_changes" },
         };
 
         for (rules) |rule| {

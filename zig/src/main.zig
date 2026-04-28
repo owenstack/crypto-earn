@@ -269,7 +269,7 @@ pub fn main() !void {
     }
     log.info("engine", "strategy worker started", .{});
 
-    // Spawn DB retention/vacuum ticker. Runs hourly to prune high-churn rows
+    // Spawn DB retention/vacuum ticker. Runs every 15 minutes to prune high-churn rows
     // (orderbooks, risk_events, balance_snapshots, etc) so the database
     // doesn't grow unbounded over long deployments.
     var retention_should_stop = std.atomic.Value(bool).init(false);
@@ -328,12 +328,12 @@ fn strategyWorker(ctx: *StrategyWorkerCtx) void {
             evaluateLpSignals(ctx);
         }
 
-        // Persist strategy stats + balance snapshot at most once per minute.
-        // Writing every 5s caused the DB to grow ~17k rows/day per table; once
-        // a minute is plenty for downstream analytics and risk-gate balance
-        // checks (which require <600s freshness anyway).
+        // Persist strategy stats + balance snapshot once every 5 minutes.
+        // Long-running deployments otherwise accumulate ~17k rows/day per
+        // table at 1/min cadence. 1/5min keeps the DB compact while still
+        // providing fresh balance data for risk-gate checks (max-age 600s).
         ctx.persist_tick +%= 1;
-        if (ctx.persist_tick % 12 == 0) {
+        if (ctx.persist_tick % 60 == 0) {
             persistStrategyStats(ctx);
             persistBalanceSnapshot(ctx);
         }
@@ -517,7 +517,21 @@ fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
 /// transition back out — never per-signal.
 fn checkSaturation(ctx: *StrategyWorkerCtx) bool {
     const open_count = ctx.database.queryOpenOrderCount() catch 0;
-    const max_orders = ctx.om.risk_config.max_open_orders;
+    const cfg = &ctx.om.risk_config;
+
+    // Resolve current USDC balance (may be null if no recent snapshot).
+    const max_age = cfg.balance_snapshot_max_age_seconds;
+    const balance_opt = ctx.database.queryLatestUsdcBalance(max_age) catch null;
+
+    // Compute the balance-derived max open orders. Falls back to the static
+    // safety cap when no balance is available so the engine still operates
+    // on a cold start.
+    const max_orders = risk.dynamicMaxOpenOrders(
+        balance_opt,
+        cfg.max_balance_commitment_ratio,
+        cfg.nominal_order_notional_usd,
+        cfg.max_open_orders,
+    );
 
     var at_capacity = open_count >= max_orders;
     var reason: []const u8 = "max_open_orders";
@@ -529,10 +543,9 @@ fn checkSaturation(ctx: *StrategyWorkerCtx) bool {
         // condition. The risk gate would reject these too, but checking
         // up-front avoids spamming risk_events / event_risk_rejection.
         const exposure = ctx.database.queryOpenExposureUsd() catch 0.0;
-        const max_age = ctx.om.risk_config.balance_snapshot_max_age_seconds;
-        if (ctx.database.queryLatestUsdcBalance(max_age) catch null) |bal| {
+        if (balance_opt) |bal| {
             if (bal > 0) {
-                balance_limit = bal * ctx.om.risk_config.max_balance_commitment_ratio;
+                balance_limit = bal * cfg.max_balance_commitment_ratio;
                 balance_committed = exposure;
                 if (exposure >= balance_limit) {
                     at_capacity = true;
@@ -582,9 +595,10 @@ fn checkSaturation(ctx: *StrategyWorkerCtx) bool {
 }
 
 /// Periodic database retention task — prunes old high-churn rows and
-/// reclaims disk space. Runs once on startup and then every hour.
+/// reclaims disk space. Runs once on startup and then every 15 minutes so
+/// orderbooks (highest-churn table) doesn't balloon between cycles.
 fn dbRetentionTicker(database: *db.DB, should_stop: *std.atomic.Value(bool)) void {
-    const interval_ns: u64 = 60 * 60 * std.time.ns_per_s; // 1 hour
+    const interval_ns: u64 = 15 * 60 * std.time.ns_per_s; // 15 minutes
     if (should_stop.load(.seq_cst)) return;
     database.runRetention();
 

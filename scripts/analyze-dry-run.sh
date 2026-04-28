@@ -207,7 +207,7 @@ WITH stats AS (
 )
 SELECT
   'Total raw signals: ' || total,
-  'LP distinct markets: ' || lp_distinct_markets || ' (raw signals: ' || lp_raw_signals || ', ' || ROUND(lp_raw_signals * 1.0 / NULLIF(lp_distinct_markets, 0), 0) || 'x oversample)',
+  'LP distinct markets: ' || lp_distinct_markets || ' (raw signals: ' || lp_raw_signals || ', ' || COALESCE(ROUND(lp_raw_signals * 1.0 / NULLIF(lp_distinct_markets, 0), 0), 0) || 'x oversample)',
   'News signals: ' || nr_total,
   'Duration: ' || hours || ' hours',
   'Avg LP profit/pair (if filled): $' || ROUND(COALESCE(avg_lp_profit_per_pair, 0), 4),
