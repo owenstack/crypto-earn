@@ -2,7 +2,7 @@
  * UNIX socket IPC client with line-buffered JSON framing,
  * reconnect/back-off, per-request timeout, and correlation tracking.
  */
-import type { Envelope, RequestMessageType, EventMessageType, OrderPlaceResponsePayload, OrderCancelResponsePayload, OrderCancelAllResponsePayload, HaltResponsePayload, ResumeResponsePayload, StrategyListResponsePayload, StrategyEnableResponsePayload, StrategyDisableResponsePayload, StrategyEnableDisablePayload, StrategyName, EventSubscribeResponsePayload, EventUnsubscribeResponsePayload, ConfigSetRequestPayload, ConfigSetResponsePayload, PauseResponsePayload, PnlQueryRequestPayload, PnlResponsePayload, PnlWindow } from "./types";
+import type { Envelope, RequestMessageType, EventMessageType, OrderPlaceResponsePayload, OrderCancelResponsePayload, OrderCancelAllResponsePayload, HaltResponsePayload, ResumeResponsePayload, StrategyListResponsePayload, StrategyEnableResponsePayload, StrategyDisableResponsePayload, StrategyEnableDisablePayload, StrategyName, EventSubscribeResponsePayload, EventUnsubscribeResponsePayload, ConfigSetRequestPayload, ConfigSetResponsePayload, PauseResponsePayload, PnlQueryRequestPayload, PnlResponsePayload, PnlWindow, DryRunAnalysisResponsePayload } from "./types";
 import { makeRequest } from "./types";
 import type { OrderPlaceRequestPayload, OrderCancelPayload } from "./types";
 
@@ -277,6 +277,10 @@ export class IPCClient {
 
   async pnl(window: PnlWindow) {
     return this.request<PnlQueryRequestPayload, PnlResponsePayload>("pnl.query", { window });
+  }
+
+  async dryRunAnalysis() {
+    return this.request<DryRunAnalysisResponsePayload>("dry_run.analysis");
   }
 
   /** Subscribe to event stream from Zig engine. */

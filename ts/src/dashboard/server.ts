@@ -87,5 +87,14 @@ export function dashboardRoutes(ipc: IPCClient) {
         return json(res?.payload ?? { markets: [] });
       },
     },
+
+    "/api/dry-run-analysis": {
+      async GET(req: Request) {
+        if (!bearerAuth(req)) return unauthorized();
+        if (!ipc.connected) return json({ diagnosis: "offline" }, 503);
+        const res = await ipc.dryRunAnalysis().catch(() => null);
+        return json(res?.payload ?? { diagnosis: "unavailable" }, res ? 200 : 502);
+      },
+    },
   } as const;
 }

@@ -1290,6 +1290,42 @@ test "db: getAllConfig returns valid JSON" {
     try testing.expectEqualStrings("v2", parsed.value.object.get("k2").?.string);
 }
 
+test "db: analyzeDryRunSignals reports paper trade metrics" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    // Buy signal that gets filled and later exits profitably.
+    try database.insertDryRunSignal("m1", "news_repricing", "buy", 0.50, 10.0, 0.10, 0.90, 100, 0.49, 0.51);
+    try database.insertDryRunSignal("m1", "news_repricing", "buy", 0.48, 10.0, 0.08, 0.85, 130, 0.47, 0.49);
+    try database.insertDryRunSignal("m1", "news_repricing", "buy", 0.60, 10.0, 0.05, 0.80, 400, 0.59, 0.61);
+
+    // Sell signal that gets filled and later exits at a loss.
+    try database.insertDryRunSignal("m2", "liquidity_provision", "sell", 0.60, 10.0, 0.06, 0.75, 200, 0.59, 0.61);
+    try database.insertDryRunSignal("m2", "liquidity_provision", "sell", 0.62, 10.0, 0.05, 0.70, 240, 0.61, 0.63);
+    try database.insertDryRunSignal("m2", "liquidity_provision", "sell", 0.67, 10.0, 0.03, 0.65, 500, 0.66, 0.68);
+
+    var buf: [4096]u8 = undefined;
+    const json = try database.analyzeDryRunSignals(&buf);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    try testing.expect(parsed.value == .object);
+    const obj = parsed.value.object;
+
+    try testing.expectEqual(@as(i64, 6), obj.get("total_signals").?.integer);
+    try testing.expectEqual(@as(i64, 2), obj.get("paper_filled_trades").?.integer);
+    try testing.expectEqual(@as(i64, 4), obj.get("paper_unfilled_signals").?.integer);
+    try testing.expectEqual(@as(i64, 1), obj.get("paper_winning_trades").?.integer);
+    try testing.expectEqual(@as(i64, 1), obj.get("paper_losing_trades").?.integer);
+    try testing.expect(obj.get("paper_fill_rate_pct").?.float > 30.0);
+    try testing.expect(obj.get("paper_win_rate_pct").?.float > 40.0);
+    try testing.expect(obj.get("paper_net_pnl").?.float > 0.4);
+    try testing.expect(obj.get("paper_max_drawdown").?.float > 0.5);
+    try testing.expectEqualStrings("paper_viable", obj.get("diagnosis").?.string);
+}
+
 // ─── Phase 5: P&L query ────────────────────────────────────────────────────
 
 test "db: queryPnl returns zero result on empty db" {

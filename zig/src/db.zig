@@ -1039,7 +1039,37 @@ pub const DB = struct {
         }
     }
 
-    /// Analyze dry-run signals: persistence rate and hypothetical P&L.
+    const DryRunFill = struct {
+        filled_at: i64,
+        fill_price: f64,
+    };
+
+    const DryRunExit = struct {
+        exit_at: i64,
+        mark_price: f64,
+        used_fallback: bool,
+    };
+
+    const DryRunPaperMetrics = struct {
+        considered_signals: i64 = 0,
+        filled_trades: i64 = 0,
+        unfilled_signals: i64 = 0,
+        fallback_exit_marks: i64 = 0,
+        winning_trades: i64 = 0,
+        losing_trades: i64 = 0,
+        net_pnl: f64 = 0.0,
+        gross_profit: f64 = 0.0,
+        gross_loss: f64 = 0.0,
+        max_drawdown: f64 = 0.0,
+        avg_hold_seconds: f64 = 0.0,
+    };
+
+    const DRY_RUN_ENTRY_LOOKAHEAD_SECONDS: i64 = 15 * 60;
+    const DRY_RUN_MAX_HOLD_SECONDS: i64 = 30 * 60;
+    const DRY_RUN_FEE_BPS_PER_SIDE: f64 = 2.0;
+
+    /// Analyze dry-run signals: persistence rate, coarse mark-to-market P&L,
+    /// and a conservative paper-trading simulation.
     /// Writes a JSON report to the provided buffer.
     /// Persistence check: a signal is "persistent" if another signal for the same
     /// market+direction exists >= 15 seconds after it.
@@ -1113,19 +1143,229 @@ pub const DB = struct {
             }
         }
 
+        const paper = try self.simulateDryRunPaperTrades();
+
         const persistence_pct: f64 = if (total > 0) @as(f64, @floatFromInt(persistent)) / @as(f64, @floatFromInt(total)) * 100.0 else 0.0;
+        const paper_fill_rate_pct: f64 = if (paper.considered_signals > 0)
+            @as(f64, @floatFromInt(paper.filled_trades)) / @as(f64, @floatFromInt(paper.considered_signals)) * 100.0
+        else
+            0.0;
+        const paper_win_rate_pct: f64 = if (paper.filled_trades > 0)
+            @as(f64, @floatFromInt(paper.winning_trades)) / @as(f64, @floatFromInt(paper.filled_trades)) * 100.0
+        else
+            0.0;
+        const paper_avg_pnl_per_trade: f64 = if (paper.filled_trades > 0)
+            paper.net_pnl / @as(f64, @floatFromInt(paper.filled_trades))
+        else
+            0.0;
+        const paper_expectancy_per_signal: f64 = if (paper.considered_signals > 0)
+            paper.net_pnl / @as(f64, @floatFromInt(paper.considered_signals))
+        else
+            0.0;
+        const paper_profit_factor: f64 = if (paper.gross_loss > 0.0)
+            paper.gross_profit / paper.gross_loss
+        else if (paper.gross_profit > 0.0)
+            999999.0
+        else
+            0.0;
+        const diagnosis =
+            if (total == 0) "no_data"
+            else if (paper.filled_trades == 0) "no_fills_detected"
+            else if (paper.net_pnl <= 0.0) "paper_loss"
+            else if (paper_fill_rate_pct < 10.0) "fill_rate_too_low"
+            else "paper_viable";
 
         try writer.print(
-            "{{\"total_signals\":{d},\"persistent_signals\":{d},\"persistence_pct\":{d:.1},\"optimistic_pnl\":{d:.4},\"pessimistic_pnl\":{d:.4},\"diagnosis\":\"{s}\"}}",
+            "{{\"total_signals\":{d},\"persistent_signals\":{d},\"persistence_pct\":{d:.1}," ++
+                "\"optimistic_pnl\":{d:.4},\"pessimistic_pnl\":{d:.4}," ++
+                "\"paper_entry_lookahead_seconds\":{d},\"paper_max_hold_seconds\":{d},\"paper_fee_bps_per_side\":{d:.2}," ++
+                "\"paper_filled_trades\":{d},\"paper_unfilled_signals\":{d},\"paper_fill_rate_pct\":{d:.1}," ++
+                "\"paper_winning_trades\":{d},\"paper_losing_trades\":{d},\"paper_win_rate_pct\":{d:.1}," ++
+                "\"paper_net_pnl\":{d:.4},\"paper_avg_pnl_per_trade\":{d:.4},\"paper_expectancy_per_signal\":{d:.4}," ++
+                "\"paper_profit_factor\":{d:.4},\"paper_max_drawdown\":{d:.4},\"paper_avg_hold_seconds\":{d:.1}," ++
+                "\"paper_fallback_exit_marks\":{d},\"diagnosis\":\"{s}\"}}",
             .{
                 total,
                 persistent,
                 persistence_pct,
                 optimistic_pnl,
                 pessimistic_pnl,
-                if (optimistic_pnl < 0) "signal_broken" else if (pessimistic_pnl < 0) "fill_rate_problem" else "viable",
+                DRY_RUN_ENTRY_LOOKAHEAD_SECONDS,
+                DRY_RUN_MAX_HOLD_SECONDS,
+                DRY_RUN_FEE_BPS_PER_SIDE,
+                paper.filled_trades,
+                paper.unfilled_signals,
+                paper_fill_rate_pct,
+                paper.winning_trades,
+                paper.losing_trades,
+                paper_win_rate_pct,
+                paper.net_pnl,
+                paper_avg_pnl_per_trade,
+                paper_expectancy_per_signal,
+                paper_profit_factor,
+                paper.max_drawdown,
+                paper.avg_hold_seconds,
+                paper.fallback_exit_marks,
+                diagnosis,
             },
         );
         return fbs.getWritten();
+    }
+
+    fn simulateDryRunPaperTrades(self: DB) !DryRunPaperMetrics {
+        var metrics = DryRunPaperMetrics{};
+        var equity: f64 = 0.0;
+        var peak_equity: f64 = 0.0;
+        var total_hold_seconds: f64 = 0.0;
+
+        const sql =
+            \\SELECT market_id, direction, price, size, signal_ts
+            \\FROM dry_run_signals
+            \\ORDER BY signal_ts ASC;
+        ++ &[_:0]u8{};
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const market_id_raw = c.sqlite3_column_text(stmt, 0);
+            const market_id = if (market_id_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else continue;
+            const dir_raw = c.sqlite3_column_text(stmt, 1);
+            const direction = if (dir_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else continue;
+            const signal_price = c.sqlite3_column_double(stmt, 2);
+            const size = c.sqlite3_column_double(stmt, 3);
+            const signal_ts = c.sqlite3_column_int64(stmt, 4);
+
+            if (size <= 0.0 or signal_price <= 0.0) continue;
+
+            metrics.considered_signals += 1;
+
+            const fill = try self.queryDryRunFill(market_id, direction, signal_price, signal_ts, DRY_RUN_ENTRY_LOOKAHEAD_SECONDS);
+            if (fill == null) {
+                metrics.unfilled_signals += 1;
+                continue;
+            }
+
+            const f = fill.?;
+            const exit = try self.queryDryRunExitMark(market_id, f.filled_at, DRY_RUN_MAX_HOLD_SECONDS, f.fill_price);
+            const hold_seconds = @as(f64, @floatFromInt(exit.exit_at - f.filled_at));
+            const exit_price = exit.mark_price;
+            const gross_pnl = if (std.mem.eql(u8, direction, "buy"))
+                (exit_price - f.fill_price) * size
+            else
+                (f.fill_price - exit_price) * size;
+            const fees = ((f.fill_price * size) + (exit_price * size)) * (DRY_RUN_FEE_BPS_PER_SIDE / 10000.0);
+            const net_pnl = gross_pnl - fees;
+
+            metrics.filled_trades += 1;
+            if (exit.used_fallback) metrics.fallback_exit_marks += 1;
+            total_hold_seconds += hold_seconds;
+            metrics.net_pnl += net_pnl;
+
+            if (net_pnl >= 0.0) {
+                metrics.winning_trades += 1;
+                metrics.gross_profit += net_pnl;
+            } else {
+                metrics.losing_trades += 1;
+                metrics.gross_loss += @abs(net_pnl);
+            }
+
+            equity += net_pnl;
+            if (equity > peak_equity) peak_equity = equity;
+            const drawdown = peak_equity - equity;
+            if (drawdown > metrics.max_drawdown) metrics.max_drawdown = drawdown;
+        }
+
+        if (metrics.filled_trades > 0) {
+            metrics.avg_hold_seconds = total_hold_seconds / @as(f64, @floatFromInt(metrics.filled_trades));
+        }
+
+        return metrics;
+    }
+
+    fn queryDryRunFill(
+        self: DB,
+        market_id: []const u8,
+        direction: []const u8,
+        signal_price: f64,
+        signal_ts: i64,
+        lookahead_seconds: i64,
+    ) !?DryRunFill {
+        const is_buy = std.mem.eql(u8, direction, "buy");
+        const sql = if (is_buy)
+            "SELECT signal_ts, best_ask FROM dry_run_signals WHERE market_id=? AND signal_ts>? AND signal_ts<=? AND best_ask IS NOT NULL AND best_ask<=? ORDER BY signal_ts ASC LIMIT 1;" ++ &[_:0]u8{}
+        else
+            "SELECT signal_ts, best_bid FROM dry_run_signals WHERE market_id=? AND signal_ts>? AND signal_ts<=? AND best_bid IS NOT NULL AND best_bid>=? ORDER BY signal_ts ASC LIMIT 1;" ++ &[_:0]u8{};
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_int64(stmt, 2, signal_ts) != c.SQLITE_OK or
+            c.sqlite3_bind_int64(stmt, 3, signal_ts + lookahead_seconds) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 4, signal_price) != c.SQLITE_OK)
+        {
+            return error.DBExecFailed;
+        }
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+
+        const fill_price = c.sqlite3_column_double(stmt, 1);
+        if (fill_price <= 0.0) return null;
+
+        return DryRunFill{
+            .filled_at = c.sqlite3_column_int64(stmt, 0),
+            .fill_price = fill_price,
+        };
+    }
+
+    fn queryDryRunExitMark(
+        self: DB,
+        market_id: []const u8,
+        filled_at: i64,
+        max_hold_seconds: i64,
+        fallback_fill_price: f64,
+    ) !DryRunExit {
+        const sql =
+            "SELECT signal_ts, price, best_bid, best_ask FROM dry_run_signals " ++
+            "WHERE market_id=? AND signal_ts>? AND signal_ts<=? ORDER BY signal_ts DESC LIMIT 1;" ++ &[_:0]u8{};
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_int64(stmt, 2, filled_at) != c.SQLITE_OK or
+            c.sqlite3_bind_int64(stmt, 3, filled_at + max_hold_seconds) != c.SQLITE_OK)
+        {
+            return error.DBExecFailed;
+        }
+
+        if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const signal_ts = c.sqlite3_column_int64(stmt, 0);
+            const fallback_price = c.sqlite3_column_double(stmt, 1);
+            const has_bid = c.sqlite3_column_type(stmt, 2) != c.SQLITE_NULL;
+            const has_ask = c.sqlite3_column_type(stmt, 3) != c.SQLITE_NULL;
+            const mark_price = if (has_bid and has_ask)
+                (c.sqlite3_column_double(stmt, 2) + c.sqlite3_column_double(stmt, 3)) / 2.0
+            else if (fallback_price > 0.0)
+                fallback_price
+            else
+                fallback_fill_price;
+
+            return DryRunExit{
+                .exit_at = signal_ts,
+                .mark_price = mark_price,
+                .used_fallback = false,
+            };
+        }
+
+        return DryRunExit{
+            .exit_at = filled_at + max_hold_seconds,
+            .mark_price = fallback_fill_price,
+            .used_fallback = true,
+        };
     }
 };

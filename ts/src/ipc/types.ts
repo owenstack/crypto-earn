@@ -24,6 +24,7 @@ export type RequestMessageType =
   | "config.set"
   | "pause"
   | "pnl.query"
+  | "dry_run.analysis"
   | "reconcile.status"
   | "config.validate";
 
@@ -56,6 +57,7 @@ export type ResponseMessageType =
   | "config.set.response"
   | "pause.response"
   | "pnl.response"
+  | "dry_run.analysis.response"
   | "reconcile.status.response"
   | "config.validate.response";
 
@@ -395,6 +397,31 @@ export interface PnlResponsePayload {
   loss_count: number;
   avg_win: string;
   avg_loss: string;
+}
+
+export interface DryRunAnalysisResponsePayload {
+  total_signals: number;
+  persistent_signals: number;
+  persistence_pct: number;
+  optimistic_pnl: number;
+  pessimistic_pnl: number;
+  paper_entry_lookahead_seconds: number;
+  paper_max_hold_seconds: number;
+  paper_fee_bps_per_side: number;
+  paper_filled_trades: number;
+  paper_unfilled_signals: number;
+  paper_fill_rate_pct: number;
+  paper_winning_trades: number;
+  paper_losing_trades: number;
+  paper_win_rate_pct: number;
+  paper_net_pnl: number;
+  paper_avg_pnl_per_trade: number;
+  paper_expectancy_per_signal: number;
+  paper_profit_factor: number;
+  paper_max_drawdown: number;
+  paper_avg_hold_seconds: number;
+  paper_fallback_exit_marks: number;
+  diagnosis: "no_data" | "no_fills_detected" | "paper_loss" | "fill_rate_too_low" | "paper_viable";
 }
 
 export interface ConfigValidateResponsePayload {

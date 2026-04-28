@@ -664,7 +664,7 @@ fn handleInventorySnapshot(ctx: *Context, req_id: []const u8, writer: anytype) !
 }
 
 fn handleDryRunAnalysis(ctx: *Context, req_id: []const u8, writer: anytype) !void {
-    var buf: [2048]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     const result = ctx.database.analyzeDryRunSignals(&buf) catch {
         try types.writeError(writer, req_id, "dry-run analysis failed");
         return;

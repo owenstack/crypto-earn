@@ -2,7 +2,7 @@
 # Dry-run profitability analysis
 # Run after the engine has collected signals in DRY_RUN mode
 
-DB="${1:-/home/owenstack/repos/personal/cex-zig/zig/data/cex.db}"
+DB="${1:-./data/cex.db}"
 REPORT="/tmp/cex-dry-run-analysis.txt"
 
 echo "═══════════════════════════════════════════════════════════════" > "$REPORT"
