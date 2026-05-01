@@ -232,7 +232,7 @@ export function createBot(ipc: IPCClient): Bot {
 
   bot.command("drystatus", guard(async ctx => {
     if (!ipc.connected) { await ctx.reply("🔴 Engine IPC offline."); return; }
-    const res = await ipc.request<DryRunAnalysisResponsePayload>("dry_run.analysis");
+    const res = await ipc.dryRunAnalysis();
     const p = res.payload;
     const diagEmoji: Record<string, string> = {
       paper_viable: "✅",

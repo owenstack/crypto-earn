@@ -84,6 +84,51 @@ describe("IPCClient", () => {
     client.disconnect();
   });
 
+  test("request-specific timeout overrides the default timeout", async () => {
+    const slowSock = `/tmp/cex-test-slow-${Date.now()}.sock`;
+    const slowServer = Bun.listen({
+      unix: slowSock,
+      socket: {
+        data(socket, raw: Buffer) {
+          const text = raw.toString("utf8");
+          const lines = text.split("\n").filter(Boolean);
+          for (const line of lines) {
+            const req = JSON.parse(line) as Envelope;
+            setTimeout(() => {
+              const response: Envelope = {
+                v: 1,
+                id: req.id,
+                ts: Date.now(),
+                type: `${req.type}.response` as Envelope["type"],
+                payload: { slow: true },
+              };
+              socket.write(JSON.stringify(response) + "\n");
+            }, 150);
+          }
+        },
+        open() {},
+        close() {},
+        error() {},
+      },
+    });
+
+    try {
+      const client = new IPCClient({
+        socketPath: slowSock,
+        requestTimeoutMs: 50,
+      });
+      await client.connect();
+
+      const res = await client.request("status", { timeoutMs: 300 });
+      expect(res.payload).toEqual({ slow: true });
+
+      client.disconnect();
+    } finally {
+      slowServer.stop(true);
+      try { unlinkSync(slowSock); } catch {}
+    }
+  });
+
   test("connected property reflects actual state", async () => {
     const client = new IPCClient({ socketPath: SOCK_PATH });
     expect(client.connected).toBe(false);

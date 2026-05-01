@@ -14,6 +14,10 @@ export interface IPCClientOptions {
   maxInitialAttempts?: number;
 }
 
+export interface IPCRequestOptions {
+  timeoutMs?: number;
+}
+
 type Resolver = (envelope: Envelope) => void;
 type Rejector  = (err: Error) => void;
 type EventHandler = (envelope: Envelope) => void;
@@ -185,10 +189,15 @@ export class IPCClient {
   }
 
   /** Send a typed request and await the correlated response. */
-  async request<RES = unknown>(type: RequestMessageType): Promise<Envelope<RES>>;
-  async request<REQ, RES = unknown>(type: RequestMessageType, payload: REQ): Promise<Envelope<RES>>;
-  async request<REQ>(type: RequestMessageType, payload?: REQ): Promise<Envelope<unknown>> {
+  async request<RES = unknown>(type: RequestMessageType, options?: IPCRequestOptions): Promise<Envelope<RES>>;
+  async request<REQ, RES = unknown>(type: RequestMessageType, payload: REQ, options?: IPCRequestOptions): Promise<Envelope<RES>>;
+  async request<REQ>(type: RequestMessageType, payloadOrOptions?: REQ | IPCRequestOptions, options?: IPCRequestOptions): Promise<Envelope<unknown>> {
     if (!this.socket || !this._connected) throw new Error("IPC not connected");
+
+    const hasPayload = arguments.length >= 2 && !isRequestOptions(payloadOrOptions);
+    const payload = hasPayload ? payloadOrOptions as REQ : undefined;
+    const requestOptions = (hasPayload ? options : payloadOrOptions) as IPCRequestOptions | undefined;
+    const timeoutMs = requestOptions?.timeoutMs ?? this.requestTimeoutMs;
 
     const req = payload === undefined ? makeRequest(type) : makeRequest(type, payload);
     const line = JSON.stringify(req) + "\n";
@@ -197,7 +206,7 @@ export class IPCClient {
       const timer = setTimeout(() => {
         this.pending.delete(req.id);
         reject(new Error(`IPC timeout: ${type}`));
-      }, this.requestTimeoutMs);
+      }, timeoutMs);
 
       this.pending.set(req.id, {
         resolve: resolve as Resolver,
@@ -280,7 +289,7 @@ export class IPCClient {
   }
 
   async dryRunAnalysis() {
-    return this.request<DryRunAnalysisResponsePayload>("dry_run.analysis");
+    return this.request<DryRunAnalysisResponsePayload>("dry_run.analysis", { timeoutMs: 30_000 });
   }
 
   /** Subscribe to event stream from Zig engine. */
@@ -343,4 +352,10 @@ export class IPCClient {
       for (const handler of wildcard) dispatch(handler, "wildcard");
     }
   }
+}
+
+function isRequestOptions(value: unknown): value is IPCRequestOptions {
+  if (value === null || value === undefined) return true;
+  if (typeof value !== "object" || Array.isArray(value)) return false;
+  return "timeoutMs" in value || Object.keys(value).length === 0;
 }
