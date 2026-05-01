@@ -24,6 +24,8 @@ import type {
   PnlWindow,
   ConfigPayload,
   ConfigValidateResponsePayload,
+  DryRunAnalysisResponsePayload,
+  KalshiMappingsResponsePayload,
 } from "../ipc/types";
 
 export function createAllowedIds(raw: string): Set<number> {
@@ -149,6 +151,8 @@ export function createBot(ipc: IPCClient): Bot {
       "/portfolio — open positions\n" +
       "/orders — open orders\n" +
       "/config — get or set config\n" +
+      "/mappings — Kalshi market mappings\n" +
+      "/drystatus — dry-run analysis\n" +
       "/trade — place an order\n" +
       "/cancel — cancel an order\n" +
       "/strategy — manage strategies\n" +
@@ -184,9 +188,16 @@ export function createBot(ipc: IPCClient): Bot {
       await ctx.reply("⚠️ Balance unavailable (portfolio tracker not initialized).");
       return;
     }
-    const fmtNum = (n: number | undefined) => (n ?? 0).toFixed(2);
+    const fmtNum = (n: number | string | undefined) => {
+      const value = typeof n === "string" ? Number(n) : n;
+      const safeValue = Number.isFinite(value) ? value ?? 0 : 0;
+      return safeValue.toFixed(2);
+    };
     const positionCount = p.positions?.length ?? 0;
+    const isDryRun = Bun.env.DRY_RUN === "1" || Bun.env.DRY_RUN === "true";
+    const dryRunBadge = isDryRun ? "🔬 *[DRY RUN - simulated balance]*\n\n" : "";
     await ctx.reply(
+      dryRunBadge +
       `💰 *Balance & P&L*\n` +
       "```\n" +
       `Cash (USDC):       $${fmtNum(p.usdc_balance)}\n` +
@@ -194,6 +205,62 @@ export function createBot(ipc: IPCClient): Bot {
       `Unrealized P&L:    $${fmtNum(p.unrealized_pnl)}\n` +
       `Realized (today):  $${fmtNum(p.realized_pnl_today)}\n` +
       `Open positions:    ${positionCount}\n` +
+      "```",
+      { parse_mode: "Markdown" }
+    );
+  }));
+
+  bot.command("mappings", guard(async ctx => {
+    if (!ipc.connected) { await ctx.reply("🔴 Engine IPC offline."); return; }
+    const res = await ipc.request<KalshiMappingsResponsePayload>("kalshi.mappings");
+    const rows = res.payload.mappings;
+    if (!rows.length) {
+      await ctx.reply(
+        "🗺️ *Kalshi Market Mappings*\n\nNo mappings discovered yet. They will appear here after Kalshi REST or WebSocket data matches local markets.",
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+    const lines = rows.slice(0, 30).map(row => {
+      const pct = Number.isFinite(row.confidence) ? (row.confidence * 100).toFixed(0) : "?";
+      const method = row.match_method ?? "unknown";
+      return `• \`${row.ticker}\` → \`${row.gamma_id}\` (${pct}%, ${method})`;
+    });
+    const suffix = rows.length > 30 ? `\n\nShowing 30 of ${rows.length}.` : "";
+    await ctx.reply(`🗺️ *Kalshi Market Mappings*\n\n${lines.join("\n")}${suffix}`, { parse_mode: "Markdown" });
+  }));
+
+  bot.command("drystatus", guard(async ctx => {
+    if (!ipc.connected) { await ctx.reply("🔴 Engine IPC offline."); return; }
+    const res = await ipc.request<DryRunAnalysisResponsePayload>("dry_run.analysis");
+    const p = res.payload;
+    const diagEmoji: Record<string, string> = {
+      paper_viable: "✅",
+      paper_loss: "❌",
+      fill_rate_too_low: "⚠️",
+      no_fills_detected: "🔴",
+      no_data: "⏳",
+    };
+    const emoji = diagEmoji[p.diagnosis] ?? "❓";
+    const fmtMetric = (value: number | null | undefined, decimals: number) =>
+      value == null || !Number.isFinite(value) ? "N/A" : value.toFixed(decimals);
+    await ctx.reply(
+      `🔬 *Dry-Run Status*\n` +
+      `${emoji} Diagnosis: \`${p.diagnosis}\`\n\n` +
+      "```\n" +
+      `Total Signals:    ${p.total_signals ?? 0}\n` +
+      `Persistent:       ${p.persistent_signals ?? 0} (${fmtMetric(p.persistence_pct, 1)}%)\n` +
+      `Paper Trades:     ${p.paper_filled_trades ?? 0} filled\n` +
+      `Missed Fills:     ${p.paper_unfilled_signals ?? 0}\n` +
+      `Fill Rate:        ${fmtMetric(p.paper_fill_rate_pct, 1)}%\n` +
+      `Wins / Losses:    ${p.paper_winning_trades ?? 0} / ${p.paper_losing_trades ?? 0}\n` +
+      `Win Rate:         ${fmtMetric(p.paper_win_rate_pct, 1)}%\n` +
+      `Net P&L:          $${fmtMetric(p.paper_net_pnl, 4)}\n` +
+      `Avg per Trade:    $${fmtMetric(p.paper_avg_pnl_per_trade, 4)}\n` +
+      `Expectancy/Sig:   $${fmtMetric(p.paper_expectancy_per_signal, 4)}\n` +
+      `Profit Factor:    ${fmtMetric(p.paper_profit_factor, 2)}\n` +
+      `Max Drawdown:     $${fmtMetric(p.paper_max_drawdown, 4)}\n` +
+      `Avg Hold:         ${fmtMetric(p.paper_avg_hold_seconds, 0)}s\n` +
       "```",
       { parse_mode: "Markdown" }
     );

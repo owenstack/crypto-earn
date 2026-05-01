@@ -21,14 +21,29 @@ pub const Signal = struct {
 
 pub const StrategyConfig = struct {
     // News repricing
-    news_delta_threshold: f64 = 0.05,
-    news_confidence_min: f64 = 0.3,
-    news_order_size: f64 = 10.0,
+    news_delta_threshold: f64 = 0.06,
+    news_confidence_min: f64 = 0.40,
+
+    /// News order size as fraction of balance. 0.12 on $10 = $1.20.
+    news_order_size_pct: f64 = 0.12,
+    news_order_size_fallback: f64 = 1.20,
+
     // Liquidity provision
-    lp_min_spread: f64 = 0.04,
-    lp_exit_spread: f64 = 0.02,
-    lp_order_size: f64 = 5.0,
+    lp_min_spread: f64 = 0.06,
+    lp_exit_spread: f64 = 0.03,
+
+    /// LP order size as fraction of balance. 0.07 on $10 = $0.70.
+    lp_order_size_pct: f64 = 0.07,
+    lp_order_size_fallback: f64 = 0.70,
 };
+
+/// Resolve a strategy order size from a balance and ratio config.
+/// Floors at $0.50 (Polymarket minimum viable order). Falls back to the
+/// absolute value when no balance is available.
+pub fn resolveOrderSize(balance: f64, pct: f64, fallback: f64) f64 {
+    if (balance <= 0) return fallback;
+    return @max(balance * pct, 0.50);
+}
 
 pub const StrategyStats = struct {
     signals_emitted: u64 = 0,
@@ -124,11 +139,13 @@ pub const StrategyEngine = struct {
 
     /// News repricing evaluator: compare external_prob vs market_mid.
     /// Returns a signal if delta exceeds threshold and confidence passes.
+    /// `balance` is the current USDC balance — used to scale order size.
     pub fn evaluateNewsRepricing(
         self: *StrategyEngine,
         market_id: []const u8,
         external_prob: f64,
         market_mid: f64,
+        balance: f64,
     ) ?Signal {
         if (self.paused.load(.seq_cst)) return null;
         // enable check should live at worker level
@@ -155,13 +172,15 @@ pub const StrategyEngine = struct {
             confidence,
         });
 
+        const order_size = resolveOrderSize(balance, self.config.news_order_size_pct, self.config.news_order_size_fallback);
+
         return Signal{
             .strategy = .news_repricing,
             .market_id = mid,
             .market_id_len = mid_len,
             .direction = direction,
             .price = external_prob,
-            .size = self.config.news_order_size,
+            .size = order_size,
             .confidence = confidence,
             .timestamp = std.time.timestamp(),
             .best_bid = 0.0,
@@ -179,6 +198,7 @@ pub const StrategyEngine = struct {
         market_id: []const u8,
         best_bid: f64,
         best_ask: f64,
+        balance: f64,
     ) LpResult {
         if (self.paused.load(.seq_cst)) return .{ .signals = undefined, .count = 0 };
         const spread = best_ask - best_bid;
@@ -224,6 +244,8 @@ pub const StrategyEngine = struct {
             spread,
         });
 
+        const order_size = resolveOrderSize(balance, self.config.lp_order_size_pct, self.config.lp_order_size_fallback);
+
         return .{
             .signals = .{
                 Signal{
@@ -232,7 +254,7 @@ pub const StrategyEngine = struct {
                     .market_id_len = mid_len,
                     .direction = .buy,
                     .price = bid_price,
-                    .size = self.config.lp_order_size,
+                    .size = order_size,
                     .confidence = confidence,
                     .timestamp = std.time.timestamp(),
                     .best_bid = best_bid,
@@ -244,7 +266,7 @@ pub const StrategyEngine = struct {
                     .market_id_len = mid_len,
                     .direction = .sell,
                     .price = ask_price,
-                    .size = self.config.lp_order_size,
+                    .size = order_size,
                     .confidence = confidence,
                     .timestamp = std.time.timestamp(),
                     .best_bid = best_bid,
@@ -524,7 +546,7 @@ pub const StrategyEngine = struct {
 
         const delta: f64 = if (direction == .buy) fill_size else -fill_size;
 
-        // Find existing entry
+        // Find existing entry first
         for (self.market_inventory[0..self.inventory_count]) |*slot| {
             if (slot.*) |*inv| {
                 if (std.mem.eql(u8, inv.market_id[0..inv.market_id_len], market_id)) {
@@ -533,26 +555,25 @@ pub const StrategyEngine = struct {
                     return;
                 }
             }
-            // Not found, create new entry
-            if (self.inventory_count < MAX_INVENTORY_MARKETS) {
-                var mid: [68]u8 = undefined;
-                const mid_len = @min(market_id.len, 68);
-                @memcpy(mid[0..mid_len], market_id[0..mid_len]);
-
-                self.market_inventory[self.inventory_count] = MarketInventory{
-                    .market_id = mid,
-                    .market_id_len = mid_len,
-                    .net_shares = delta,
-                    .cost_basis = 0.0,
-                };
-                self.inventory_count += 1;
-                log.info("strategy", "inventory created: {s} net_shares={d:.4}", .{ market_id, delta });
-            } else {
-                log.warn("strategy", "cannot create inventory entry: capacity full ({d})", .{MAX_INVENTORY_MARKETS});
-            }
-        } else {
-            log.warn("strategy", "cannot create inventory entry: capacity full ({d})", .{MAX_INVENTORY_MARKETS});
         }
+
+        // Not found, create new entry
+        if (self.inventory_count >= MAX_INVENTORY_MARKETS) {
+            log.warn("strategy", "cannot create inventory entry: capacity full ({d})", .{MAX_INVENTORY_MARKETS});
+            return;
+        }
+        var mid: [68]u8 = undefined;
+        const mid_len = @min(market_id.len, 68);
+        @memcpy(mid[0..mid_len], market_id[0..mid_len]);
+
+        self.market_inventory[self.inventory_count] = MarketInventory{
+            .market_id = mid,
+            .market_id_len = mid_len,
+            .net_shares = delta,
+            .cost_basis = 0.0,
+        };
+        self.inventory_count += 1;
+        log.info("strategy", "inventory created: {s} net_shares={d:.4}", .{ market_id, delta });
     }
 
     /// Get a snapshot of inventory for IPC.

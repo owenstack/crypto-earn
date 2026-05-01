@@ -7,9 +7,26 @@ const ipc = @import("ipc.zig");
 const ipc_types = @import("ipc_types.zig");
 
 pub const RiskConfig = struct {
-    max_position_usd: f64 = 500.0,
-    max_portfolio_exposure_usd: f64 = 5000.0,
-    max_daily_drawdown_usd: f64 = 200.0,
+    // --- Ratio-based limits (scale automatically with balance) ---
+
+    /// Max notional for a single order as a fraction of balance.
+    /// 0.15 on $10 = $1.50 order. On $100 = $15. On $500 = $75.
+    max_position_pct: f64 = 0.15,
+
+    /// Max total open exposure as fraction of balance.
+    /// 0.80 leaves 20% undeployed as buffer for fees and drawdown.
+    max_portfolio_exposure_pct: f64 = 0.80,
+
+    /// Daily loss kill-switch as fraction of balance.
+    /// 0.30 on $10 = halt at -$3. On $100 = halt at -$30.
+    max_daily_drawdown_pct: f64 = 0.30,
+
+    // --- Absolute fallbacks (used only before first balance snapshot) ---
+    max_position_usd_fallback: f64 = 1.50,
+    max_portfolio_exposure_usd_fallback: f64 = 8.0,
+    max_daily_drawdown_usd_fallback: f64 = 3.0,
+
+    // --- Unchanged fields ---
     /// Hard upper bound (safety cap). The *effective* max open orders is
     /// derived from the latest balance snapshot via dynamicMaxOpenOrders().
     /// This static value is only used as a fallback ceiling and when no
@@ -21,10 +38,40 @@ pub const RiskConfig = struct {
     max_balance_commitment_ratio: f64 = 0.70,
     balance_snapshot_max_age_seconds: i64 = 600,
     /// Nominal per-order notional in USD used to compute dynamicMaxOpenOrders
-    /// from balance. Intentionally small (matches default lp/news order size
-    /// of $5–$10) so the dynamic cap scales sensibly with account size.
-    nominal_order_notional_usd: f64 = 5.0,
+    /// from balance. Intentionally small (matches default order sizes) so the
+    /// dynamic cap scales sensibly with account size.
+    nominal_order_notional_usd: f64 = 0.75,
 };
+
+/// Resolved (absolute USD) limits. Computed from the current balance snapshot.
+/// Falls back to the cold-start absolute values when no balance is available.
+pub const ResolvedLimits = struct {
+    max_position_usd: f64,
+    max_portfolio_exposure_usd: f64,
+    max_daily_drawdown_usd: f64,
+};
+
+pub fn resolveLimits(config: RiskConfig, balance: ?f64) ResolvedLimits {
+    const bal = balance orelse {
+        return .{
+            .max_position_usd = config.max_position_usd_fallback,
+            .max_portfolio_exposure_usd = config.max_portfolio_exposure_usd_fallback,
+            .max_daily_drawdown_usd = config.max_daily_drawdown_usd_fallback,
+        };
+    };
+    if (bal <= 0) {
+        return .{
+            .max_position_usd = config.max_position_usd_fallback,
+            .max_portfolio_exposure_usd = config.max_portfolio_exposure_usd_fallback,
+            .max_daily_drawdown_usd = config.max_daily_drawdown_usd_fallback,
+        };
+    }
+    return .{
+        .max_position_usd = bal * config.max_position_pct,
+        .max_portfolio_exposure_usd = bal * config.max_portfolio_exposure_pct,
+        .max_daily_drawdown_usd = bal * config.max_daily_drawdown_pct,
+    };
+}
 
 /// Compute the effective max open orders from the user's USDC balance.
 /// Formula: floor(balance * commitment_ratio / nominal_order_notional).
@@ -106,12 +153,25 @@ pub fn validateOrder(request: OrderRequest, database: *db.DB, config: RiskConfig
     };
     const notional = size * price;
 
-    // Check 1: Max position size
-    if (notional > config.max_position_usd) {
+    // Resolve current balance up-front so all checks reference balance-scaled limits.
+    const balance_opt = database.queryLatestUsdcBalance(config.balance_snapshot_max_age_seconds) catch {
+        const rejection = Rejection{
+            .reason = .db_error,
+            .check_name = "db_query_latest_usdc_balance_failed",
+            .limit_value = 0.0,
+            .actual_value = 0.0,
+        };
+        persistRejection(database, request, rejection);
+        return .{ .reject = rejection };
+    };
+    const limits = resolveLimits(config, balance_opt);
+
+    // Check 1: Max position size (ratio-based, scales with balance)
+    if (notional > limits.max_position_usd) {
         const rejection = Rejection{
             .reason = .max_position_exceeded,
             .check_name = "max_position_usd",
-            .limit_value = config.max_position_usd,
+            .limit_value = limits.max_position_usd,
             .actual_value = notional,
         };
         persistRejection(database, request, rejection);
@@ -129,11 +189,11 @@ pub fn validateOrder(request: OrderRequest, database: *db.DB, config: RiskConfig
         persistRejection(database, request, rejection);
         return .{ .reject = rejection };
     };
-    if (current_exposure + notional > config.max_portfolio_exposure_usd) {
+    if (current_exposure + notional > limits.max_portfolio_exposure_usd) {
         const rejection = Rejection{
             .reason = .max_portfolio_exposure_exceeded,
             .check_name = "max_portfolio_exposure_usd",
-            .limit_value = config.max_portfolio_exposure_usd,
+            .limit_value = limits.max_portfolio_exposure_usd,
             .actual_value = current_exposure + notional,
         };
         persistRejection(database, request, rejection);
@@ -141,16 +201,6 @@ pub fn validateOrder(request: OrderRequest, database: *db.DB, config: RiskConfig
     }
 
     // Check 2b: Balance commitment ratio (only when balance snapshots are available)
-    const balance_opt = database.queryLatestUsdcBalance(config.balance_snapshot_max_age_seconds) catch {
-        const rejection = Rejection{
-            .reason = .db_error,
-            .check_name = "db_query_latest_usdc_balance_failed",
-            .limit_value = 0.0,
-            .actual_value = 0.0,
-        };
-        persistRejection(database, request, rejection);
-        return .{ .reject = rejection };
-    };
     if (balance_opt) |usdc_balance| {
         if (usdc_balance <= 0) {
             const rejection = Rejection{
@@ -186,11 +236,11 @@ pub fn validateOrder(request: OrderRequest, database: *db.DB, config: RiskConfig
         persistRejection(database, request, rejection);
         return .{ .reject = rejection };
     };
-    if (daily_loss < 0 and @abs(daily_loss) >= config.max_daily_drawdown_usd) {
+    if (daily_loss < 0 and @abs(daily_loss) >= limits.max_daily_drawdown_usd) {
         const rejection = Rejection{
             .reason = .max_daily_drawdown_exceeded,
             .check_name = "max_daily_drawdown_usd",
-            .limit_value = config.max_daily_drawdown_usd,
+            .limit_value = limits.max_daily_drawdown_usd,
             .actual_value = @abs(daily_loss),
         };
         persistRejection(database, request, rejection);

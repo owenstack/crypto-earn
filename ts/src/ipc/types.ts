@@ -26,7 +26,8 @@ export type RequestMessageType =
   | "pnl.query"
   | "dry_run.analysis"
   | "reconcile.status"
-  | "config.validate";
+  | "config.validate"
+  | "kalshi.mappings";
 
 export type ResponseMessageType =
   | "heartbeat.response"
@@ -59,7 +60,8 @@ export type ResponseMessageType =
   | "pnl.response"
   | "dry_run.analysis.response"
   | "reconcile.status.response"
-  | "config.validate.response";
+  | "config.validate.response"
+  | "kalshi.mappings.response";
 
 export type EventMessageType =
   | "event.order.placed"
@@ -429,6 +431,18 @@ export interface ConfigValidateResponsePayload {
   prob_source_poll_seconds: { valid: boolean; value: string };
   prob_source_market_id_field: { valid: boolean; value: string };
   prob_source_probability_field: { valid: boolean; value: string };
+}
+
+export interface KalshiMappingInfo {
+  ticker: string;
+  gamma_id: string;
+  confidence: number;
+  match_method: string;
+  updated_at: number;
+}
+
+export interface KalshiMappingsResponsePayload {
+  mappings: KalshiMappingInfo[];
 }
 
 /** Build a request envelope with a random correlation ID. */

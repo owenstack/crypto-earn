@@ -281,15 +281,10 @@ pub const ProbabilityProvider = struct {
             };
 
             var market_id_buf: [64]u8 = undefined;
-            const market_id = self.queryKalshiMappedMarketId(ticker, &market_id_buf) orelse
-                self.resolveMarketId(slug, title, subtitle, &market_id_buf) orelse {
+            const market_id = self.resolveKalshiTicker(ticker, slug, title, subtitle, &market_id_buf) orelse {
                 skip_no_market += 1;
                 continue;
             };
-
-            if (self.kalshi) |kws| {
-                kws.upsertAutoMapping(ticker, market_id);
-            }
 
             acc[acc_count.*] = self.buildEstimate(market_id, probability, 0.85, "kalshi_rest", now);
             acc_count.* += 1;
@@ -430,6 +425,70 @@ pub const ProbabilityProvider = struct {
         return null;
     }
 
+    /// Three-tier Kalshi ticker resolver:
+    ///   1. DB-persisted mapping from `kalshi_market_map` (highest confidence,
+    ///      survives restarts).
+    ///   2. In-memory auto-mapping seeded by the live Kalshi WS during the
+    ///      current session.
+    ///   3. Fuzzy match against the local `markets` table by slug/title/subtitle.
+    /// On a successful tier-3 match, the result is persisted to both the DB
+    /// and the in-memory map so subsequent lookups are O(1).
+    fn resolveKalshiTicker(
+        self: *ProbabilityProvider,
+        ticker: []const u8,
+        slug: ?[]const u8,
+        title: ?[]const u8,
+        subtitle: ?[]const u8,
+        out: *[64]u8,
+    ) ?[]const u8 {
+        // Tier 1: DB-persisted mapping
+        if (self.database.lookupKalshiMapping(ticker, out)) |id| return id;
+
+        // Tier 2: In-memory auto-map seeded during current session
+        if (self.kalshi) |kws| {
+            kws.mu.lock();
+            for (0..kws.auto_map_count) |i| {
+                const t = kws.auto_map_tickers[i][0..kws.auto_map_ticker_lens[i]];
+                if (std.mem.eql(u8, t, ticker)) {
+                    const len = kws.auto_map_market_id_lens[i];
+                    @memcpy(out[0..len], kws.auto_map_market_ids[i][0..len]);
+                    kws.mu.unlock();
+                    return out[0..len];
+                }
+            }
+            kws.mu.unlock();
+        }
+
+        // Tier 3: Fuzzy match against markets table
+        if (slug) |s| {
+            if (self.queryMarketIdBySymbol(s, out)) |id| {
+                self.database.upsertKalshiMapping(ticker, id, 0.90, "slug_match") catch {};
+                if (self.kalshi) |kws| kws.upsertAutoMapping(ticker, id);
+                return id;
+            }
+        }
+        if (title) |t| {
+            if (self.queryMarketIdByQuestion(t, out)) |id| {
+                self.database.upsertKalshiMapping(ticker, id, 0.75, "title_match") catch {};
+                if (self.kalshi) |kws| kws.upsertAutoMapping(ticker, id);
+                return id;
+            }
+        }
+        if (subtitle) |s| {
+            if (self.queryMarketIdByQuestion(s, out)) |id| {
+                self.database.upsertKalshiMapping(ticker, id, 0.60, "subtitle_match") catch {};
+                if (self.kalshi) |kws| kws.upsertAutoMapping(ticker, id);
+                return id;
+            }
+        }
+
+        return null;
+    }
+
+    /// Backward-compat: legacy runtime-config based lookup. Retained so an
+    /// operator can still pin specific tickers via the `kalshi_market_map`
+    /// runtime_config key as a manual override (no longer required for
+    /// normal operation).
     fn queryKalshiMappedMarketId(self: *ProbabilityProvider, ticker: []const u8, out: *[64]u8) ?[]const u8 {
         var map_buf: [4096]u8 = undefined;
         const market_map = self.database.getConfig("kalshi_market_map", &map_buf) orelse return null;

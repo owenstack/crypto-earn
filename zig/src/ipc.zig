@@ -167,6 +167,7 @@ const DispatchKind = enum {
     pause,
     pnl_query,
     config_validate,
+    kalshi_mappings,
     reconcile_status,
     inventory_snapshot,
     dry_run_analysis,
@@ -199,6 +200,7 @@ const DISPATCH_TABLE = [_]DispatchEntry{
     .{ .msg_type = types.T.pnl_query, .kind = .pnl_query },
     .{ .msg_type = types.T.reconcile_status, .kind = .reconcile_status },
     .{ .msg_type = types.T.config_validate, .kind = .config_validate },
+    .{ .msg_type = types.T.kalshi_mappings, .kind = .kalshi_mappings },
     .{ .msg_type = types.T.inventory_snapshot, .kind = .inventory_snapshot },
     .{ .msg_type = types.T.dry_run_analysis, .kind = .dry_run_analysis },
 };
@@ -287,6 +289,7 @@ fn dispatch(ctx: *Context, line: []const u8, writer: anytype, stream: std.net.St
         .pnl_query => try handlePnlQuery(ctx, req_id, root, writer),
         .reconcile_status => try handleReconcileStatus(req_id, writer),
         .config_validate => try handleConfigValidate(ctx, req_id, writer),
+        .kalshi_mappings => try handleKalshiMappings(ctx, req_id, writer),
         .inventory_snapshot => try handleInventorySnapshot(ctx, req_id, writer),
         .dry_run_analysis => try handleDryRunAnalysis(ctx, req_id, writer),
     }
@@ -648,6 +651,37 @@ fn handleConfigValidate(ctx: *Context, req_id: []const u8, writer: anytype) !voi
     defer ctx.allocator.free(result);
 
     try types.writeResponse(writer, req_id, types.T.config_validate_response, result);
+}
+
+fn handleKalshiMappings(ctx: *Context, req_id: []const u8, writer: anytype) !void {
+    const rows = ctx.database.getAllKalshiMappings(ctx.allocator) catch {
+        try types.writeError(writer, req_id, "kalshi mappings query failed");
+        return;
+    };
+    defer ctx.allocator.free(rows);
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(ctx.allocator);
+    var w = payload.writer(ctx.allocator);
+    try w.writeAll("{\"mappings\":[");
+    for (rows, 0..) |row, i| {
+        if (i > 0) try w.writeByte(',');
+        const row_json = std.json.Stringify.valueAlloc(ctx.allocator, .{
+            .ticker = row.ticker_buf[0..row.ticker_len],
+            .gamma_id = row.gamma_id_buf[0..row.gamma_id_len],
+            .confidence = row.confidence,
+            .match_method = row.match_method_buf[0..row.match_method_len],
+            .updated_at = row.updated_at,
+        }, .{}) catch {
+            try types.writeError(writer, req_id, "kalshi mappings serialization failed");
+            return;
+        };
+        defer ctx.allocator.free(row_json);
+        try w.writeAll(row_json);
+    }
+    try w.writeAll("]}");
+
+    try types.writeResponse(writer, req_id, types.T.kalshi_mappings_response, payload.items);
 }
 
 fn handleInventorySnapshot(ctx: *Context, req_id: []const u8, writer: anytype) !void {

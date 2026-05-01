@@ -149,8 +149,11 @@ pub fn main() !void {
     }
     log.info("engine", "stale order ticker started", .{});
 
-    // Initialize fill poller
-    var fp = fill_poller.FillPoller.init(allocator, &database, &om, &pt);
+    // Initialize strategy engine early so the fill poller can be wired with it.
+    var se = strategy.StrategyEngine.init(.{});
+
+    // Initialize fill poller (with strategy engine reference for inventory + LP pair cancel)
+    var fp = fill_poller.FillPoller.init(allocator, &database, &om, &pt, &se);
     log.info("engine", "fill poller ready", .{});
 
     // Run startup reconciliation (blocking, before strategy worker)
@@ -202,19 +205,33 @@ pub fn main() !void {
     }
     log.info("engine", "probability provider started", .{});
 
-    // Initialize strategy engine
-    var se = strategy.StrategyEngine.init(.{});
+    // Strategy engine was initialized earlier (above fill poller). Now load
+    // its runtime config and resolve lp_max_position_usd.
 
-    // Load lp_max_position_usd from runtime_config
+    // Load lp_max_position_usd from runtime_config; if absent, fall back to a
+    // ratio of current balance (20%) so a small account doesn't get blown by
+    // the legacy $50 default.
     {
         var lp_buf: [32]u8 = undefined;
-        if (database.getConfig("lp_max_position_usd", &lp_buf)) |val| {
+        const explicit = database.getConfig("lp_max_position_usd", &lp_buf);
+        if (explicit) |val| {
             if (std.fmt.parseFloat(f64, val)) |v| {
                 se.lp_max_position_usd = v;
                 log.info("engine", "lp_max_position_usd={d:.2}", .{v});
             } else |_| {
                 log.warn("engine", "invalid lp_max_position_usd in runtime_config: {s}", .{val});
             }
+        } else {
+            // No explicit override → derive from balance using a ratio
+            // (default 20%, configurable via lp_max_position_usd_pct).
+            var pct_buf: [16]u8 = undefined;
+            const pct_str = database.getConfig("lp_max_position_usd_pct", &pct_buf) orelse "0.20";
+            const pct = std.fmt.parseFloat(f64, pct_str) catch 0.20;
+            const bal = pt.usdc_balance;
+            se.lp_max_position_usd = if (bal > 0) bal * pct else 2.0;
+            log.info("engine", "lp_max_position_usd derived from balance: ${d:.2} (pct={d:.2}, balance=${d:.2})", .{
+                se.lp_max_position_usd, pct, bal,
+            });
         }
     }
     log.info("engine", "strategy engine ready", .{});
@@ -303,6 +320,8 @@ const StrategyWorkerCtx = struct {
     /// Counter ticking 5s per increment; used to throttle balance/stats DB
     /// inserts so they happen ~1/min instead of every 5s.
     persist_tick: u64 = 0,
+    /// Counter for dry-run fill simulation (every ~30s when in dry-run).
+    sim_tick: u64 = 0,
 };
 
 /// Strategy worker: periodically evaluates enabled strategies and dispatches signals.
@@ -340,6 +359,14 @@ fn strategyWorker(ctx: *StrategyWorkerCtx) void {
             persistStrategyStats(ctx);
             persistBalanceSnapshot(ctx);
         }
+
+        // Dry-run fill simulation (~every 30s = 6 × 5s eval interval).
+        if (ctx.dry_run) {
+            ctx.sim_tick +%= 1;
+            if (ctx.sim_tick % 6 == 0) {
+                simulateDryRunFills(ctx);
+            }
+        }
     }
 
     log.info("strategy_worker", "strategy evaluation loop stopped", .{});
@@ -359,7 +386,7 @@ fn evaluateNewsSignals(ctx: *StrategyWorkerCtx) void {
         const mid = queryLastMidByAsset(ctx.database, yes_token_id) orelse continue;
         const implied_prob = priceToImpliedProb(mid);
 
-        if (ctx.se.evaluateNewsRepricing(market_id, est.probability, implied_prob)) |signal| {
+        if (ctx.se.evaluateNewsRepricing(market_id, est.probability, implied_prob, ctx.pt.usdc_balance)) |signal| {
             dispatchSignal(ctx, signal);
         }
 
@@ -378,6 +405,12 @@ fn evaluateNewsSignals(ctx: *StrategyWorkerCtx) void {
 }
 
 fn evaluateLpSignals(ctx: *StrategyWorkerCtx) void {
+    // Read cooldown from runtime_config; default 15s, clamp 5–300s.
+    var cd_buf: [16]u8 = undefined;
+    const cd_str = ctx.database.getConfig("lp_cooldown_seconds", &cd_buf) orelse "15";
+    const cooldown_s = std.fmt.parseInt(i64, cd_str, 10) catch 15;
+    const cooldown = std.math.clamp(cooldown_s, @as(i64, 5), @as(i64, 300));
+
     // Get the most recent bid/ask per market from the last 30 seconds, using gamma_id as the market identifier
     const sql = "SELECT gamma_id, best_bid, best_ask FROM orderbooks WHERE gamma_id IS NOT NULL AND id IN (SELECT MAX(id) FROM orderbooks WHERE created_at >= unixepoch() - 30 AND gamma_id IS NOT NULL GROUP BY gamma_id);" ++ &[_:0]u8{};
     var stmt: ?*db.c.sqlite3_stmt = null;
@@ -395,15 +428,142 @@ fn evaluateLpSignals(ctx: *StrategyWorkerCtx) void {
         const best_bid = std.fmt.parseFloat(f64, bid_span) catch continue;
         const best_ask = std.fmt.parseFloat(f64, ask_span) catch continue;
 
-        // Per-market cooldown: skip if we signaled this market within the last 60 seconds
-        if (ctx.se.checkLpCooldown(gid_span, 60)) continue;
+        // Per-market cooldown: configurable via runtime_config.lp_cooldown_seconds.
+        if (ctx.se.checkLpCooldown(gid_span, cooldown)) continue;
 
         // Pass gamma_id (Gamma market id) so placeOrder receives a Gamma id
-        const lp_result = ctx.se.evaluateLiquidityProvision(gid_span, best_bid, best_ask);
-        for (lp_result.signals[0..lp_result.count]) |signal| {
-            dispatchSignal(ctx, signal);
+        const lp_result = ctx.se.evaluateLiquidityProvision(gid_span, best_bid, best_ask, ctx.pt.usdc_balance);
+        if (lp_result.count == 2) {
+            dispatchLpPair(ctx, lp_result.signals[0], lp_result.signals[1]);
+        } else {
+            for (lp_result.signals[0..lp_result.count]) |signal| {
+                dispatchSignal(ctx, signal);
+            }
         }
     }
+}
+
+/// Query the latest orderbook (best bid/ask + mid) for a Gamma market id.
+fn queryOrderbookForMarket(database: *db.DB, market_id: []const u8) ?struct {
+    best_bid: f64,
+    best_ask: f64,
+    mid_price: f64,
+} {
+    const sql = "SELECT best_bid, best_ask, mid_price FROM orderbooks WHERE gamma_id=? ORDER BY created_at DESC LIMIT 1;" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    if (db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) != db.c.SQLITE_OK) return null;
+    defer _ = db.c.sqlite3_finalize(stmt);
+    if (db.c.sqlite3_bind_text(stmt, 1, market_id.ptr, @intCast(market_id.len), null) != db.c.SQLITE_OK) return null;
+    if (db.c.sqlite3_step(stmt) != db.c.SQLITE_ROW) return null;
+
+    const bid_raw = db.c.sqlite3_column_text(stmt, 0);
+    const ask_raw = db.c.sqlite3_column_text(stmt, 1);
+    const bid_span = if (bid_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else return null;
+    const ask_span = if (ask_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else return null;
+
+    const bid = std.fmt.parseFloat(f64, bid_span) catch return null;
+    const ask = std.fmt.parseFloat(f64, ask_span) catch return null;
+    const mid = db.c.sqlite3_column_double(stmt, 2);
+
+    return .{ .best_bid = bid, .best_ask = ask, .mid_price = mid };
+}
+
+/// Settle open dry-run orders against current orderbook prices.
+/// Buy fills if ask <= signal_price; sell fills if bid >= signal_price.
+/// Orders older than 30 minutes are expired. After settlements, the simulated
+/// USDC balance is updated so risk gate / dynamic limits track P&L exactly
+/// like the live engine.
+fn simulateDryRunFills(ctx: *StrategyWorkerCtx) void {
+    var orders: [64]db.DB.DryRunOrderRow = [_]db.DB.DryRunOrderRow{.{}} ** 64;
+    const count = ctx.database.getOpenDryRunOrders(&orders) catch return;
+    if (count == 0) return;
+
+    const now = std.time.timestamp();
+    const fee_bps: f64 = 2.0; // 2bps per side, matches taker fee config
+
+    var any_settled = false;
+
+    for (orders[0..count]) |order| {
+        const oid = order.id();
+        const mid = order.marketId();
+        const dir = order.direction();
+        const is_buy = std.mem.eql(u8, dir, "buy");
+
+        // Expire orders older than 30 minutes.
+        if (now - order.created_at > 1800) {
+            ctx.database.settleDryRunOrder(oid, "expired", 0, 0, 0) catch {};
+            any_settled = true;
+            continue;
+        }
+
+        const ob = queryOrderbookForMarket(ctx.database, mid) orelse continue;
+
+        const fills = if (is_buy)
+            ob.best_ask <= order.signal_price
+        else
+            ob.best_bid >= order.signal_price;
+
+        if (!fills) continue;
+
+        const fill_price = if (is_buy) ob.best_ask else ob.best_bid;
+        const notional = fill_price * order.size;
+        // Fees: entry + exit, charged at fee_bps each side.
+        const fees = notional * (fee_bps / 10000.0) * 2.0;
+
+        // Mark-to-mid P&L (conservative — assumes immediate exit at mid).
+        const pnl_gross = if (is_buy)
+            (ob.mid_price - fill_price) * order.size
+        else
+            (fill_price - ob.mid_price) * order.size;
+        const pnl_net = pnl_gross - fees;
+
+        ctx.database.settleDryRunOrder(oid, "filled", fill_price, pnl_net, fees) catch {};
+        any_settled = true;
+
+        log.info("dry_run", "FILL [{s}] {s} {d:.4} -> pnl={d:.4} fees={d:.4}", .{
+            oid[0..@min(oid.len, 24)], dir, fill_price, pnl_net, fees,
+        });
+    }
+
+    if (any_settled) {
+        updateDryRunBalance(ctx);
+    }
+}
+
+/// After dry-run fills settle, sum filled-order P&L and write a fresh balance
+/// snapshot. This makes /balance, the risk gate, and dynamic order-size
+/// limits all reflect simulated profitability so dry-run mirrors live exactly.
+fn updateDryRunBalance(ctx: *StrategyWorkerCtx) void {
+    const sql = "SELECT COALESCE(SUM(pnl), 0.0), COALESCE(SUM(fees), 0.0) FROM dry_run_orders WHERE status='filled';" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    if (db.c.sqlite3_prepare_v2(ctx.database.handle, sql.ptr, -1, &stmt, null) != db.c.SQLITE_OK) return;
+    defer _ = db.c.sqlite3_finalize(stmt);
+    if (db.c.sqlite3_step(stmt) != db.c.SQLITE_ROW) return;
+
+    const cumulative_pnl = db.c.sqlite3_column_double(stmt, 0);
+    const cumulative_fees = db.c.sqlite3_column_double(stmt, 1);
+    _ = cumulative_fees; // cumulative_pnl is already net of fees.
+
+    // Initial seeded balance (from DRY_RUN_INITIAL_BALANCE or default).
+    const initial_balance = if (std.posix.getenv("DRY_RUN_INITIAL_BALANCE")) |v|
+        std.fmt.parseFloat(f64, v) catch 10.0
+    else
+        10.0;
+
+    const simulated_balance = initial_balance + cumulative_pnl;
+
+    ctx.database.insertBalanceSnapshot(
+        simulated_balance,
+        0.0,
+        0.0,
+        cumulative_pnl,
+    ) catch |e| {
+        log.warn("dry_run", "failed to write simulated balance snapshot: {s}", .{@errorName(e)});
+        return;
+    };
+
+    // Resync portfolio tracker so in-memory balance reflects the new snapshot.
+    ctx.pt.syncFromDB();
 }
 
 fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
@@ -418,18 +578,22 @@ fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
         const dr_mid = if (dr_bid != null and dr_ask != null) (dr_bid.? + dr_ask.?) / 2.0 else signal.price;
         const dr_delta = @abs(signal.price - dr_mid);
 
-        log.info("dry_run", "signal: market={s} strategy={s} dir={s} price={d:.4} size={d:.2} delta={d:.4} conf={d:.4} bid={d:.4} ask={d:.4}", .{
-            dr_market_id,
-            @tagName(signal.strategy),
+        // Generate a deterministic-ish fake order ID
+        var id_buf: [64]u8 = undefined;
+        const id_market_slice = dr_market_id[0..@min(dr_market_id.len, 8)];
+        const dr_order_id = std.fmt.bufPrint(&id_buf, "dry-{s}-{d}", .{ id_market_slice, std.time.milliTimestamp() }) catch "dry-unknown";
+
+        log.info("dry_run", "[{s}] {s} {s} x{d:.2} @ {d:.4} | conf={d:.2} delta={d:.4}", .{
+            dr_order_id[0..@min(dr_order_id.len, 24)],
             dr_side,
-            signal.price,
+            id_market_slice,
             signal.size,
-            dr_delta,
+            signal.price,
             signal.confidence,
-            dr_bid orelse 0.0,
-            dr_ask orelse 0.0,
+            dr_delta,
         });
 
+        // Existing analytics table (keeps backwards-compat for analyzeDryRunSignals).
         ctx.database.insertDryRunSignal(
             dr_market_id,
             @tagName(signal.strategy),
@@ -443,6 +607,19 @@ fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
             dr_ask,
         ) catch |e| {
             log.err("dry_run", "failed to persist dry-run signal: {s}", .{@errorName(e)});
+        };
+
+        // New: lifecycle order tracking. simulateDryRunFills will settle these
+        // against live orderbook prices in the strategy worker loop.
+        ctx.database.insertDryRunOrder(
+            dr_order_id,
+            dr_market_id,
+            @tagName(signal.strategy),
+            dr_side,
+            signal.price,
+            signal.size,
+        ) catch |e| {
+            log.err("dry_run", "failed to insert dry_run_order: {s}", .{@errorName(e)});
         };
         return;
     }
@@ -464,10 +641,28 @@ fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
     // Clamp to valid Polymarket price range (0.01 to 0.99)
     const clamped_price = std.math.clamp(rounded_price, 0.01, 0.99);
 
+    // Optional runtime override: hard cap on order notional (USD).
+    // Allows `/config set max_order_size_usd 5.00` to throttle orders during
+    // volatile periods without a restart. Applied as a notional cap on the
+    // size used for this order.
+    var effective_size: f64 = signal.size;
+    {
+        var cap_buf: [16]u8 = undefined;
+        const cap_str_opt = ctx.database.getConfig("max_order_size_usd", &cap_buf);
+        if (cap_str_opt) |cap_str| {
+            if (std.fmt.parseFloat(f64, cap_str)) |cap_usd| {
+                if (clamped_price > 0) {
+                    const cap_size = cap_usd / clamped_price;
+                    if (effective_size > cap_size) effective_size = cap_size;
+                }
+            } else |_| {}
+        }
+    }
+
     var price_buf: [32]u8 = undefined;
     const price_str = std.fmt.bufPrint(&price_buf, "{d:.2}", .{clamped_price}) catch "0";
     var size_buf: [32]u8 = undefined;
-    const size_str = std.fmt.bufPrint(&size_buf, "{d:.2}", .{signal.size}) catch "0";
+    const size_str = std.fmt.bufPrint(&size_buf, "{d:.2}", .{effective_size}) catch "0";
 
     const origin = @tagName(signal.strategy);
 
@@ -512,6 +707,116 @@ fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
             ctx.se.incrementOrdersRejected(signal.strategy);
         },
     }
+}
+
+/// Dispatch a paired LP buy+sell signal, placing both legs and linking them
+/// so a fill on one cancels the other (handled in fill_poller). Falls back
+/// to dispatchSignal individually for dry-run.
+fn dispatchLpPair(ctx: *StrategyWorkerCtx, buy_signal: strategy.Signal, sell_signal: strategy.Signal) void {
+    if (ctx.dry_run) {
+        dispatchSignal(ctx, buy_signal);
+        dispatchSignal(ctx, sell_signal);
+        return;
+    }
+
+    if (ctx.om.isHalted()) return;
+    if (checkSaturation(ctx)) return;
+
+    const tick: f64 = 0.01;
+
+    const buy_market_id = buy_signal.market_id[0..buy_signal.market_id_len];
+    const sell_market_id = sell_signal.market_id[0..sell_signal.market_id_len];
+
+    // Apply the same runtime cap as dispatchSignal to both legs.
+    var cap_size_usd: ?f64 = null;
+    {
+        var cap_buf: [16]u8 = undefined;
+        if (ctx.database.getConfig("max_order_size_usd", &cap_buf)) |cap_str| {
+            if (std.fmt.parseFloat(f64, cap_str)) |cap_usd| {
+                cap_size_usd = cap_usd;
+            } else |_| {}
+        }
+    }
+
+    const buy_price = std.math.clamp(@round(buy_signal.price / tick) * tick, 0.01, 0.99);
+    const sell_price = std.math.clamp(@round(sell_signal.price / tick) * tick, 0.01, 0.99);
+
+    var buy_size = buy_signal.size;
+    var sell_size = sell_signal.size;
+    if (cap_size_usd) |cap_usd| {
+        if (buy_price > 0) {
+            const cap = cap_usd / buy_price;
+            if (buy_size > cap) buy_size = cap;
+        }
+        if (sell_price > 0) {
+            const cap = cap_usd / sell_price;
+            if (sell_size > cap) sell_size = cap;
+        }
+    }
+
+    var buy_price_buf: [32]u8 = undefined;
+    var sell_price_buf: [32]u8 = undefined;
+    var buy_size_buf: [32]u8 = undefined;
+    var sell_size_buf: [32]u8 = undefined;
+
+    const buy_price_str = std.fmt.bufPrint(&buy_price_buf, "{d:.2}", .{buy_price}) catch "0";
+    const sell_price_str = std.fmt.bufPrint(&sell_price_buf, "{d:.2}", .{sell_price}) catch "0";
+    const buy_size_str = std.fmt.bufPrint(&buy_size_buf, "{d:.2}", .{buy_size}) catch "0";
+    const sell_size_str = std.fmt.bufPrint(&sell_size_buf, "{d:.2}", .{sell_size}) catch "0";
+
+    const origin = "liquidity_provision";
+
+    // Place buy leg
+    const buy_result = ctx.om.placeOrder(buy_market_id, "buy", buy_size_str, buy_price_str, "limit", origin);
+    // Place sell leg
+    const sell_result = ctx.om.placeOrder(sell_market_id, "sell", sell_size_str, sell_price_str, "limit", origin);
+
+    var buy_tracked = false;
+    var sell_tracked = false;
+
+    if (buy_result == .success) {
+        buy_tracked = ctx.se.trackOrder(buy_result.success.order_id, buy_market_id, .liquidity_provision, .buy, buy_signal.price);
+        if (buy_tracked) {
+            ctx.se.incrementOrdersAccepted(.liquidity_provision);
+            ctx.database.insertStrategySignal(buy_market_id, origin, buy_signal.confidence, "") catch {};
+        } else {
+            ctx.se.incrementOrdersRejected(.liquidity_provision);
+            log.err("strategy_worker", "lp_pair: failed to track buy leg, attempting cancel: {s}", .{buy_result.success.order_id});
+            _ = ctx.om.cancelOrder(buy_result.success.order_id);
+        }
+    } else {
+        ctx.se.incrementOrdersRejected(.liquidity_provision);
+    }
+
+    if (sell_result == .success) {
+        sell_tracked = ctx.se.trackOrder(sell_result.success.order_id, sell_market_id, .liquidity_provision, .sell, sell_signal.price);
+        if (sell_tracked) {
+            ctx.se.incrementOrdersAccepted(.liquidity_provision);
+            ctx.database.insertStrategySignal(sell_market_id, origin, sell_signal.confidence, "") catch {};
+        } else {
+            ctx.se.incrementOrdersRejected(.liquidity_provision);
+            log.err("strategy_worker", "lp_pair: failed to track sell leg, attempting cancel: {s}", .{sell_result.success.order_id});
+            _ = ctx.om.cancelOrder(sell_result.success.order_id);
+        }
+    } else {
+        ctx.se.incrementOrdersRejected(.liquidity_provision);
+    }
+
+    // Link the two tracked orders so a fill on one triggers cancel of the other.
+    if (buy_tracked and sell_tracked) {
+        if (ctx.se.findOrderIndex(buy_result.success.order_id)) |bi| {
+            if (ctx.se.findOrderIndex(sell_result.success.order_id)) |si| {
+                ctx.se.linkPair(bi, si);
+                log.info("strategy_worker", "lp_pair linked: buy={s} sell={s}", .{
+                    buy_result.success.order_id, sell_result.success.order_id,
+                });
+            }
+        }
+    }
+
+    // Free heap-owned order IDs returned by placeOrder.
+    if (buy_result == .success) ctx.om.allocator.free(buy_result.success.order_id);
+    if (sell_result == .success) ctx.om.allocator.free(sell_result.success.order_id);
 }
 
 /// Returns true if the engine is at capacity (max open orders OR balance
@@ -646,6 +951,7 @@ fn persistBalanceSnapshot(ctx: *StrategyWorkerCtx) void {
         snap.unrealized_pnl,
         snap.realized_pnl_today,
     ) catch {};
+    ctx.pt.markBalanceDirty();
 }
 
 fn queryLastMid(database: *db.DB, market_id: []const u8) ?f64 {

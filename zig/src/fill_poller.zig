@@ -8,6 +8,7 @@ const http = @import("http_client.zig");
 const poly_auth = @import("polymarket_auth.zig");
 const order_mgr = @import("order_manager.zig");
 const portfolio = @import("portfolio_tracker.zig");
+const strategy = @import("strategy_engine.zig");
 const ipc = @import("ipc.zig");
 const ipc_types = @import("ipc_types.zig");
 const ws_lib = @import("websocket");
@@ -68,6 +69,7 @@ pub const FillPoller = struct {
     database: *db_mod.DB,
     om: *order_mgr.OrderManager,
     pt: *portfolio.PortfolioTracker,
+    se: ?*strategy.StrategyEngine,
     should_stop: std.atomic.Value(bool),
     ws_connected: std.atomic.Value(bool),
     ws_disconnect_ts: std.atomic.Value(i64),
@@ -84,12 +86,14 @@ pub const FillPoller = struct {
         database: *db_mod.DB,
         om: *order_mgr.OrderManager,
         pt: *portfolio.PortfolioTracker,
+        se: ?*strategy.StrategyEngine,
     ) FillPoller {
         return .{
             .allocator = allocator,
             .database = database,
             .om = om,
             .pt = pt,
+            .se = se,
             .should_stop = std.atomic.Value(bool).init(false),
             .ws_connected = std.atomic.Value(bool).init(false),
             .ws_disconnect_ts = std.atomic.Value(i64).init(0),
@@ -97,6 +101,38 @@ pub const FillPoller = struct {
             .consecutive_http_failures = 0,
             .circuit_breaker_until = 0,
         };
+    }
+
+    /// Shared fill-confirmation handler called from both REST and WebSocket
+    /// fill paths so inventory + paired-order cancel logic is never duplicated.
+    fn onFillConfirmed(
+        self: *FillPoller,
+        order_id: []const u8,
+        market_id: []const u8,
+        direction: []const u8,
+        fill_size_f: f64,
+        is_fully_filled: bool,
+    ) void {
+        const se = self.se orelse return;
+
+        // Update per-market inventory regardless of fill type.
+        const dir: strategy.SignalDirection = if (std.mem.eql(u8, direction, "buy"))
+            .buy
+        else
+            .sell;
+        se.updateInventory(market_id, dir, fill_size_f);
+
+        // On full fill, cancel the paired LP order (if any) and untrack both.
+        if (is_fully_filled) {
+            if (se.findPairedOrder(order_id)) |paired_id| {
+                if (self.om.cancelOrder(paired_id)) {
+                    se.untrackOrder(paired_id);
+                    se.incrementCancels(.liquidity_provision);
+                    log.info("fill_poller", "cancelled LP pair: {s}", .{paired_id});
+                }
+            }
+            se.untrackOrder(order_id);
+        }
     }
 
     pub fn stop(self: *FillPoller) void {
@@ -339,6 +375,18 @@ pub const FillPoller = struct {
                 self.database.updateOrderFillStatus(oid, new_status, size_matched, fill_price) catch |e| {
                     log.err("fill_poller", "failed to update fill status: {s}", .{@errorName(e)});
                 };
+
+                var side_lower_buf: [8]u8 = undefined;
+                var side_lower: []const u8 = side;
+                if (side.len > 0 and side.len <= side_lower_buf.len) {
+                    for (side, 0..) |ch, si| {
+                        side_lower_buf[si] = std.ascii.toLower(ch);
+                    }
+                    side_lower = side_lower_buf[0..side.len];
+                }
+
+                // Notify strategy engine: update inventory + cancel paired LP order
+                self.onFillConfirmed(oid, mid, side_lower, new_f - prev_f, is_fully_filled);
 
                 // Compute realized PnL for the event
                 var pnl_buf: [32]u8 = undefined;
@@ -584,6 +632,7 @@ pub const FillPoller = struct {
             // Resolve market_id (Gamma id) from condition_id
             var gamma_id_buf: [128]u8 = undefined;
             var gamma_id: []const u8 = market_str;
+            // Will be re-set after lookup; declared here so onFillConfirmed sees Gamma id below.
             if (market_str.len > 0) {
                 const lookup_sql = "SELECT id FROM markets WHERE condition_id=? LIMIT 1;" ++ &[_:0]u8{};
                 var lookup_stmt: ?*c.sqlite3_stmt = null;
@@ -612,6 +661,9 @@ pub const FillPoller = struct {
                 }
                 side_lower = side_lower_buf[0..side_str.len];
             }
+
+            // Notify strategy engine: update inventory + cancel paired LP order
+            self.onFillConfirmed(order_id, gamma_id, side_lower, fill_delta, is_fully_filled);
 
             var pnl_buf: [32]u8 = undefined;
             const pnl_str = std.fmt.bufPrint(&pnl_buf, "{d:.2}", .{self.pt.realized_pnl_today}) catch "0.00";

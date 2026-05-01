@@ -41,8 +41,18 @@ pub const PortfolioTracker = struct {
     usdc_balance: f64,
     realized_pnl_today: f64,
     last_sync_ts: i64,
+    /// Set when persistBalanceSnapshot writes a fresh balance row. syncFromDB
+    /// re-queries balance_snapshots only when this flag is set or the cache
+    /// is older than 5 minutes.
+    balance_dirty: bool,
+    /// Timestamp of the last balance_snapshots query inside syncFromDB.
+    balance_cache_ts: i64,
 
     const MAX_POSITIONS = 100;
+    /// Minimum interval between full syncFromDB calls inside processFill.
+    /// Hot paths (WS + REST fill paths) call processFill on every fill;
+    /// running a full SQL sync on each one is unnecessary churn.
+    const FULL_SYNC_MIN_INTERVAL_S: i64 = 60;
 
     pub fn init(allocator: std.mem.Allocator, database: *db_mod.DB, fee_config: FeeConfig) PortfolioTracker {
         var tracker = PortfolioTracker{
@@ -54,9 +64,81 @@ pub const PortfolioTracker = struct {
             .usdc_balance = 0.0,
             .realized_pnl_today = 0.0,
             .last_sync_ts = 0,
+            .balance_dirty = true,
+            .balance_cache_ts = 0,
         };
         tracker.syncFromDB();
         return tracker;
+    }
+
+    /// Mark the balance cache as dirty so the next syncFromDB re-queries
+    /// balance_snapshots. Call this after persistBalanceSnapshot.
+    pub fn markBalanceDirty(self: *PortfolioTracker) void {
+        self.balance_dirty = true;
+    }
+
+    /// In-memory targeted update for a fill. Avoids a full SQL re-sync on
+    /// every fill — `processFill` calls this and only escalates to a full
+    /// `syncFromDB` once per FULL_SYNC_MIN_INTERVAL_S.
+    pub fn applyFillDelta(
+        self: *PortfolioTracker,
+        market_id: []const u8,
+        fill_size: f64,
+        fill_price: f64,
+        side: []const u8,
+    ) void {
+        const fill_side = fillSideToPositionSide(side);
+
+        // Update an existing in-memory position if one matches the market.
+        for (self.positions[0..self.position_count]) |*pos| {
+            if (!std.mem.eql(u8, pos.market_id[0..pos.market_id_len], market_id)) continue;
+
+            const pos_side = normalizePositionSide(pos.side[0..pos.side_len]);
+            if (std.mem.eql(u8, pos_side, fill_side)) {
+                const new_size = pos.size + fill_size;
+                if (new_size > 0.0) {
+                    pos.entry_price = ((pos.entry_price * pos.size) + (fill_price * fill_size)) / new_size;
+                    pos.size = new_size;
+                    setPositionSide(pos, fill_side);
+                }
+            } else {
+                pos.size = @max(pos.size - fill_size, 0.0);
+                if (pos.size == 0.0) {
+                    pos.side = [_]u8{0} ** 8;
+                    pos.side_len = 0;
+                    pos.entry_price = 0.0;
+                }
+            }
+
+            pos.current_price = fill_price;
+            pos.unrealized_pnl = calculateUnrealizedPnl(pos.*);
+            return;
+        }
+
+        // No matching position: this is an opening fill. Add a new entry.
+        if (self.position_count >= MAX_POSITIONS) {
+            log.warn("portfolio", "applyFillDelta: position cache full, deferring to syncFromDB", .{});
+            return;
+        }
+
+        var pos = Position{
+            .market_id = [_]u8{0} ** 64,
+            .market_id_len = 0,
+            .side = [_]u8{0} ** 8,
+            .side_len = 0,
+            .size = fill_size,
+            .entry_price = fill_price,
+            .current_price = fill_price,
+            .unrealized_pnl = 0.0,
+        };
+        const mid_n = @min(market_id.len, pos.market_id.len);
+        @memcpy(pos.market_id[0..mid_n], market_id[0..mid_n]);
+        pos.market_id_len = mid_n;
+
+        setPositionSide(&pos, fill_side);
+
+        self.positions[self.position_count] = pos;
+        self.position_count += 1;
     }
 
     /// Sync in-memory state from SQLite (called on startup and recovery).
@@ -145,17 +227,23 @@ pub const PortfolioTracker = struct {
         }
 
         const bal_sql = "SELECT usdc_balance FROM balance_snapshots ORDER BY snapshot_at DESC, id DESC LIMIT 1;" ++ &[_:0]u8{};
-        var bal_stmt: ?*c.sqlite3_stmt = null;
-        const bal_rc = c.sqlite3_prepare_v2(self.database.handle, bal_sql.ptr, -1, &bal_stmt, null);
-        if (bal_rc == c.SQLITE_OK) {
-            defer _ = c.sqlite3_finalize(bal_stmt);
-            if (c.sqlite3_step(bal_stmt) == c.SQLITE_ROW) {
-                const bal_raw = c.sqlite3_column_text(bal_stmt, 0);
-                const bal_txt: [*c]const u8 = @ptrCast(bal_raw orelse @as([*c]const u8, "0"));
-                self.usdc_balance = std.fmt.parseFloat(f64, std.mem.span(bal_txt)) catch 0.0;
+        const now_ts = std.time.timestamp();
+        const balance_stale = (now_ts - self.balance_cache_ts) > 300;
+        if (self.balance_dirty or balance_stale) {
+            var bal_stmt: ?*c.sqlite3_stmt = null;
+            const bal_rc = c.sqlite3_prepare_v2(self.database.handle, bal_sql.ptr, -1, &bal_stmt, null);
+            if (bal_rc == c.SQLITE_OK) {
+                defer _ = c.sqlite3_finalize(bal_stmt);
+                if (c.sqlite3_step(bal_stmt) == c.SQLITE_ROW) {
+                    const bal_raw = c.sqlite3_column_text(bal_stmt, 0);
+                    const bal_txt: [*c]const u8 = @ptrCast(bal_raw orelse @as([*c]const u8, "0"));
+                    self.usdc_balance = std.fmt.parseFloat(f64, std.mem.span(bal_txt)) catch 0.0;
+                }
+            } else {
+                log.warn("portfolio", "failed to prepare balance snapshot query: rc={d}", .{bal_rc});
             }
-        } else {
-            log.warn("portfolio", "failed to prepare balance snapshot query: rc={d}", .{bal_rc});
+            self.balance_dirty = false;
+            self.balance_cache_ts = now_ts;
         }
 
         self.last_sync_ts = std.time.timestamp();
@@ -202,17 +290,55 @@ pub const PortfolioTracker = struct {
         var fee_buf: [32]u8 = undefined;
         const fee_str = std.fmt.bufPrint(&fee_buf, "{d:.6}", .{fee}) catch "0";
 
-        // Persist fill
+        // Persist fill (write-only; no read).
         self.database.insertFill(fill_id, order_id, fill_size, fill_price, fee_str) catch |e| {
             log.err("portfolio", "failed to persist fill: {any}", .{e});
         };
+
+        // Targeted in-memory update so /portfolio reflects the fill immediately.
+        // Look up market_id/side from the order row.
+        var market_buf: [128]u8 = undefined;
+        var market_id_str: []const u8 = "";
+        var side_buf: [8]u8 = undefined;
+        var side_str: []const u8 = "";
+        {
+            const sql = "SELECT market_id, side FROM orders WHERE id=? LIMIT 1;" ++ &[_:0]u8{};
+            var stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) == c.SQLITE_OK) {
+                defer _ = c.sqlite3_finalize(stmt);
+                if (c.sqlite3_bind_text(stmt, 1, order_id.ptr, @intCast(order_id.len), null) == c.SQLITE_OK) {
+                    if (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+                        if (c.sqlite3_column_text(stmt, 0)) |p| {
+                            const s = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+                            const n = @min(s.len, market_buf.len);
+                            @memcpy(market_buf[0..n], s[0..n]);
+                            market_id_str = market_buf[0..n];
+                        }
+                        if (c.sqlite3_column_text(stmt, 1)) |p| {
+                            const s = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+                            const n = @min(s.len, side_buf.len);
+                            @memcpy(side_buf[0..n], s[0..n]);
+                            side_str = side_buf[0..n];
+                        }
+                    }
+                }
+            }
+        }
+
+        if (market_id_str.len > 0) {
+            self.applyFillDelta(market_id_str, size_f, price_f, side_str);
+        }
 
         log.info("portfolio", "fill processed: order={s} size={s} price={s} fee={s}", .{
             order_id, fill_size, fill_price, fee_str,
         });
 
-        // Re-sync from DB to pick up latest state
-        self.syncFromDB();
+        // Full SQL sync only if we haven't synced recently. The targeted
+        // delta above is sufficient between full syncs.
+        const now = std.time.timestamp();
+        if (now - self.last_sync_ts > FULL_SYNC_MIN_INTERVAL_S) {
+            self.syncFromDB();
+        }
     }
 
     fn computeRealizedPnlForFill(
@@ -380,6 +506,27 @@ pub const PortfolioTracker = struct {
         return fbs.getWritten();
     }
 };
+
+fn fillSideToPositionSide(side: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(side, "buy")) return "long";
+    if (std.ascii.eqlIgnoreCase(side, "sell")) return "short";
+    return side;
+}
+
+fn normalizePositionSide(side: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(side, "buy")) return "long";
+    if (std.ascii.eqlIgnoreCase(side, "sell")) return "short";
+    if (std.ascii.eqlIgnoreCase(side, "long")) return "long";
+    if (std.ascii.eqlIgnoreCase(side, "short")) return "short";
+    return side;
+}
+
+fn setPositionSide(pos: *Position, side: []const u8) void {
+    pos.side = [_]u8{0} ** 8;
+    const side_n = @min(side.len, pos.side.len);
+    @memcpy(pos.side[0..side_n], side[0..side_n]);
+    pos.side_len = side_n;
+}
 
 /// Calculate unrealized PnL for a position.
 /// For long: (current_price - entry_price) × size

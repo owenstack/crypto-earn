@@ -86,6 +86,41 @@ const MIGRATION_009 =
     \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(9);
 ;
 
+/// Embedded migration: Kalshi auto-mapping persistence + dry-run order
+/// lifecycle tracking + LP cooldown / position pct defaults.
+const MIGRATION_010 =
+    \\CREATE TABLE IF NOT EXISTS kalshi_market_map(
+    \\  ticker TEXT PRIMARY KEY,
+    \\  gamma_id TEXT NOT NULL,
+    \\  confidence REAL NOT NULL DEFAULT 0.0,
+    \\  match_method TEXT NOT NULL DEFAULT 'auto',
+    \\  created_at INTEGER NOT NULL DEFAULT(unixepoch()),
+    \\  updated_at INTEGER NOT NULL DEFAULT(unixepoch())
+    \\);
+    \\CREATE INDEX IF NOT EXISTS idx_kalshi_map_gamma ON kalshi_market_map(gamma_id);
+    \\CREATE TABLE IF NOT EXISTS dry_run_orders(
+    \\  id TEXT PRIMARY KEY,
+    \\  market_id TEXT NOT NULL,
+    \\  strategy TEXT NOT NULL,
+    \\  direction TEXT NOT NULL,
+    \\  signal_price REAL NOT NULL,
+    \\  size REAL NOT NULL,
+    \\  status TEXT NOT NULL DEFAULT 'open',
+    \\  fill_price REAL,
+    \\  fill_ts INTEGER,
+    \\  pnl REAL,
+    \\  fees REAL,
+    \\  created_at INTEGER NOT NULL DEFAULT(unixepoch()),
+    \\  updated_at INTEGER NOT NULL DEFAULT(unixepoch())
+    \\);
+    \\CREATE INDEX IF NOT EXISTS idx_dry_run_orders_status  ON dry_run_orders(status);
+    \\CREATE INDEX IF NOT EXISTS idx_dry_run_orders_market  ON dry_run_orders(market_id, status);
+    \\CREATE INDEX IF NOT EXISTS idx_dry_run_orders_created ON dry_run_orders(created_at DESC);
+    \\INSERT OR IGNORE INTO runtime_config(key,value) VALUES('lp_cooldown_seconds','15');
+    \\INSERT OR IGNORE INTO runtime_config(key,value) VALUES('lp_max_position_usd_pct','0.20');
+    \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(10);
+;
+
 pub const DB = struct {
     handle: *c.sqlite3,
 
@@ -339,6 +374,10 @@ pub const DB = struct {
         if (!self.migrationApplied(9)) {
             log.info("db", "applying migration 009", .{});
             try self.execZ(MIGRATION_009 ++ &[_:0]u8{});
+        }
+        if (!self.migrationApplied(10)) {
+            log.info("db", "applying migration 010", .{});
+            try self.execZ(MIGRATION_010 ++ &[_:0]u8{});
         }
         log.info("db", "migrations complete", .{});
     }
@@ -1367,5 +1406,237 @@ pub const DB = struct {
             .mark_price = fallback_fill_price,
             .used_fallback = true,
         };
+    }
+
+    // -------------------------------------------------------------------
+    // Kalshi market map persistence (migration 010)
+    // -------------------------------------------------------------------
+
+    /// Insert or update a Kalshi ticker → Polymarket Gamma id mapping.
+    pub fn upsertKalshiMapping(
+        self: DB,
+        ticker: []const u8,
+        gamma_id: []const u8,
+        confidence: f64,
+        method: []const u8,
+    ) !void {
+        const sql =
+            "INSERT INTO kalshi_market_map(ticker,gamma_id,confidence,match_method,updated_at) " ++
+            "VALUES(?,?,?,?,unixepoch()) " ++
+            "ON CONFLICT(ticker) DO UPDATE SET gamma_id=excluded.gamma_id," ++
+            "confidence=excluded.confidence,match_method=excluded.match_method,updated_at=excluded.updated_at;" ++
+            &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, ticker.ptr, @intCast(ticker.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 2, gamma_id.ptr, @intCast(gamma_id.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 3, confidence) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 4, method.ptr, @intCast(method.len), null) != c.SQLITE_OK)
+        {
+            return error.DBExecFailed;
+        }
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DBExecFailed;
+    }
+
+    /// Look up a Kalshi ticker → Gamma id mapping. Returns the slice into `buf`.
+    pub fn lookupKalshiMapping(self: DB, ticker: []const u8, buf: []u8) ?[]const u8 {
+        const sql = "SELECT gamma_id FROM kalshi_market_map WHERE ticker=? LIMIT 1;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return null;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_text(stmt, 1, ticker.ptr, @intCast(ticker.len), null) != c.SQLITE_OK) return null;
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        const raw_ptr = c.sqlite3_column_text(stmt, 0);
+        const raw = if (raw_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else return null;
+        if (raw.len > buf.len) return null;
+        @memcpy(buf[0..raw.len], raw);
+        return buf[0..raw.len];
+    }
+
+    pub const KalshiMapRow = struct {
+        ticker_buf: [64]u8 = [_]u8{0} ** 64,
+        ticker_len: usize = 0,
+        gamma_id_buf: [64]u8 = [_]u8{0} ** 64,
+        gamma_id_len: usize = 0,
+        confidence: f64 = 0.0,
+        match_method_buf: [32]u8 = [_]u8{0} ** 32,
+        match_method_len: usize = 0,
+        updated_at: i64 = 0,
+    };
+
+    /// Return all Kalshi mappings sorted by ticker. Caller owns the returned slice.
+    pub fn getAllKalshiMappings(self: DB, alloc: std.mem.Allocator) ![]KalshiMapRow {
+        const sql = "SELECT ticker,gamma_id,confidence,match_method,updated_at FROM kalshi_market_map ORDER BY ticker;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        var list: std.ArrayList(KalshiMapRow) = .empty;
+        errdefer list.deinit(alloc);
+
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            var row: KalshiMapRow = .{};
+
+            if (c.sqlite3_column_text(stmt, 0)) |p| {
+                const s = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+                const n = @min(s.len, row.ticker_buf.len);
+                @memcpy(row.ticker_buf[0..n], s[0..n]);
+                row.ticker_len = n;
+            }
+            if (c.sqlite3_column_text(stmt, 1)) |p| {
+                const s = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+                const n = @min(s.len, row.gamma_id_buf.len);
+                @memcpy(row.gamma_id_buf[0..n], s[0..n]);
+                row.gamma_id_len = n;
+            }
+            row.confidence = c.sqlite3_column_double(stmt, 2);
+            if (c.sqlite3_column_text(stmt, 3)) |p| {
+                const s = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+                const n = @min(s.len, row.match_method_buf.len);
+                @memcpy(row.match_method_buf[0..n], s[0..n]);
+                row.match_method_len = n;
+            }
+            row.updated_at = c.sqlite3_column_int64(stmt, 4);
+
+            try list.append(alloc, row);
+        }
+
+        return list.toOwnedSlice(alloc);
+    }
+
+    // -------------------------------------------------------------------
+    // Dry-run order lifecycle (migration 010)
+    // -------------------------------------------------------------------
+
+    pub const DryRunOrderRow = struct {
+        id_buf: [64]u8 = [_]u8{0} ** 64,
+        id_len: usize = 0,
+        market_id_buf: [128]u8 = [_]u8{0} ** 128,
+        market_id_len: usize = 0,
+        strategy_buf: [32]u8 = [_]u8{0} ** 32,
+        strategy_len: usize = 0,
+        direction_buf: [8]u8 = [_]u8{0} ** 8,
+        direction_len: usize = 0,
+        signal_price: f64 = 0.0,
+        size: f64 = 0.0,
+        created_at: i64 = 0,
+
+        pub fn id(self: *const DryRunOrderRow) []const u8 {
+            return self.id_buf[0..self.id_len];
+        }
+        pub fn marketId(self: *const DryRunOrderRow) []const u8 {
+            return self.market_id_buf[0..self.market_id_len];
+        }
+        pub fn strategy(self: *const DryRunOrderRow) []const u8 {
+            return self.strategy_buf[0..self.strategy_len];
+        }
+        pub fn direction(self: *const DryRunOrderRow) []const u8 {
+            return self.direction_buf[0..self.direction_len];
+        }
+    };
+
+    pub fn insertDryRunOrder(
+        self: DB,
+        id: []const u8,
+        market_id: []const u8,
+        strategy_name: []const u8,
+        direction: []const u8,
+        signal_price: f64,
+        size: f64,
+    ) !void {
+        const sql =
+            "INSERT INTO dry_run_orders(id,market_id,strategy,direction,signal_price,size) " ++
+            "VALUES(?,?,?,?,?,?);" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 2, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 3, strategy_name.ptr, @intCast(strategy_name.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 4, direction.ptr, @intCast(direction.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 5, signal_price) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 6, size) != c.SQLITE_OK)
+        {
+            return error.DBExecFailed;
+        }
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DBExecFailed;
+    }
+
+    pub fn settleDryRunOrder(
+        self: DB,
+        id: []const u8,
+        status: []const u8,
+        fill_price: f64,
+        pnl: f64,
+        fees: f64,
+    ) !void {
+        const sql =
+            "UPDATE dry_run_orders SET status=?,fill_price=?,fill_ts=unixepoch(),pnl=?,fees=?,updated_at=unixepoch() WHERE id=?;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, status.ptr, @intCast(status.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 2, fill_price) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 3, pnl) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 4, fees) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 5, id.ptr, @intCast(id.len), null) != c.SQLITE_OK)
+        {
+            return error.DBExecFailed;
+        }
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DBExecFailed;
+    }
+
+    /// Fill the provided buffer with up to out.len open dry_run_orders rows.
+    pub fn getOpenDryRunOrders(self: DB, out: []DryRunOrderRow) !usize {
+        const sql =
+            "SELECT id,market_id,strategy,direction,signal_price,size,created_at FROM dry_run_orders WHERE status='open' ORDER BY created_at ASC LIMIT ?;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_int(stmt, 1, @intCast(out.len)) != c.SQLITE_OK) return error.DBExecFailed;
+
+        var count: usize = 0;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW and count < out.len) {
+            var row: DryRunOrderRow = .{};
+            if (c.sqlite3_column_text(stmt, 0)) |p| {
+                const s = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+                const n = @min(s.len, row.id_buf.len);
+                @memcpy(row.id_buf[0..n], s[0..n]);
+                row.id_len = n;
+            }
+            if (c.sqlite3_column_text(stmt, 1)) |p| {
+                const s = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+                const n = @min(s.len, row.market_id_buf.len);
+                @memcpy(row.market_id_buf[0..n], s[0..n]);
+                row.market_id_len = n;
+            }
+            if (c.sqlite3_column_text(stmt, 2)) |p| {
+                const s = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+                const n = @min(s.len, row.strategy_buf.len);
+                @memcpy(row.strategy_buf[0..n], s[0..n]);
+                row.strategy_len = n;
+            }
+            if (c.sqlite3_column_text(stmt, 3)) |p| {
+                const s = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+                const n = @min(s.len, row.direction_buf.len);
+                @memcpy(row.direction_buf[0..n], s[0..n]);
+                row.direction_len = n;
+            }
+            row.signal_price = c.sqlite3_column_double(stmt, 4);
+            row.size = c.sqlite3_column_double(stmt, 5);
+            row.created_at = c.sqlite3_column_int64(stmt, 6);
+
+            out[count] = row;
+            count += 1;
+        }
+        return count;
     }
 };

@@ -473,9 +473,9 @@ test "risk_gate: passes valid order under all limits" {
     try database.runMigrations();
 
     const config = risk_gate.RiskConfig{
-        .max_position_usd = 500.0,
-        .max_portfolio_exposure_usd = 5000.0,
-        .max_daily_drawdown_usd = 200.0,
+        .max_position_usd_fallback = 500.0,
+        .max_portfolio_exposure_usd_fallback = 5000.0,
+        .max_daily_drawdown_usd_fallback = 200.0,
         .max_open_orders = 20,
         .allow_duplicate_positions = false,
     };
@@ -499,7 +499,7 @@ test "risk_gate: rejects order exceeding max position" {
     try database.runMigrations();
 
     const config = risk_gate.RiskConfig{
-        .max_position_usd = 100.0,
+        .max_position_usd_fallback = 100.0,
     };
 
     const request = risk_gate.OrderRequest{
@@ -527,7 +527,7 @@ test "risk_gate: rejects above max position boundary" {
     try database.runMigrations();
 
     const config = risk_gate.RiskConfig{
-        .max_position_usd = 250.0,
+        .max_position_usd_fallback = 250.0,
     };
 
     // Notional = 500 * 0.55 = 275 > 250
@@ -554,6 +554,8 @@ test "risk_gate: rejects when max open orders reached" {
 
     // Insert max_open_orders pending orders
     const config = risk_gate.RiskConfig{
+        .max_position_usd_fallback = 500.0,
+        .max_portfolio_exposure_usd_fallback = 5000.0,
         .max_open_orders = 2,
     };
 
@@ -588,6 +590,8 @@ test "risk_gate: rejects duplicate position" {
     try database.execZ("INSERT INTO positions(id,market_id,side,size,entry_price,status) VALUES('p1','m1','long','10','0.50','open');");
 
     const config = risk_gate.RiskConfig{
+        .max_position_usd_fallback = 500.0,
+        .max_portfolio_exposure_usd_fallback = 5000.0,
         .allow_duplicate_positions = false,
     };
 
@@ -619,6 +623,8 @@ test "risk_gate: allows duplicate when configured" {
     try database.execZ("INSERT INTO positions(id,market_id,side,size,entry_price,status) VALUES('p1','m1','long','10','0.50','open');");
 
     const config = risk_gate.RiskConfig{
+        .max_position_usd_fallback = 500.0,
+        .max_portfolio_exposure_usd_fallback = 5000.0,
         .allow_duplicate_positions = true,
     };
 
@@ -823,11 +829,11 @@ test "strategy_engine: news repricing triggers on sufficient delta" {
     var se = strategy_engine.StrategyEngine.init(.{
         .news_delta_threshold = 0.05,
         .news_confidence_min = 0.3,
-        .news_order_size = 10.0,
+        .news_order_size_fallback = 10.0,
     });
 
     // Delta = |0.70 - 0.50| = 0.20, well above threshold
-    const signal = se.evaluateNewsRepricing("test-market", 0.70, 0.50);
+    const signal = se.evaluateNewsRepricing("test-market", 0.70, 0.50, 0.0);
     try testing.expect(signal != null);
     const s = signal.?;
     try testing.expectEqual(strategy_engine.StrategyName.news_repricing, s.strategy);
@@ -845,7 +851,7 @@ test "strategy_engine: news repricing returns null when delta below threshold" {
     });
 
     // Delta = |0.52 - 0.50| = 0.02, below threshold
-    const signal = se.evaluateNewsRepricing("test-market", 0.52, 0.50);
+    const signal = se.evaluateNewsRepricing("test-market", 0.52, 0.50, 0.0);
     try testing.expect(signal == null);
     try testing.expectEqual(@as(u64, 0), se.news_stats.signals_emitted);
 }
@@ -857,7 +863,7 @@ test "strategy_engine: news repricing sell direction" {
     });
 
     // external_prob < market_mid => sell signal
-    const signal = se.evaluateNewsRepricing("test-market", 0.30, 0.50);
+    const signal = se.evaluateNewsRepricing("test-market", 0.30, 0.50, 0.0);
     try testing.expect(signal != null);
     try testing.expectEqual(strategy_engine.SignalDirection.sell, signal.?.direction);
 }
@@ -869,12 +875,12 @@ test "strategy_engine: news repricing confidence bounds" {
     });
 
     // Delta = 0.30 => confidence = min(1.0, 0.30/0.2) = 1.0 (capped)
-    const sig1 = se.evaluateNewsRepricing("m1", 0.80, 0.50);
+    const sig1 = se.evaluateNewsRepricing("m1", 0.80, 0.50, 0.0);
     try testing.expect(sig1 != null);
     try testing.expectEqual(@as(f64, 1.0), sig1.?.confidence);
 
     // Delta = 0.05 => confidence = min(1.0, 0.05/0.2) = 0.25
-    const sig2 = se.evaluateNewsRepricing("m2", 0.55, 0.50);
+    const sig2 = se.evaluateNewsRepricing("m2", 0.55, 0.50, 0.0);
     try testing.expect(sig2 != null);
     try testing.expectApproxEqAbs(@as(f64, 0.25), sig2.?.confidence, 1e-9);
 }
@@ -882,11 +888,11 @@ test "strategy_engine: news repricing confidence bounds" {
 test "strategy_engine: LP emits paired signals when spread wide" {
     var se = strategy_engine.StrategyEngine.init(.{
         .lp_min_spread = 0.04,
-        .lp_order_size = 5.0,
+        .lp_order_size_fallback = 5.0,
     });
 
     // Spread = 0.60 - 0.40 = 0.20, well above min_spread
-    const result = se.evaluateLiquidityProvision("test-market", 0.40, 0.60);
+    const result = se.evaluateLiquidityProvision("test-market", 0.40, 0.60, 0.0);
     try testing.expectEqual(@as(u8, 2), result.count);
     try testing.expectEqual(strategy_engine.SignalDirection.buy, result.signals[0].direction);
     try testing.expectEqual(strategy_engine.SignalDirection.sell, result.signals[1].direction);
@@ -904,7 +910,7 @@ test "strategy_engine: LP returns no signals when spread narrow" {
     });
 
     // Spread = 0.51 - 0.49 = 0.02, below min_spread
-    const result = se.evaluateLiquidityProvision("test-market", 0.49, 0.51);
+    const result = se.evaluateLiquidityProvision("test-market", 0.49, 0.51, 0.0);
     try testing.expectEqual(@as(u8, 0), result.count);
     try testing.expectEqual(@as(u64, 0), se.lp_stats.signals_emitted);
 }
@@ -981,7 +987,7 @@ test "strategy_engine: halt suppresses evaluation gating" {
     });
 
     // When not enabled, evaluator still produces signals (enable check is at worker level)
-    const signal = se.evaluateNewsRepricing("m1", 0.70, 0.50);
+    const signal = se.evaluateNewsRepricing("m1", 0.70, 0.50, 0.0);
     try testing.expect(signal != null);
 
     // isEnabled returns false by default
@@ -997,7 +1003,7 @@ test "strategy_engine: stats tracking" {
     try testing.expectEqual(@as(u64, 0), ns.orders_accepted);
 
     // After signals
-    _ = se.evaluateNewsRepricing("m1", 0.80, 0.50);
+    _ = se.evaluateNewsRepricing("m1", 0.80, 0.50, 0.0);
     const ns2 = se.getStats(.news_repricing);
     try testing.expectEqual(@as(u64, 1), ns2.signals_emitted);
 }
@@ -1303,7 +1309,7 @@ test "db: analyzeDryRunSignals reports paper trade metrics" {
     // Sell signal that gets filled and later exits at a loss.
     try database.insertDryRunSignal("m2", "liquidity_provision", "sell", 0.60, 10.0, 0.06, 0.75, 200, 0.59, 0.61);
     try database.insertDryRunSignal("m2", "liquidity_provision", "sell", 0.62, 10.0, 0.05, 0.70, 240, 0.61, 0.63);
-    try database.insertDryRunSignal("m2", "liquidity_provision", "sell", 0.67, 10.0, 0.03, 0.65, 500, 0.66, 0.68);
+    try database.insertDryRunSignal("m2", "liquidity_provision", "sell", 0.67, 10.0, 0.03, 0.65, 500, 0.61, 0.73);
 
     var buf: [4096]u8 = undefined;
     const json = try database.analyzeDryRunSignals(&buf);
@@ -1360,20 +1366,20 @@ test "strategy_engine: paused state blocks signal generation" {
     });
 
     // Not paused — signals generated
-    const signal1 = se.evaluateNewsRepricing("m1", 0.80, 0.50);
+    const signal1 = se.evaluateNewsRepricing("m1", 0.80, 0.50, 0.0);
     try testing.expect(signal1 != null);
 
     // Pause — no signals
     se.paused.store(true, .seq_cst);
-    const signal2 = se.evaluateNewsRepricing("m1", 0.80, 0.50);
+    const signal2 = se.evaluateNewsRepricing("m1", 0.80, 0.50, 0.0);
     try testing.expect(signal2 == null);
 
-    const lp = se.evaluateLiquidityProvision("m1", 0.40, 0.60);
+    const lp = se.evaluateLiquidityProvision("m1", 0.40, 0.60, 0.0);
     try testing.expectEqual(@as(usize, 0), lp.count);
 
     // Unpause — signals resume
     se.paused.store(false, .seq_cst);
-    const signal3 = se.evaluateNewsRepricing("m1", 0.80, 0.50);
+    const signal3 = se.evaluateNewsRepricing("m1", 0.80, 0.50, 0.0);
     try testing.expect(signal3 != null);
 }
 
@@ -1668,7 +1674,7 @@ test "fill_poller: circuit-breaker fields initialized to zero" {
     var om = order_manager.OrderManager.init(testing.allocator, &database, .{}, .{});
     var pt = portfolio_tracker.PortfolioTracker.init(testing.allocator, &database, .{});
 
-    const fp = fill_poller.FillPoller.init(testing.allocator, &database, &om, &pt);
+    const fp = fill_poller.FillPoller.init(testing.allocator, &database, &om, &pt, null);
     try testing.expectEqual(@as(u32, 0), fp.consecutive_http_failures);
     try testing.expectEqual(@as(i64, 0), fp.circuit_breaker_until);
 }

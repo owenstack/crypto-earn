@@ -65,12 +65,19 @@ Required keys in `.env`:
 - `DASHBOARD_SECRET`: Bearer token used to protect dashboard API routes.
   - Generate with: `openssl rand -hex 32`
   - Example: `d43b6fd9a0a81b7e5f6be4a6bd3d2f0e9f0c0ad4c08371d4d4f3d4a2df922e15`
+- `POLYMARKET_PRIVATE_KEY`: Polymarket wallet private key used by the engine for live order signing.
 
 Optional/common keys:
 
+- `KALSHI_API_KEY` (strongly recommended for primary probability data)
 - `DASHBOARD_PORT` (default: `3000`)
 - `LOG_LEVEL` (example: `info`)
-- `NODE_ENV` (example: `development`)
+- `NODE_ENV` (example: `production`)
+- `DRY_RUN_INITIAL_BALANCE` (default: `10.0`)
+
+Optional overrides:
+
+- `kalshi_market_map`: legacy runtime config override for manually pinning Kalshi tickers to Gamma IDs when auto-discovery is wrong.
 
 ## Quick Start (Docker — recommended)
 
@@ -152,10 +159,49 @@ Envelope:
 
 ## Market Data Transport
 
-- Native WebSocket upgrade support is not yet implemented in the Zig client.
-- Current runtime behavior uses REST polling fallback for market updates.
+Real-time CLOB price feeds are delivered via WebSocket to
+`ws-subscriptions-clob.polymarket.com`. Token IDs are subscribed dynamically
+as markets are discovered by the scanner. New markets are subscribed without
+reconnecting via dynamic subscription messages on the live socket.
 
 Supported types (Phase 0): `heartbeat`, `status`, `portfolio`, `orders`, `config.get`, `logs`.
+
+## Kalshi Integration
+
+The engine automatically maps Kalshi tickers to Polymarket markets using a
+three-tier resolution strategy:
+
+1. DB-persisted map: previously discovered mappings that survive restarts.
+2. Runtime auto-map: mappings discovered during the current session.
+3. Title fuzzy-match: normalized matching against market questions in SQLite.
+
+No manual configuration is required. Discovered mappings are written to the
+`kalshi_market_map` table and can be inspected with `/mappings` in Telegram.
+The optional `kalshi_market_map` runtime config key still works as a manual
+override for edge cases.
+
+## Runtime Tuning
+
+All values below can be changed live with `/config set <key> <value>`.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `lp_cooldown_seconds` | 15 | Seconds between LP signals per market |
+| `lp_max_position_usd_pct` | 0.20 | LP max exposure as fraction of balance |
+| `max_order_size_usd` | unset | Hard cap on any single order |
+| `prob_source_poll_seconds` | 60 | Kalshi REST poll interval |
+| `kalshi_series_tickers` | unset | Comma-separated Kalshi series to focus on |
+| `kalshi_api_key` | unset | Required for Kalshi WS primary source |
+
+## Dry-Run Mode
+
+Set `DRY_RUN=1` in `.env` to run without placing real orders.
+
+In dry-run mode the engine generates real signals against live market data,
+simulates fills from live bid/ask prices, tracks order lifecycle in
+`dry_run_orders`, updates a virtual USDC balance in `balance_snapshots`, and
+applies the same risk gate against that virtual balance. Use `/drystatus` in
+Telegram for the go/no-go summary before live deployment.
 
 ## Verification
 

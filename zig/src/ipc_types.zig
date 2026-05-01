@@ -94,6 +94,8 @@ pub const T = struct {
     pub const pnl_response = "pnl.response";
     pub const config_validate = "config.validate";
     pub const config_validate_response = "config.validate.response";
+    pub const kalshi_mappings = "kalshi.mappings";
+    pub const kalshi_mappings_response = "kalshi.mappings.response";
 
     // Dry-run analysis
     pub const dry_run_analysis = "dry_run.analysis";
