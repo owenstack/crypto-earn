@@ -153,6 +153,7 @@ export function createBot(ipc: IPCClient): Bot {
       "/config — get or set config\n" +
       "/mappings — Kalshi market mappings\n" +
       "/drystatus — dry-run analysis\n" +
+      "/livestatus — live trading status\n" +
       "/trade — place an order\n" +
       "/cancel — cancel an order\n" +
       "/strategy — manage strategies\n" +
@@ -264,6 +265,82 @@ export function createBot(ipc: IPCClient): Bot {
       "```",
       { parse_mode: "Markdown" }
     );
+  }));
+
+  bot.command("livestatus", guard(async ctx => {
+    if (!ipc.connected) { await ctx.reply("🔴 Engine IPC offline."); return; }
+
+    const [
+      statusResult,
+      portfolioResult,
+      ordersResult,
+      strategyResult,
+      pnlResult,
+      reconcileResult,
+      mappingsResult,
+    ] = await Promise.allSettled([
+      ipc.request<StatusPayload>("status"),
+      ipc.request<PortfolioPayload>("portfolio"),
+      ipc.request<OrdersPayload>("orders"),
+      ipc.request<StrategyListResponsePayload>("strategy.list"),
+      ipc.request<{ window: PnlWindow }, PnlResponsePayload>("pnl.query", { window: "today" }),
+      ipc.request("reconcile.status"),
+      ipc.request<KalshiMappingsResponsePayload>("kalshi.mappings"),
+    ]);
+
+    const value = <T,>(result: PromiseSettledResult<Envelope<T>>): T | undefined =>
+      result.status === "fulfilled" ? result.value.payload : undefined;
+
+    const status = value(statusResult);
+    const portfolio = value(portfolioResult);
+    const orders = value(ordersResult);
+    const strategies = value(strategyResult);
+    const pnl = value(pnlResult);
+    const reconcile = value(reconcileResult) as { status?: string } | undefined;
+    const mappings = value(mappingsResult);
+
+    const n = (raw: unknown, decimals = 2): string => {
+      const num = typeof raw === "string" ? Number(raw) : Number(raw ?? NaN);
+      return Number.isFinite(num) ? num.toFixed(decimals) : "N/A";
+    };
+    const count = (arr: unknown[] | undefined): number => Array.isArray(arr) ? arr.length : 0;
+    const mode = Bun.env.DRY_RUN === "1" || Bun.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE";
+
+    const strategyLines = strategies?.strategies?.length
+      ? strategies.strategies.map(s => {
+        const name = s.name === "news_repricing" ? "News" : s.name === "liquidity_provision" ? "LP" : s.name;
+        return `${name.padEnd(6)} ${s.enabled ? "on " : "off"} sig=${s.stats.signals_emitted} ok=${s.stats.orders_accepted} rej=${s.stats.orders_rejected}`;
+      })
+      : ["Strategies unavailable"];
+
+    const orderRows = (orders?.orders ?? []).slice(0, 3).map((order: any) => {
+      const id = String(order.id ?? order.order_id ?? "?");
+      const side = String(order.side ?? "?");
+      const price = order.price ?? "?";
+      const size = order.size ?? "?";
+      return `${id.slice(0, 12).padEnd(12)} ${side.padEnd(4)} ${size}@${price}`;
+    });
+
+    const body =
+      `Engine:       ${status?.engine ?? "unknown"}\n` +
+      `DB:           ${status?.db ?? "unknown"}\n` +
+      `Uptime:       ${status?.uptime_ms != null ? `${(status.uptime_ms / 1000).toFixed(0)}s` : "N/A"}\n` +
+      `Reconcile:    ${reconcile?.status ?? "unknown"}\n` +
+      `Cash USDC:    $${n(portfolio?.usdc_balance)}\n` +
+      `Exposure:     $${n(portfolio?.total_exposure_usd)}\n` +
+      `Unrealized:   $${n(portfolio?.unrealized_pnl)}\n` +
+      `Realized day: $${n(portfolio?.realized_pnl_today ?? pnl?.realized_pnl)}\n` +
+      `P&L W/L:      ${(pnl?.win_count ?? 0)} / ${(pnl?.loss_count ?? 0)}\n` +
+      `Positions:    ${count(portfolio?.positions)}\n` +
+      `Open orders:  ${count(orders?.orders)}${orders?.truncated ? " (truncated)" : ""}\n` +
+      `Mappings:     ${mappings?.mappings?.length ?? "N/A"}\n` +
+      `\nStrategies\n${strategyLines.join("\n")}\n` +
+      (orderRows.length ? `\nTop Orders\n${orderRows.join("\n")}\n` : "");
+    const message =
+      `<b>Live Status</b> <code>${escapeHtml(mode)}</code>\n` +
+      `<pre>${escapeHtml(body)}</pre>`;
+
+    await ctx.reply(message, { parse_mode: "HTML" });
   }));
 
   bot.command("portfolio", guard(async ctx => {

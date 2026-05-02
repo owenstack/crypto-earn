@@ -200,17 +200,19 @@ pub const KalshiWsClient = struct {
         self.connected.store(true, .seq_cst);
         log.info("kalshi_ws", "connected to Kalshi WebSocket", .{});
 
-        // Subscribe to ticker channel
-        var sub_buf: [256]u8 = undefined;
+        // Subscribe to ticker plus lifecycle channels. Ticker messages carry
+        // prices; lifecycle messages carry titles/subtitles needed to discover
+        // ticker -> Gamma mappings without manual config.
+        var sub_buf: [512]u8 = undefined;
         const sub_msg = std.fmt.bufPrint(&sub_buf,
-            \\{{"id":1,"cmd":"subscribe","params":{{"channels":["ticker"]}}}}
+            \\{{"id":1,"cmd":"subscribe","params":{{"channels":["ticker","market_lifecycle_v2","multivariate_market_lifecycle"]}}}}
         , .{}) catch return error.BufferOverflow;
         const sub_len = sub_msg.len;
-        var send_buf: [256]u8 = undefined;
+        var send_buf: [512]u8 = undefined;
         @memcpy(send_buf[0..sub_len], sub_msg);
         try client.write(send_buf[0..sub_len]);
 
-        log.info("kalshi_ws", "subscribed to ticker channel", .{});
+        log.info("kalshi_ws", "subscribed to Kalshi ticker and lifecycle channels", .{});
 
         // Read loop with periodic pings
         try client.readTimeout(5_000);
@@ -237,7 +239,13 @@ pub const KalshiWsClient = struct {
             switch (message.type) {
                 .text, .binary => self.handleMessage(message.data),
                 .close => return,
-                .ping, .pong => {},
+                .ping => {
+                    var pong_buf: [128]u8 = undefined;
+                    const pong_len = @min(message.data.len, pong_buf.len);
+                    @memcpy(pong_buf[0..pong_len], message.data[0..pong_len]);
+                    try client.writePong(pong_buf[0..pong_len]);
+                },
+                .pong => {},
             }
         }
     }
@@ -251,6 +259,14 @@ pub const KalshiWsClient = struct {
 
         if (std.mem.eql(u8, msg_type, "ticker")) {
             self.handleTickerMessage(data);
+        } else if (std.mem.eql(u8, msg_type, "market_lifecycle_v2") or
+            std.mem.eql(u8, msg_type, "multivariate_market_lifecycle"))
+        {
+            self.handleMarketLifecycleMessage(data);
+        } else if (std.mem.eql(u8, msg_type, "error")) {
+            const code = extractNestedJsonString(data, "msg", "code") orelse "?";
+            const msg = extractNestedJsonString(data, "msg", "msg") orelse "";
+            log.warn("kalshi_ws", "Kalshi websocket error code={s} msg={s}", .{ code, msg });
         }
     }
 
@@ -260,19 +276,22 @@ pub const KalshiWsClient = struct {
         // Find the "msg" object and extract fields from it
         const market_ticker = extractNestedJsonString(data, "msg", "market_ticker") orelse return;
 
-        // yes_bid and yes_ask are in cents (0-100), convert to probability (0.0-1.0)
-        const yes_bid_str = extractNestedJsonString(data, "msg", "yes_bid") orelse
-            extractNestedJsonString(data, "msg", "yes_bid_dollars") orelse "0";
-        const yes_ask_str = extractNestedJsonString(data, "msg", "yes_ask") orelse
-            extractNestedJsonString(data, "msg", "yes_ask_dollars") orelse "0";
+        const yes_bid_str = extractNestedJsonString(data, "msg", "yes_bid_dollars") orelse
+            extractNestedJsonString(data, "msg", "yes_bid") orelse "0";
+        const yes_ask_str = extractNestedJsonString(data, "msg", "yes_ask_dollars") orelse
+            extractNestedJsonString(data, "msg", "yes_ask") orelse "0";
 
         const yes_bid = std.fmt.parseFloat(f64, yes_bid_str) catch 0.0;
         const yes_ask = std.fmt.parseFloat(f64, yes_ask_str) catch 0.0;
 
-        // Convert cents to probability (Kalshi prices are in cents 0-99)
         const bid_prob = if (yes_bid > 1.0) yes_bid / 100.0 else yes_bid;
         const ask_prob = if (yes_ask > 1.0) yes_ask / 100.0 else yes_ask;
-        const mid_prob = (bid_prob + ask_prob) / 2.0;
+        const mid_prob = if (bid_prob > 0.0 and ask_prob > 0.0)
+            (bid_prob + ask_prob) / 2.0
+        else if (extractNestedJsonString(data, "msg", "price_dollars")) |price_str|
+            normalizeProbability(std.fmt.parseFloat(f64, price_str) catch 0.0) orelse 0.0
+        else
+            0.0;
 
         if (mid_prob <= 0.0 or mid_prob >= 1.0) return;
 
@@ -325,7 +344,32 @@ pub const KalshiWsClient = struct {
         log.debug("kalshi_ws", "ticker update: {s} prob={d:.4}", .{ market_ticker, mid_prob });
     }
 
+    fn handleMarketLifecycleMessage(self: *KalshiWsClient, data: []const u8) void {
+        const market_ticker = extractNestedJsonString(data, "msg", "market_ticker") orelse return;
+        const title = extractNestedJsonString(data, "additional_metadata", "title") orelse
+            extractNestedJsonString(data, "additional_metadata", "name");
+        const yes_sub_title = extractNestedJsonString(data, "additional_metadata", "yes_sub_title");
+        const no_sub_title = extractNestedJsonString(data, "additional_metadata", "no_sub_title");
+
+        var gamma_id_buf: [64]u8 = undefined;
+        const gamma_id =
+            (if (title) |t| self.queryMarketIdByQuestion(t, &gamma_id_buf) else null) orelse
+            (if (yes_sub_title) |s| self.queryMarketIdByQuestion(s, &gamma_id_buf) else null) orelse
+            (if (no_sub_title) |s| self.queryMarketIdByQuestion(s, &gamma_id_buf) else null) orelse
+            return;
+
+        self.database.upsertKalshiMapping(market_ticker, gamma_id, 0.75, "ws_lifecycle_match") catch |err| {
+            log.warn("kalshi_ws", "failed to persist lifecycle mapping for {s}: {s}", .{ market_ticker, @errorName(err) });
+        };
+        self.upsertAutoMapping(market_ticker, gamma_id);
+        log.info("kalshi_ws", "mapped Kalshi ticker {s} to Gamma market {s} from lifecycle metadata", .{ market_ticker, gamma_id });
+    }
+
     fn resolveGammaId(self: *KalshiWsClient, market_ticker: []const u8, buf: *[64]u8) ?[]const u8 {
+        if (self.database.lookupKalshiMapping(market_ticker, buf)) |gamma_id| {
+            return gamma_id;
+        }
+
         var map_buf: [4096]u8 = undefined;
         if (self.database.getConfig("kalshi_market_map", &map_buf)) |market_map| {
             if (lookupTickerMapping(market_map, market_ticker, buf)) |gamma_id| {
@@ -341,6 +385,30 @@ pub const KalshiWsClient = struct {
                 @memcpy(buf[0..len], self.auto_map_market_ids[i][0..len]);
                 return buf[0..len];
             }
+        }
+
+        return null;
+    }
+
+    fn queryMarketIdByQuestion(self: *KalshiWsClient, question: []const u8, out: *[64]u8) ?[]const u8 {
+        const sql = "SELECT id, base, symbol FROM markets;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return null;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const id_ptr = c.sqlite3_column_text(stmt, 0);
+            const base_ptr = c.sqlite3_column_text(stmt, 1);
+            const symbol_ptr = c.sqlite3_column_text(stmt, 2);
+            const id = if (id_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else continue;
+            const base = if (base_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+            const symbol = if (symbol_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+
+            if (!normalizedEql(base, question) and !normalizedEql(symbol, question)) continue;
+
+            const len = @min(id.len, out.len);
+            @memcpy(out[0..len], id[0..len]);
+            return out[0..len];
         }
 
         return null;
@@ -450,6 +518,33 @@ fn lookupTickerMapping(map_json: []const u8, ticker: []const u8, buf: *[64]u8) ?
     return null;
 }
 
+fn normalizeProbability(raw: f64) ?f64 {
+    var prob = raw;
+    if (prob > 1.0) prob /= 100.0;
+    if (prob <= 0.0 or prob >= 1.0) return null;
+    return prob;
+}
+
+fn normalizedEql(a: []const u8, b: []const u8) bool {
+    var ia: usize = 0;
+    var ib: usize = 0;
+
+    while (true) {
+        while (ia < a.len and !std.ascii.isAlphanumeric(a[ia])) : (ia += 1) {}
+        while (ib < b.len and !std.ascii.isAlphanumeric(b[ib])) : (ib += 1) {}
+
+        if (ia >= a.len or ib >= b.len) break;
+
+        if (std.ascii.toLower(a[ia]) != std.ascii.toLower(b[ib])) return false;
+        ia += 1;
+        ib += 1;
+    }
+
+    while (ia < a.len and !std.ascii.isAlphanumeric(a[ia])) : (ia += 1) {}
+    while (ib < b.len and !std.ascii.isAlphanumeric(b[ib])) : (ib += 1) {}
+    return ia == a.len and ib == b.len;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -477,6 +572,39 @@ test "kalshi_ws: extractNestedJsonString" {
     const bid = extractNestedJsonString(json, "msg", "yes_bid");
     try std.testing.expect(bid != null);
     try std.testing.expectEqualStrings("45", bid.?);
+}
+
+test "kalshi_ws: ticker message accepts documented dollar fields" {
+    var database = try db_mod.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote,status,clob_token_ids) VALUES('m1','fed-cuts','Will the Fed cut rates?','USDC','active','[\"yes-1\"]');");
+    try database.upsertKalshiMapping("FED-23DEC-T3.00", "m1", 1.0, "test");
+
+    var client = KalshiWsClient.init(std.testing.allocator, &database);
+    client.handleMessage(
+        \\{"type":"ticker","sid":11,"msg":{"market_ticker":"FED-23DEC-T3.00","market_id":"9b0f6b43","price_dollars":"0.480","yes_bid_dollars":"0.450","yes_ask_dollars":"0.530","volume_fp":"33896.00","open_interest_fp":"20422.00","ts":1669149841}}
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), client.estimate_count);
+    try std.testing.expect(client.estimates[0].?.probability > 0.48 and client.estimates[0].?.probability < 0.50);
+}
+
+test "kalshi_ws: lifecycle message seeds ticker mapping" {
+    var database = try db_mod.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote,status,clob_token_ids) VALUES('m1','fed-cuts','Will the Fed cut rates?','USDC','active','[\"yes-1\"]');");
+
+    var client = KalshiWsClient.init(std.testing.allocator, &database);
+    client.handleMessage(
+        \\{"type":"market_lifecycle_v2","sid":13,"msg":{"market_ticker":"KXFEDCUT","event_type":"created","additional_metadata":{"title":"Will the Fed cut rates?","yes_sub_title":"Fed cuts","no_sub_title":"Fed does not cut","event_ticker":"KXFED"}}}
+    );
+
+    var buf: [64]u8 = undefined;
+    const gamma_id = database.lookupKalshiMapping("KXFEDCUT", &buf);
+    try std.testing.expect(gamma_id != null);
+    try std.testing.expectEqualStrings("m1", gamma_id.?);
 }
 
 test "kalshi_ws: lookupTickerMapping" {

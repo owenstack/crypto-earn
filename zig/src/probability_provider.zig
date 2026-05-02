@@ -7,7 +7,7 @@ const http = @import("http_client.zig");
 const kalshi_ws = @import("kalshi_ws.zig");
 const c = db_mod.c;
 
-const KALSHI_REST_URL = "https://api.elections.kalshi.com/trade-api/v2/markets";
+const KALSHI_EVENTS_URL = "https://api.elections.kalshi.com/trade-api/v2/events";
 const MANIFOLD_MARKETS_URL = "https://api.manifold.markets/v0/markets";
 
 pub const ExternalEstimate = struct {
@@ -189,7 +189,7 @@ pub const ProbabilityProvider = struct {
                 if (ticker.len == 0) continue;
 
                 var url_buf: [256]u8 = undefined;
-                const url = std.fmt.bufPrint(&url_buf, KALSHI_REST_URL ++ "?status=open&limit=200&series_ticker={s}", .{ticker}) catch continue;
+                const url = std.fmt.bufPrint(&url_buf, KALSHI_EVENTS_URL ++ "?status=open&with_nested_markets=true&limit=200&series_ticker={s}", .{ticker}) catch continue;
 
                 var response = client.get(url) catch {
                     log.warn("prob_provider", "Kalshi REST poll failed for series {s}", .{ticker});
@@ -204,7 +204,7 @@ pub const ProbabilityProvider = struct {
             }
         } else {
             // Fallback: unfiltered (mostly sports MVE markets, low signal)
-            var response = client.get(KALSHI_REST_URL ++ "?status=open&limit=200") catch {
+            var response = client.get(KALSHI_EVENTS_URL ++ "?status=open&with_nested_markets=true&limit=200") catch {
                 log.err("prob_provider", "Kalshi REST poll failed", .{});
                 return false;
             };
@@ -256,45 +256,105 @@ pub const ProbabilityProvider = struct {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
         defer parsed.deinit();
 
-        const items = extractArray(parsed.value, &.{ "markets", "data" }) orelse
-            return error.MissingMarketsArray;
-
         var added: usize = 0;
         var skip_no_prob: usize = 0;
         var skip_no_market: usize = 0;
         const now = std.time.timestamp();
 
+        if (extractArray(parsed.value, &.{"events"})) |events| {
+            for (events) |event_item| {
+                const event_obj = switch (event_item) {
+                    .object => |o| o,
+                    else => continue,
+                };
+                const markets_value = event_obj.get("markets") orelse continue;
+                const markets = switch (markets_value) {
+                    .array => |a| a.items,
+                    else => continue,
+                };
+
+                for (markets) |market_item| {
+                    const outcome = self.appendKalshiMarketEstimate(market_item, event_obj, acc, acc_count, now);
+                    switch (outcome) {
+                        .added => added += 1,
+                        .no_probability => skip_no_prob += 1,
+                        .no_market => skip_no_market += 1,
+                        .ignored => {},
+                    }
+                }
+            }
+
+            log.info("prob_provider", "Kalshi REST events: {d} events, {d} published (skipped: {d} no-prob, {d} no-market)", .{
+                events.len, added, skip_no_prob, skip_no_market,
+            });
+            return added;
+        }
+
+        const items = extractArray(parsed.value, &.{ "markets", "data", "trades" }) orelse
+            return error.MissingMarketsArray;
+
         for (items) |item| {
             if (acc_count.* >= MAX_ESTIMATES) break;
-            const obj = switch (item) {
-                .object => |o| o,
-                else => continue,
-            };
-
-            const ticker = objectString(obj, "ticker") orelse continue;
-            const slug = objectString(obj, "slug");
-            const title = objectString(obj, "title") orelse objectString(obj, "question");
-            const subtitle = objectString(obj, "subtitle");
-            const probability = extractProbability(obj) orelse {
-                skip_no_prob += 1;
-                continue;
-            };
-
-            var market_id_buf: [64]u8 = undefined;
-            const market_id = self.resolveKalshiTicker(ticker, slug, title, subtitle, &market_id_buf) orelse {
-                skip_no_market += 1;
-                continue;
-            };
-
-            acc[acc_count.*] = self.buildEstimate(market_id, probability, 0.85, "kalshi_rest", now);
-            acc_count.* += 1;
-            added += 1;
+            const outcome = self.appendKalshiMarketEstimate(item, null, acc, acc_count, now);
+            switch (outcome) {
+                .added => added += 1,
+                .no_probability => skip_no_prob += 1,
+                .no_market => skip_no_market += 1,
+                .ignored => {},
+            }
         }
 
         log.info("prob_provider", "Kalshi REST: {d} items, {d} published (skipped: {d} no-prob, {d} no-market)", .{
             items.len, added, skip_no_prob, skip_no_market,
         });
         return added;
+    }
+
+    const KalshiAppendOutcome = enum {
+        added,
+        no_probability,
+        no_market,
+        ignored,
+    };
+
+    fn appendKalshiMarketEstimate(
+        self: *ProbabilityProvider,
+        item: std.json.Value,
+        event_obj: ?std.json.ObjectMap,
+        acc: *[MAX_ESTIMATES]?ExternalEstimate,
+        acc_count: *usize,
+        now: i64,
+    ) KalshiAppendOutcome {
+        if (acc_count.* >= MAX_ESTIMATES) return .ignored;
+        const obj = switch (item) {
+            .object => |o| o,
+            else => return .ignored,
+        };
+
+        const ticker = objectString(obj, "ticker") orelse return .ignored;
+        const slug = objectString(obj, "slug");
+        const title = objectString(obj, "title") orelse objectString(obj, "question");
+        const subtitle = objectString(obj, "subtitle") orelse
+            objectString(obj, "yes_sub_title") orelse
+            objectString(obj, "no_sub_title");
+        const event_title = if (event_obj) |ev| objectString(ev, "title") else null;
+        const event_subtitle = if (event_obj) |ev| objectString(ev, "sub_title") else null;
+        const probability = extractProbability(obj) orelse return .no_probability;
+
+        var market_id_buf: [64]u8 = undefined;
+        const market_id = self.resolveKalshiTickerWithEventContext(
+            ticker,
+            slug,
+            title,
+            subtitle,
+            event_title,
+            event_subtitle,
+            &market_id_buf,
+        ) orelse return .no_market;
+
+        acc[acc_count.*] = self.buildEstimate(market_id, probability, 0.85, "kalshi_rest", now);
+        acc_count.* += 1;
+        return .added;
     }
 
     /// Backward-compatible wrapper used by tests.
@@ -485,6 +545,36 @@ pub const ProbabilityProvider = struct {
         return null;
     }
 
+    fn resolveKalshiTickerWithEventContext(
+        self: *ProbabilityProvider,
+        ticker: []const u8,
+        slug: ?[]const u8,
+        title: ?[]const u8,
+        subtitle: ?[]const u8,
+        event_title: ?[]const u8,
+        event_subtitle: ?[]const u8,
+        out: *[64]u8,
+    ) ?[]const u8 {
+        if (self.resolveKalshiTicker(ticker, slug, title, subtitle, out)) |id| return id;
+
+        if (event_title) |t| {
+            if (self.queryMarketIdByQuestion(t, out)) |id| {
+                self.database.upsertKalshiMapping(ticker, id, 0.70, "event_title_match") catch {};
+                if (self.kalshi) |kws| kws.upsertAutoMapping(ticker, id);
+                return id;
+            }
+        }
+        if (event_subtitle) |s| {
+            if (self.queryMarketIdByQuestion(s, out)) |id| {
+                self.database.upsertKalshiMapping(ticker, id, 0.65, "event_subtitle_match") catch {};
+                if (self.kalshi) |kws| kws.upsertAutoMapping(ticker, id);
+                return id;
+            }
+        }
+
+        return null;
+    }
+
     /// Backward-compat: legacy runtime-config based lookup. Retained so an
     /// operator can still pin specific tickers via the `kalshi_market_map`
     /// runtime_config key as a manual override (no longer required for
@@ -639,6 +729,7 @@ fn extractProbability(obj: std.json.ObjectMap) ?f64 {
         "last_price",
         "last_price_dollars",
         "yes_price",
+        "yes_price_dollars",
         "yes_bid",
         "yes_ask",
     };
@@ -703,6 +794,39 @@ test "probability_provider: kalshi rest response matches by title" {
 
     try std.testing.expectEqual(@as(usize, 1), pp.estimate_count);
     try std.testing.expect(pp.estimates[0].?.probability > 0.62 and pp.estimates[0].?.probability < 0.64);
+}
+
+test "probability_provider: kalshi events response flattens nested markets" {
+    var database = try db_mod.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote,status,clob_token_ids) VALUES('m1','fed-cuts','Will the Fed cut rates?','USDC','active','[\"yes-1\"]');");
+
+    var kws = kalshi_ws.KalshiWsClient.init(std.testing.allocator, &database);
+    var pp = ProbabilityProvider.init(std.testing.allocator, &database, &kws);
+    _ = try pp.parseKalshiRestResponse(
+        \\{"events":[{"event_ticker":"KXFED","title":"Will the Fed cut rates?","markets":[{"ticker":"KXFEDCUT","yes_bid_dollars":"0.6100","yes_ask_dollars":"0.6500"}]}],"cursor":""}
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), pp.estimate_count);
+    try std.testing.expectEqualStrings("m1", pp.estimates[0].?.market_id[0..pp.estimates[0].?.market_id_len]);
+    try std.testing.expect(pp.estimates[0].?.probability > 0.62 and pp.estimates[0].?.probability < 0.64);
+}
+
+test "probability_provider: kalshi trades response uses persisted ticker mapping" {
+    var database = try db_mod.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote,status,clob_token_ids) VALUES('m1','fed-cuts','Will the Fed cut rates?','USDC','active','[\"yes-1\"]');");
+    try database.upsertKalshiMapping("KXFEDCUT", "m1", 1.0, "test");
+
+    var pp = ProbabilityProvider.init(std.testing.allocator, &database, null);
+    _ = try pp.parseKalshiRestResponse(
+        \\{"trades":[{"trade_id":"t1","ticker":"KXFEDCUT","count_fp":"10.00","yes_price_dollars":"0.5600","no_price_dollars":"0.4400","taker_side":"yes","created_time":"2023-11-07T05:31:56Z"}],"cursor":""}
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), pp.estimate_count);
+    try std.testing.expect(pp.estimates[0].?.probability > 0.55 and pp.estimates[0].?.probability < 0.57);
 }
 
 test "probability_provider: normalizedEql ignores punctuation and case" {
