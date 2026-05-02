@@ -537,7 +537,10 @@ pub const DB = struct {
     }
 
     pub fn queryOpenOrderCount(self: DB) !u32 {
-        const sql = "SELECT count(*) FROM orders WHERE status NOT IN ('filled','cancelled','rejected');" ++ &[_:0]u8{};
+        // Only exchange-acknowledged live orders should consume capacity.
+        // A stranded local `pending` row after a restart must not keep the
+        // engine permanently saturated.
+        const sql = "SELECT count(*) FROM orders WHERE status IN ('placed','partially_filled');" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
             log.err("db", "failed to prepare queryOpenOrderCount", .{});
@@ -553,7 +556,9 @@ pub const DB = struct {
     }
 
     pub fn queryOpenExposureUsd(self: DB) !f64 {
-        const sql = "SELECT COALESCE(SUM(CAST(size AS REAL) * CAST(price AS REAL)), 0.0) FROM orders WHERE status NOT IN ('filled','cancelled','rejected');" ++ &[_:0]u8{};
+        // Match queryOpenOrderCount: only placed / partially_filled orders
+        // represent real exchange exposure.
+        const sql = "SELECT COALESCE(SUM(CAST(size AS REAL) * CAST(price AS REAL)), 0.0) FROM orders WHERE status IN ('placed','partially_filled');" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
             log.err("db", "failed to prepare queryOpenExposureUsd", .{});

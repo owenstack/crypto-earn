@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.engine
+      args:
+        ENGINE_OPTIMIZE: "${ENGINE_OPTIMIZE:-ReleaseSafe}"
     restart: unless-stopped
     env_file: .env
     environment:

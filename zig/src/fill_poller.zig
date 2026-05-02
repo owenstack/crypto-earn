@@ -174,20 +174,13 @@ pub const FillPoller = struct {
             return null;
         };
 
-        var addr_hex: [42]u8 = undefined;
-        addr_hex[0] = '0';
-        addr_hex[1] = 'x';
-        const charset = "0123456789abcdef";
-        for (self.om.config.signer_address, 0..) |b, i| {
-            addr_hex[2 + i * 2] = charset[b >> 4];
-            addr_hex[2 + i * 2 + 1] = charset[b & 0x0f];
-        }
+        const auth_addr_hex = poly_auth.formatAddressEip55(self.om.config.signer_address);
 
         var client = http.HttpClient.init(self.allocator);
         defer client.deinit();
 
         var response = client.getWithHeaders(url, &.{
-            .{ .name = "POLY_ADDRESS", .value = &addr_hex },
+            .{ .name = "POLY_ADDRESS", .value = &auth_addr_hex },
             .{ .name = "POLY_SIGNATURE", .value = hmac_result.slice() },
             .{ .name = "POLY_TIMESTAMP", .value = ts },
             .{ .name = "POLY_API_KEY", .value = creds.api_key[0..creds.api_key_len] },
@@ -706,14 +699,9 @@ pub const FillPoller = struct {
         };
 
         // Step 1: Fetch all open orders from CLOB
-        var addr_hex: [42]u8 = undefined;
-        addr_hex[0] = '0';
-        addr_hex[1] = 'x';
-        const charset = "0123456789abcdef";
-        for (self.om.config.signer_address, 0..) |b, i| {
-            addr_hex[2 + i * 2] = charset[b >> 4];
-            addr_hex[2 + i * 2 + 1] = charset[b & 0x0f];
-        }
+        const auth_addr_hex = poly_auth.formatAddressEip55(self.om.config.signer_address);
+        const maker_addr = self.om.config.funder_address orelse self.om.config.signer_address;
+        const maker_addr_hex = poly_auth.formatAddressEip55(maker_addr);
 
         // Use ArrayList for dynamic order id storage
         var clob_order_ids: std.ArrayList([]const u8) = .empty;
@@ -726,11 +714,11 @@ pub const FillPoller = struct {
             var url_buf: [512]u8 = undefined;
             const url = if (next_cursor_len > 0)
                 std.fmt.bufPrint(&url_buf, "{s}/orders?maker_address={s}&status=open&next_cursor={s}", .{
-                    CLOB_API_BASE, &addr_hex, next_cursor[0..next_cursor_len],
+                    CLOB_API_BASE, &maker_addr_hex, next_cursor[0..next_cursor_len],
                 }) catch break
             else
                 std.fmt.bufPrint(&url_buf, "{s}/orders?maker_address={s}&status=open", .{
-                    CLOB_API_BASE, &addr_hex,
+                    CLOB_API_BASE, &maker_addr_hex,
                 }) catch break;
 
             var ts_buf: [32]u8 = undefined;
@@ -739,10 +727,10 @@ pub const FillPoller = struct {
             var path_buf: [512]u8 = undefined;
             const req_path = if (next_cursor_len > 0)
                 std.fmt.bufPrint(&path_buf, "/orders?maker_address={s}&status=open&next_cursor={s}", .{
-                    &addr_hex, next_cursor[0..next_cursor_len],
+                    &maker_addr_hex, next_cursor[0..next_cursor_len],
                 }) catch break
             else
-                std.fmt.bufPrint(&path_buf, "/orders?maker_address={s}&status=open", .{&addr_hex}) catch break;
+                std.fmt.bufPrint(&path_buf, "/orders?maker_address={s}&status=open", .{&maker_addr_hex}) catch break;
 
             const hmac = poly_auth.buildHmacSignature(
                 creds.secret[0..creds.secret_len],
@@ -756,7 +744,7 @@ pub const FillPoller = struct {
             defer client.deinit();
 
             var response = client.getWithHeaders(url, &.{
-                .{ .name = "POLY_ADDRESS", .value = &addr_hex },
+                .{ .name = "POLY_ADDRESS", .value = &auth_addr_hex },
                 .{ .name = "POLY_SIGNATURE", .value = hmac.slice() },
                 .{ .name = "POLY_TIMESTAMP", .value = ts },
                 .{ .name = "POLY_API_KEY", .value = creds.api_key[0..creds.api_key_len] },
@@ -864,7 +852,7 @@ pub const FillPoller = struct {
                     var client = http.HttpClient.init(self.allocator);
                     defer client.deinit();
                     var response = client.getWithHeaders(order_url.?, &.{
-                        .{ .name = "POLY_ADDRESS", .value = &addr_hex },
+                        .{ .name = "POLY_ADDRESS", .value = &auth_addr_hex },
                         .{ .name = "POLY_SIGNATURE", .value = hmac.slice() },
                         .{ .name = "POLY_TIMESTAMP", .value = ts.? },
                         .{ .name = "POLY_API_KEY", .value = creds.api_key[0..creds.api_key_len] },
@@ -908,7 +896,7 @@ pub const FillPoller = struct {
         }
 
         // Step 3: For each DB order in placed/partially_filled that's absent from CLOB, resolve
-        const local_sql = "SELECT id FROM orders WHERE status IN ('placed','partially_filled');" ++ &[_:0]u8{};
+        const local_sql = "SELECT id, status FROM orders WHERE status IN ('pending','placed','partially_filled');" ++ &[_:0]u8{};
         var local_stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.database.handle, local_sql.ptr, -1, &local_stmt, null) == c.SQLITE_OK) {
             defer _ = c.sqlite3_finalize(local_stmt);
@@ -916,6 +904,8 @@ pub const FillPoller = struct {
             while (c.sqlite3_step(local_stmt) == c.SQLITE_ROW) {
                 const db_id_raw = c.sqlite3_column_text(local_stmt, 0);
                 const db_id = if (db_id_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else continue;
+                const db_status_raw = c.sqlite3_column_text(local_stmt, 1);
+                const db_status = if (db_status_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
 
                 // Check if this order is in the CLOB open list
                 var found = false;
@@ -927,6 +917,16 @@ pub const FillPoller = struct {
                 }
 
                 if (!found) {
+                    // `pending` is a local pre-submit state, so if it survives a
+                    // restart and is not present on the exchange, it should not
+                    // continue to consume exposure.
+                    if (std.mem.eql(u8, db_status, "pending")) {
+                        self.database.updateOrderStatus(db_id, "rejected") catch {};
+                        result.closed += 1;
+                        log.info("fill_poller", "reconciliation: rejected stale pending order {s}", .{db_id});
+                        continue;
+                    }
+
                     // Order not on CLOB — check its final status
                     if (self.checkOrderFills(db_id)) |check| {
                         const status = check.status();

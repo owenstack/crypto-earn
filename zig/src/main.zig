@@ -13,6 +13,7 @@ const ws = @import("websocket.zig");
 const fill_poller = @import("fill_poller.zig");
 const kalshi_ws = @import("kalshi_ws.zig");
 const prob_provider = @import("probability_provider.zig");
+const crash_trace = @import("crash_trace.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -20,6 +21,8 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     log.init();
+    crash_trace.install();
+    crash_trace.breadcrumb("engine", "main entry", .{});
     log.info("engine", "starting cex-engine", .{});
 
     // Read config from environment
@@ -68,14 +71,7 @@ pub fn main() !void {
                 // Derive Ethereum address and bootstrap API credentials
                 if (poly_auth.deriveAddress(om_config.private_key)) |addr| {
                     om_config.signer_address = addr;
-                    var addr_hex: [42]u8 = undefined;
-                    addr_hex[0] = '0';
-                    addr_hex[1] = 'x';
-                    const charset = "0123456789abcdef";
-                    for (om_config.signer_address, 0..) |b, i| {
-                        addr_hex[2 + i * 2] = charset[b >> 4];
-                        addr_hex[2 + i * 2 + 1] = charset[b & 0x0f];
-                    }
+                    const addr_hex = poly_auth.formatAddressEip55(om_config.signer_address);
                     log.info("engine", "signer address: {s}", .{&addr_hex});
 
                     // Bootstrap API credentials
@@ -300,15 +296,13 @@ pub fn main() !void {
             // Initial synchronous fetch so the engine has a real balance
             // before the strategy worker (and risk gate) start firing.
             const balance_address = om_config.funder_address orelse om_config.signer_address;
-            const bal0 = poly_auth.fetchUsdcBalance(
+            const bal0 = fetchUsdcBalanceWithFallback(
                 allocator,
                 creds,
+                om_config.signer_address,
                 balance_address,
                 om_config.signature_type,
-            ) catch |e| blk: {
-                log.warn("engine", "initial USDC balance fetch failed: {s}", .{@errorName(e)});
-                break :blk @as(?f64, null);
-            };
+            );
             if (bal0) |b| {
                 const snap = pt.getSnapshot();
                 database.insertBalanceSnapshot(b, snap.total_exposure_usd, snap.unrealized_pnl, snap.realized_pnl_today) catch |e| {
@@ -324,6 +318,7 @@ pub fn main() !void {
                 .database = &database,
                 .pt = &pt,
                 .creds = creds,
+                .signer_address = om_config.signer_address,
                 .balance_address = balance_address,
                 .signature_type = om_config.signature_type,
                 .allocator = allocator,
@@ -739,6 +734,10 @@ fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
     const origin = @tagName(signal.strategy);
 
     const result = ctx.om.placeOrder(market_id, side_str, size_str, price_str, "limit", origin);
+    crash_trace.breadcrumb("strategy", "placeOrder returned market={s} side={s}", .{
+        market_id[0..@min(market_id.len, 24)],
+        side_str,
+    });
     switch (result) {
         .success => |s| {
             const tracked = ctx.se.trackOrder(s.order_id, market_id, signal.strategy, signal.direction, signal.price);
@@ -842,6 +841,10 @@ fn dispatchLpPair(ctx: *StrategyWorkerCtx, buy_signal: strategy.Signal, sell_sig
     const buy_result = ctx.om.placeOrder(buy_market_id, "buy", buy_size_str, buy_price_str, "limit", origin);
     // Place sell leg
     const sell_result = ctx.om.placeOrder(sell_market_id, "sell", sell_size_str, sell_price_str, "limit", origin);
+    crash_trace.breadcrumb("strategy", "lp pair returned buy={s} sell={s}", .{
+        buy_market_id[0..@min(buy_market_id.len, 24)],
+        sell_market_id[0..@min(sell_market_id.len, 24)],
+    });
 
     var buy_tracked = false;
     var sell_tracked = false;
@@ -1032,6 +1035,7 @@ const BalanceTickerCtx = struct {
     database: *db.DB,
     pt: *portfolio.PortfolioTracker,
     creds: poly_auth.ApiCredentials,
+    signer_address: [20]u8,
     balance_address: [20]u8,
     signature_type: u8,
     allocator: std.mem.Allocator,
@@ -1054,15 +1058,13 @@ fn balanceTicker(ctx: *BalanceTickerCtx) void {
         }
         if (ctx.should_stop.load(.seq_cst)) break;
 
-        const bal = poly_auth.fetchUsdcBalance(
+        const bal = fetchUsdcBalanceWithFallback(
             ctx.allocator,
             ctx.creds,
+            ctx.signer_address,
             ctx.balance_address,
             ctx.signature_type,
-        ) catch |e| {
-            log.warn("balance_ticker", "failed to fetch USDC balance: {s}", .{@errorName(e)});
-            continue;
-        };
+        ) orelse continue;
 
         // Preserve current exposure / pnl values from the in-memory snapshot
         // so dashboard rows stay coherent.
@@ -1083,6 +1085,39 @@ fn balanceTicker(ctx: *BalanceTickerCtx) void {
     }
 
     log.info("balance_ticker", "balance refresh loop stopped", .{});
+}
+
+fn fetchUsdcBalanceWithFallback(
+    allocator: std.mem.Allocator,
+    creds: poly_auth.ApiCredentials,
+    signer_address: [20]u8,
+    balance_address: [20]u8,
+    signature_type: u8,
+) ?f64 {
+    const primary_address = balance_address;
+    const fallback_address = signer_address;
+
+    return poly_auth.fetchUsdcBalance(
+        allocator,
+        creds,
+        primary_address,
+        signature_type,
+    ) catch |primary_err| blk: {
+        log.warn("engine", "USDC balance fetch failed for primary balance address: {s}", .{@errorName(primary_err)});
+        if (std.mem.eql(u8, primary_address[0..], fallback_address[0..])) break :blk null;
+
+        const bal = poly_auth.fetchUsdcBalance(
+            allocator,
+            creds,
+            fallback_address,
+            signature_type,
+        ) catch |fallback_err| {
+            log.warn("engine", "USDC balance fetch failed for signer-address fallback: {s}", .{@errorName(fallback_err)});
+            break :blk null;
+        };
+        log.info("engine", "USDC balance fetch succeeded via signer-address fallback", .{});
+        break :blk bal;
+    };
 }
 
 fn queryLastMid(database: *db.DB, market_id: []const u8) ?f64 {
@@ -1115,6 +1150,11 @@ var g_database: ?*db.DB = null;
 /// Callback for real-time WebSocket price updates.
 /// Persists price snapshots so the strategy worker can query mid prices.
 fn wsPriceCallback(update: ws.PriceUpdate) void {
+    crash_trace.breadcrumb("ws_feed", "update type={s} asset={s} market={s}", .{
+        update.event_type,
+        update.asset_id[0..@min(update.asset_id.len, 24)],
+        update.market[0..@min(update.market.len, 24)],
+    });
     log.debug("ws_feed", "{s} {s}: bid={s} ask={s}", .{
         update.event_type,
         update.asset_id[0..@min(update.asset_id.len, 16)],
@@ -1187,6 +1227,10 @@ fn wsPriceCallback(update: ws.PriceUpdate) void {
         log.err("ws_feed", "sqlite3_step failed: rc={d} err={s} sql={s} market={s} asset_id={s} bid={s} ask={s} mid={d}", .{ rc_step, err_msg, sql, update.market, update.asset_id, update.best_bid, update.best_ask, mid });
         return;
     }
+    crash_trace.breadcrumb("ws_feed", "persisted asset={s} mid={d:.4}", .{
+        update.asset_id[0..@min(update.asset_id.len, 24)],
+        mid,
+    });
 }
 
 fn priceToImpliedProb(mid_price: f64) f64 {

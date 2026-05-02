@@ -2,6 +2,7 @@
 FROM debian:bookworm-slim AS builder
 
 ARG ZIG_VERSION=0.15.2
+ARG ENGINE_OPTIMIZE=ReleaseSafe
 ARG TARGETARCH
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -29,7 +30,7 @@ COPY zig/ ./
 RUN mkdir -p /root/.cache/zig/p && \
     cp -r .cache/zig/p/* /root/.cache/zig/p/ 2>/dev/null || true
 
-RUN zig build -Doptimize=ReleaseSafe
+RUN zig build -Doptimize=${ENGINE_OPTIMIZE}
 
 # --- Stage 2: Minimal runtime ---
 FROM debian:bookworm-slim

@@ -9,6 +9,7 @@ const poly_auth = @import("polymarket_auth.zig");
 const risk = @import("risk_gate.zig");
 const ipc = @import("ipc.zig");
 const ipc_types = @import("ipc_types.zig");
+const crash_trace = @import("crash_trace.zig");
 const c = db_mod.c;
 
 const CLOB_API_BASE = "https://clob.polymarket.com";
@@ -118,6 +119,12 @@ pub const OrderManager = struct {
         order_type: []const u8,
         strategy_origin: ?[]const u8,
     ) OrderResult {
+        crash_trace.breadcrumb("order_mgr", "placeOrder enter market={s} side={s} size={s} price={s}", .{
+            market_id[0..@min(market_id.len, 24)],
+            side,
+            size,
+            price,
+        });
         // Block if halted
         if (self.halted.load(.seq_cst)) {
             log.warn("order_mgr", "order rejected: engine is halted", .{});
@@ -184,6 +191,9 @@ pub const OrderManager = struct {
             log.err("order_mgr", "failed to persist order: {any}", .{e});
             return .{ .failed = .{ .reason = "db_error" } };
         };
+        crash_trace.breadcrumb("order_mgr", "pending persisted id={s}", .{
+            client_order_id[0..@min(client_order_id.len, 32)],
+        });
 
         // Submit to CLOB with 429 retry
         const submit_result = self.submitToCLOB(market_id, side, size, price, order_type);
@@ -197,6 +207,9 @@ pub const OrderManager = struct {
             log.err("order_mgr", "failed to mark order as placed in DB: order_id={s} err={any}", .{ client_order_id, e });
             return .{ .failed = .{ .reason = "db_status_update_failed" } };
         };
+        crash_trace.breadcrumb("order_mgr", "placed id={s}", .{
+            client_order_id[0..@min(client_order_id.len, 32)],
+        });
         log.info("order_mgr", "order placed: {s} {s} {s}@{s} on {s}", .{
             order_type, side, size, price, market_id,
         });
@@ -438,6 +451,12 @@ pub const OrderManager = struct {
         price: []const u8,
         order_type: []const u8,
     ) bool {
+        crash_trace.breadcrumb("order_mgr", "submit enter market={s} side={s} size={s} price={s}", .{
+            market_id[0..@min(market_id.len, 24)],
+            side,
+            size,
+            price,
+        });
         const creds = self.config.api_creds orelse {
             log.err("order_mgr", "no API credentials — cannot submit order", .{});
             return false;
@@ -449,25 +468,10 @@ pub const OrderManager = struct {
             log.err("order_mgr", "failed to resolve token_id for market={s} side={s}", .{ market_id, side });
             return false;
         };
-
-        // Fetch per-market fee rate from CLOB API, with fallback to cache or default
-        var fee_rate_bps: u256 = 0;
-        var used_fallback = false;
-        if (self.fetchFeeRate(token_id)) |rate| {
-            fee_rate_bps = rate;
-            // Update cache
-            self.lastFeeRateByToken.put(token_id, rate) catch {};
-        } else |err| {
-            if (self.lastFeeRateByToken.get(token_id)) |cached| {
-                fee_rate_bps = cached;
-                used_fallback = true;
-                log.warn("order_mgr", "fee rate fetch failed for token {s}: {any}; using cached value {d}", .{ token_id, err, cached });
-            } else {
-                fee_rate_bps = self.defaultFeeRateBps;
-                used_fallback = true;
-                log.warn("order_mgr", "fee rate fetch failed for token {s}: {any}; using default value {d}", .{ token_id, err, self.defaultFeeRateBps });
-            }
-        }
+        crash_trace.breadcrumb("order_mgr", "token resolved market={s} token={s}", .{
+            market_id[0..@min(market_id.len, 24)],
+            token_id[0..@min(token_id.len, 24)],
+        });
 
         // Parse price/size as f64
         const price_f = std.fmt.parseFloat(f64, price) catch {
@@ -492,10 +496,15 @@ pub const OrderManager = struct {
         };
 
         const maker = self.config.funder_address orelse self.config.signer_address;
+        const order_signer = if (self.config.signature_type == 3)
+            maker
+        else
+            self.config.signer_address;
 
         // Build CTF Order struct
         // Salt: match SDK pattern — timestamp * random(), fits in u64 for JSON integer compat
         const ts_sec: u64 = @intCast(std.time.timestamp());
+        const ts_ms: u64 = @intCast(std.time.milliTimestamp());
         var rand_bytes: [8]u8 = undefined;
         std.crypto.random.bytes(&rand_bytes);
         const rand_val = std.mem.readInt(u64, &rand_bytes, .big);
@@ -505,16 +514,15 @@ pub const OrderManager = struct {
         const order = poly_auth.CtfOrder{
             .salt = salt,
             .maker = maker,
-            .signer = self.config.signer_address,
-            .taker = [_]u8{0} ** 20,
+            .signer = order_signer,
             .token_id = token_id_u256,
             .maker_amount = amounts.maker_amount,
             .taker_amount = amounts.taker_amount,
-            .expiration = 0,
-            .nonce = 0,
-            .fee_rate_bps = fee_rate_bps,
             .side = side_u8,
             .signature_type = self.config.signature_type,
+            .timestamp = ts_ms,
+            .metadata = [_]u8{0} ** 32,
+            .builder = [_]u8{0} ** 32,
         };
 
         // EIP-712 sign the order (use neg-risk exchange for neg-risk markets)
@@ -524,30 +532,37 @@ pub const OrderManager = struct {
         var key_copy: [32]u8 = self.config.private_key;
         defer std.crypto.secureZero(u8, key_copy[0..]);
 
-        const order_sig = crypto.signEip712(order_digest, key_copy) catch |e| {
-            log.err("order_mgr", "failed to sign order: {s}", .{@errorName(e)});
-            return false;
+        const order_sig_hex_dyn = if (self.config.signature_type == 3)
+            poly_auth.buildPoly1271OrderSignature(order, poly_auth.CHAIN_ID, exchange, key_copy) catch |e| {
+                log.err("order_mgr", "failed to build POLY_1271 order signature: {s}", .{@errorName(e)});
+                return false;
+            }
+        else
+            null;
+        defer if (order_sig_hex_dyn) |sig_hex| std.heap.page_allocator.free(sig_hex);
+        crash_trace.breadcrumb("order_mgr", "order signed market={s}", .{
+            market_id[0..@min(market_id.len, 24)],
+        });
+        var order_sig_hex_buf: [132]u8 = undefined;
+        const order_sig_hex = if (order_sig_hex_dyn) |sig_hex|
+            sig_hex
+        else blk: {
+            const order_sig = crypto.signEip712(order_digest, key_copy) catch |e| {
+                log.err("order_mgr", "failed to sign order: {s}", .{@errorName(e)});
+                return false;
+            };
+            order_sig_hex_buf = poly_auth.formatSignature(order_sig);
+            break :blk order_sig_hex_buf[0..];
         };
-        const order_sig_hex = poly_auth.formatSignature(order_sig);
 
         // Format address
-        var addr_hex: [42]u8 = undefined;
-        addr_hex[0] = '0';
-        addr_hex[1] = 'x';
-        const charset = "0123456789abcdef";
-        for (self.config.signer_address, 0..) |b, i| {
-            addr_hex[2 + i * 2] = charset[b >> 4];
-            addr_hex[2 + i * 2 + 1] = charset[b & 0x0f];
-        }
+        const addr_hex = poly_auth.formatAddressEip55(self.config.signer_address);
 
         // Format maker address
-        var maker_hex: [42]u8 = undefined;
-        maker_hex[0] = '0';
-        maker_hex[1] = 'x';
-        for (maker, 0..) |b, i| {
-            maker_hex[2 + i * 2] = charset[b >> 4];
-            maker_hex[2 + i * 2 + 1] = charset[b & 0x0f];
-        }
+        const maker_hex = poly_auth.formatAddressEip55(maker);
+
+        // Format order signer address
+        const order_signer_hex = poly_auth.formatAddressEip55(order_signer);
 
         // Build the SendOrder JSON body
         var salt_buf: [80]u8 = undefined;
@@ -557,8 +572,10 @@ pub const OrderManager = struct {
         var taker_amt_buf: [32]u8 = undefined;
         const taker_amt_str = std.fmt.bufPrint(&taker_amt_buf, "{d}", .{amounts.taker_amount}) catch "0";
 
-        var fee_rate_buf: [16]u8 = undefined;
-        const fee_rate_str = std.fmt.bufPrint(&fee_rate_buf, "{d}", .{fee_rate_bps}) catch "0";
+        var timestamp_buf: [32]u8 = undefined;
+        const timestamp_str = std.fmt.bufPrint(&timestamp_buf, "{d}", .{ts_ms}) catch "0";
+        const zero_bytes32 = "0x0000000000000000000000000000000000000000000000000000000000000000";
+        const empty_metadata = "";
 
         var body_buf: [2048]u8 = undefined;
         // Map internal order types to CLOB-compatible types
@@ -571,24 +588,30 @@ pub const OrderManager = struct {
         // owner = API key (UUID), not the signer address
         const api_key = creds.api_key[0..creds.api_key_len];
         const json_body = std.fmt.bufPrint(&body_buf,
-            \\{{"order":{{"salt":{s},"maker":"{s}","signer":"{s}","taker":"0x0000000000000000000000000000000000000000","tokenId":"{s}","makerAmount":"{s}","takerAmount":"{s}","expiration":"0","nonce":"0","feeRateBps":"{s}","side":"{s}","signatureType":{d},"signature":"{s}"}},"owner":"{s}","orderType":"{s}"}}
+            \\{{"order":{{"salt":{s},"maker":"{s}","signer":"{s}","tokenId":"{s}","makerAmount":"{s}","takerAmount":"{s}","side":"{s}","expiration":"0","signatureType":{d},"timestamp":"{s}","metadata":"{s}","builder":"{s}","signature":"{s}"}},"owner":"{s}","orderType":"{s}","deferExec":false}}
         , .{
             salt_str,
             &maker_hex,
-            &addr_hex,
+            &order_signer_hex,
             token_id,
             maker_amt_str,
             taker_amt_str,
-            fee_rate_str,
             if (side_u8 == 0) "BUY" else "SELL",
             self.config.signature_type,
-            &order_sig_hex,
+            timestamp_str,
+            empty_metadata,
+            zero_bytes32,
+            order_sig_hex,
             api_key,
             clob_order_type,
         }) catch {
             log.err("order_mgr", "failed to format order JSON", .{});
             return false;
         };
+        crash_trace.breadcrumb("order_mgr", "json ready market={s} order_type={s}", .{
+            market_id[0..@min(market_id.len, 24)],
+            clob_order_type,
+        });
 
         log.debug("order_mgr", "CLOB payload: {s}", .{json_body});
 
@@ -602,6 +625,10 @@ pub const OrderManager = struct {
 
         var attempt: u32 = 0;
         while (attempt < self.config.max_retry_attempts) : (attempt += 1) {
+            crash_trace.breadcrumb("order_mgr", "submit attempt={d} market={s}", .{
+                attempt + 1,
+                market_id[0..@min(market_id.len, 24)],
+            });
             // Build L2 HMAC headers per attempt
             var ts_buf: [32]u8 = undefined;
             const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch {
@@ -650,12 +677,19 @@ pub const OrderManager = struct {
             }
 
             if (response.status.class() == .success) {
+                crash_trace.breadcrumb("order_mgr", "submit success market={s}", .{
+                    market_id[0..@min(market_id.len, 24)],
+                });
                 log.info("order_mgr", "CLOB order submitted: market={s} side={s} price={s} size={s}", .{
                     market_id, side, price, size,
                 });
                 return true;
             }
 
+            crash_trace.breadcrumb("order_mgr", "submit rejected status={d} market={s}", .{
+                @intFromEnum(response.status),
+                market_id[0..@min(market_id.len, 24)],
+            });
             log.err("order_mgr", "CLOB rejected: status={d} body={s}", .{
                 @intFromEnum(response.status), response.body,
             });
@@ -779,14 +813,7 @@ pub const OrderManager = struct {
         };
 
         // Format address
-        var addr_hex: [42]u8 = undefined;
-        addr_hex[0] = '0';
-        addr_hex[1] = 'x';
-        const charset = "0123456789abcdef";
-        for (self.config.signer_address, 0..) |b, i| {
-            addr_hex[2 + i * 2] = charset[b >> 4];
-            addr_hex[2 + i * 2 + 1] = charset[b & 0x0f];
-        }
+        const addr_hex = poly_auth.formatAddressEip55(self.config.signer_address);
 
         var delay_ms: u64 = 1000;
         const max_delay_ms: u64 = 60_000;

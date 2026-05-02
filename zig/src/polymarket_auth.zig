@@ -15,11 +15,13 @@ const c = @cImport({
 // ---------------------------------------------------------------------------
 
 pub const CHAIN_ID: u64 = 137;
-pub const CTF_EXCHANGE: [20]u8 = parseAddr("4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E");
-pub const NEG_RISK_CTF_EXCHANGE: [20]u8 = parseAddr("C5d563A36AE78145C45a50134d48A1215220f80a");
+pub const CTF_EXCHANGE: [20]u8 = parseAddr("E111180000d2663C0091e4f400237545B87B996B");
+pub const NEG_RISK_CTF_EXCHANGE: [20]u8 = parseAddr("e2222d279d744050d28e00520010520000310F59");
 pub const COLLATERAL_DECIMALS: u64 = 6;
 
 const CLOB_API_BASE = "https://clob.polymarket.com";
+const ORDER_V2_TYPE_STRING = "Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)";
+const TYPED_DATA_SIGN_TYPE_STRING = "TypedDataSign(Order contents,string name,string version,uint256 chainId,address verifyingContract,bytes32 salt)" ++ ORDER_V2_TYPE_STRING;
 
 // ---------------------------------------------------------------------------
 // Address derivation
@@ -189,15 +191,14 @@ pub const CtfOrder = struct {
     salt: u256,
     maker: [20]u8,
     signer: [20]u8,
-    taker: [20]u8,
     token_id: u256,
     maker_amount: u256,
     taker_amount: u256,
-    expiration: u256,
-    nonce: u256,
-    fee_rate_bps: u256,
     side: u8,
     signature_type: u8,
+    timestamp: u256,
+    metadata: [32]u8,
+    builder: [32]u8,
 };
 
 /// Build the EIP-712 digest for a CTF Exchange order.
@@ -213,7 +214,7 @@ pub fn buildOrderDigest(order: CtfOrder, chain_id: u64, exchange_addr: [20]u8) [
     };
     const version_hash = comptime blk: {
         @setEvalBranchQuota(100000);
-        break :blk crypto.Keccak256.hash("1");
+        break :blk crypto.Keccak256.hash("2");
     };
 
     var domain_data: [5 * 32]u8 = undefined;
@@ -227,27 +228,26 @@ pub fn buildOrderDigest(order: CtfOrder, chain_id: u64, exchange_addr: [20]u8) [
 
     const domain_separator = crypto.Keccak256.hash(&domain_data);
 
-    // Order type hash
+    // CLOB V2 order type hash
     const order_type_hash = comptime blk: {
         @setEvalBranchQuota(100000);
-        break :blk crypto.Keccak256.hash("Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)");
+        break :blk crypto.Keccak256.hash("Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)");
     };
 
-    // Struct hash: 13 fields (type_hash + 12 fields)
-    var struct_data: [13 * 32]u8 = undefined;
+    // Struct hash: 12 fields (type_hash + 11 fields)
+    var struct_data: [12 * 32]u8 = undefined;
     @memcpy(struct_data[0..32], &order_type_hash);
     writeU256_wide(struct_data[32..64], order.salt);
     writeAddrPadded(struct_data[64..96], order.maker);
     writeAddrPadded(struct_data[96..128], order.signer);
-    writeAddrPadded(struct_data[128..160], order.taker);
-    writeU256_wide(struct_data[160..192], order.token_id);
-    writeU256_wide(struct_data[192..224], order.maker_amount);
-    writeU256_wide(struct_data[224..256], order.taker_amount);
-    writeU256_wide(struct_data[256..288], order.expiration);
-    writeU256_wide(struct_data[288..320], order.nonce);
-    writeU256_wide(struct_data[320..352], order.fee_rate_bps);
-    writeU256(struct_data[352..384], order.side);
-    writeU256(struct_data[384..416], order.signature_type);
+    writeU256_wide(struct_data[128..160], order.token_id);
+    writeU256_wide(struct_data[160..192], order.maker_amount);
+    writeU256_wide(struct_data[192..224], order.taker_amount);
+    writeU256(struct_data[224..256], order.side);
+    writeU256(struct_data[256..288], order.signature_type);
+    writeU256_wide(struct_data[288..320], order.timestamp);
+    @memcpy(struct_data[320..352], &order.metadata);
+    @memcpy(struct_data[352..384], &order.builder);
 
     const struct_hash = crypto.Keccak256.hash(&struct_data);
 
@@ -280,6 +280,32 @@ pub fn formatSignature(sig: crypto.Signature) [132]u8 {
     for (raw, 0..) |b, i| {
         out[2 + i * 2] = charset[b >> 4];
         out[2 + i * 2 + 1] = charset[b & 0x0f];
+    }
+    return out;
+}
+
+/// Format an Ethereum address using EIP-55 checksum casing.
+pub fn formatAddressEip55(addr: [20]u8) [42]u8 {
+    var lower_hex: [40]u8 = undefined;
+    const charset = "0123456789abcdef";
+    for (addr, 0..) |b, i| {
+        lower_hex[i * 2] = charset[b >> 4];
+        lower_hex[i * 2 + 1] = charset[b & 0x0f];
+    }
+
+    const digest = crypto.Keccak256.hash(&lower_hex);
+
+    var out: [42]u8 = undefined;
+    out[0] = '0';
+    out[1] = 'x';
+    for (lower_hex, 0..) |ch, i| {
+        if (ch >= 'a' and ch <= 'f') {
+            const hash_byte = digest[i / 2];
+            const nibble: u8 = if ((i & 1) == 0) (hash_byte >> 4) & 0x0f else hash_byte & 0x0f;
+            out[2 + i] = if (nibble >= 8) std.ascii.toUpper(ch) else ch;
+        } else {
+            out[2 + i] = ch;
+        }
     }
     return out;
 }
@@ -344,7 +370,7 @@ pub fn computeOrderAmounts(side: u8, price_f: f64, size_f: f64) !OrderAmounts {
 pub fn fetchUsdcBalance(
     allocator: std.mem.Allocator,
     creds: ApiCredentials,
-    account_address: [20]u8,
+    auth_address: [20]u8,
     signature_type: u8,
 ) !f64 {
     // Path used in the HMAC signature (no query string).
@@ -374,14 +400,7 @@ pub fn fetchUsdcBalance(
         null,
     );
 
-    var addr_hex: [42]u8 = undefined;
-    addr_hex[0] = '0';
-    addr_hex[1] = 'x';
-    const charset = "0123456789abcdef";
-    for (account_address, 0..) |b, i| {
-        addr_hex[2 + i * 2] = charset[b >> 4];
-        addr_hex[2 + i * 2 + 1] = charset[b & 0x0f];
-    }
+    const addr_hex = formatAddressEip55(auth_address);
 
     var client = http.HttpClient.init(allocator);
     defer client.deinit();
@@ -457,7 +476,91 @@ pub fn parseSignatureType(value: []const u8) !u8 {
         std.ascii.eqlIgnoreCase(trimmed, "GNOSIS") or
         std.ascii.eqlIgnoreCase(trimmed, "SAFE") or
         std.mem.eql(u8, trimmed, "2")) return 2;
+    if (std.ascii.eqlIgnoreCase(trimmed, "POLY_1271") or
+        std.ascii.eqlIgnoreCase(trimmed, "1271") or
+        std.ascii.eqlIgnoreCase(trimmed, "DEPOSIT_WALLET") or
+        std.ascii.eqlIgnoreCase(trimmed, "DEPOSIT") or
+        std.mem.eql(u8, trimmed, "3")) return 3;
     return error.InvalidSignatureType;
+}
+
+pub fn signatureTypeName(signature_type: u8) []const u8 {
+    return switch (signature_type) {
+        0 => "EOA",
+        1 => "POLY_PROXY",
+        2 => "GNOSIS_SAFE",
+        3 => "POLY_1271",
+        else => "EOA",
+    };
+}
+
+pub fn buildPoly1271OrderSignature(
+    order: CtfOrder,
+    chain_id: u64,
+    exchange_addr: [20]u8,
+    private_key: [32]u8,
+) ![]u8 {
+    const app_domain_separator = computeExchangeDomainSeparator(chain_id, exchange_addr);
+    const contents_hash = computeOrderContentsHash(order);
+
+    const solady_type_hash = comptime blk: {
+        @setEvalBranchQuota(100000);
+        break :blk crypto.Keccak256.hash(TYPED_DATA_SIGN_TYPE_STRING);
+    };
+    const deposit_wallet_name_hash = comptime blk: {
+        @setEvalBranchQuota(100000);
+        break :blk crypto.Keccak256.hash("DepositWallet");
+    };
+    const deposit_wallet_version_hash = comptime blk: {
+        @setEvalBranchQuota(100000);
+        break :blk crypto.Keccak256.hash("1");
+    };
+    const zero_bytes32 = [_]u8{0} ** 32;
+
+    var typed_sign_data: [7 * 32]u8 = undefined;
+    @memcpy(typed_sign_data[0..32], &solady_type_hash);
+    @memcpy(typed_sign_data[32..64], &contents_hash);
+    @memcpy(typed_sign_data[64..96], &deposit_wallet_name_hash);
+    @memcpy(typed_sign_data[96..128], &deposit_wallet_version_hash);
+    writeU256(typed_sign_data[128..160], chain_id);
+    writeAddrPadded(typed_sign_data[160..192], order.signer);
+    @memcpy(typed_sign_data[192..224], &zero_bytes32);
+    const typed_sign_struct_hash = crypto.Keccak256.hash(&typed_sign_data);
+
+    var envelope: [2 + 32 + 32]u8 = undefined;
+    envelope[0] = 0x19;
+    envelope[1] = 0x01;
+    @memcpy(envelope[2..34], &app_domain_separator);
+    @memcpy(envelope[34..66], &typed_sign_struct_hash);
+    const digest = crypto.Keccak256.hash(&envelope);
+
+    const inner_sig = try crypto.signEip712(digest, private_key);
+    const inner_sig_hex = formatSignature(inner_sig);
+    const order_type_hex_len = ORDER_V2_TYPE_STRING.len * 2;
+
+    const total_len = 2 + 130 + 64 + 64 + order_type_hex_len + 4;
+    var out = try std.heap.page_allocator.alloc(u8, total_len);
+    out[0] = '0';
+    out[1] = 'x';
+
+    @memcpy(out[2..132], inner_sig_hex[2..132]);
+
+    var domain_hex_buf: [64]u8 = undefined;
+    _ = bytesToHexInto(&app_domain_separator, &domain_hex_buf);
+    @memcpy(out[132..196], &domain_hex_buf);
+
+    var contents_hex_buf: [64]u8 = undefined;
+    _ = bytesToHexInto(&contents_hash, &contents_hex_buf);
+    @memcpy(out[196..260], &contents_hex_buf);
+
+    _ = bytesToHexInto(ORDER_V2_TYPE_STRING, out[260 .. 260 + order_type_hex_len]);
+
+    const type_len_u16: u16 = @intCast(ORDER_V2_TYPE_STRING.len);
+    var type_len_bytes: [2]u8 = undefined;
+    std.mem.writeInt(u16, &type_len_bytes, type_len_u16, .big);
+    _ = bytesToHexInto(&type_len_bytes, out[260 + order_type_hex_len .. total_len]);
+
+    return out;
 }
 
 pub fn parseAddress(value: []const u8) ![20]u8 {
@@ -475,8 +578,9 @@ pub fn parseAddress(value: []const u8) ![20]u8 {
     return out;
 }
 
-/// Bootstrap API credentials by deriving or creating via the CLOB auth endpoints.
-/// Tries GET /auth/derive-api-key first; on 4xx falls back to POST /auth/api-key.
+/// Bootstrap API credentials via the same create-or-derive flow used by the
+/// official CLOB clients. Try POST /auth/api-key first, then fall back to
+/// GET /auth/derive-api-key if creation does not produce usable creds.
 pub fn bootstrapApiCredentials(
     allocator: std.mem.Allocator,
     private_key: [32]u8,
@@ -492,14 +596,7 @@ pub fn bootstrapApiCredentials(
     const sig = try crypto.signEip712(digest, private_key);
     const sig_hex = formatSignature(sig);
 
-    var addr_hex: [42]u8 = undefined;
-    addr_hex[0] = '0';
-    addr_hex[1] = 'x';
-    const charset = "0123456789abcdef";
-    for (address, 0..) |b, i| {
-        addr_hex[2 + i * 2] = charset[b >> 4];
-        addr_hex[2 + i * 2 + 1] = charset[b & 0x0f];
-    }
+    const addr_hex = formatAddressEip55(address);
 
     var nonce_buf: [32]u8 = undefined;
     const nonce_str = std.fmt.bufPrint(&nonce_buf, "{d}", .{nonce}) catch
@@ -512,17 +609,17 @@ pub fn bootstrapApiCredentials(
         .{ .name = "POLY_NONCE", .value = nonce_str },
     };
 
-    // Try GET /auth/derive-api-key
+    // Match the official client bootstrap sequence: create first, then derive.
     const derive_url = CLOB_API_BASE ++ "/auth/derive-api-key";
     const create_url = CLOB_API_BASE ++ "/auth/api-key";
 
     var client: std.http.Client = .{ .allocator = allocator };
     defer client.deinit();
 
-    const result = tryAuthRequest(allocator, &client, .GET, derive_url, null, &auth_headers) catch |e| blk: {
-        log.info("poly_auth", "derive-api-key failed ({s}), trying POST create", .{@errorName(e)});
-        break :blk tryAuthRequest(allocator, &client, .POST, create_url, "{}", &auth_headers) catch |e2| {
-            log.err("poly_auth", "POST /auth/api-key also failed: {s}", .{@errorName(e2)});
+    const result = tryAuthRequest(allocator, &client, .POST, create_url, "", &auth_headers) catch |e| blk: {
+        log.info("poly_auth", "create-api-key failed ({s}), trying GET derive", .{@errorName(e)});
+        break :blk tryAuthRequest(allocator, &client, .GET, derive_url, null, &auth_headers) catch |e2| {
+            log.err("poly_auth", "GET /auth/derive-api-key also failed: {s}", .{@errorName(e2)});
             return e2;
         };
     };
@@ -650,6 +747,61 @@ fn writeAddrPadded(buf: *[32]u8, addr: [20]u8) void {
     @memcpy(buf[12..32], &addr);
 }
 
+fn computeExchangeDomainSeparator(chain_id: u64, exchange_addr: [20]u8) [32]u8 {
+    const domain_type_hash = comptime blk: {
+        @setEvalBranchQuota(100000);
+        break :blk crypto.Keccak256.hash("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+    };
+    const name_hash = comptime blk: {
+        @setEvalBranchQuota(100000);
+        break :blk crypto.Keccak256.hash("Polymarket CTF Exchange");
+    };
+    const version_hash = comptime blk: {
+        @setEvalBranchQuota(100000);
+        break :blk crypto.Keccak256.hash("2");
+    };
+
+    var domain_data: [5 * 32]u8 = undefined;
+    @memcpy(domain_data[0..32], &domain_type_hash);
+    @memcpy(domain_data[32..64], &name_hash);
+    @memcpy(domain_data[64..96], &version_hash);
+    writeU256(domain_data[96..128], chain_id);
+    writeAddrPadded(domain_data[128..160], exchange_addr);
+    return crypto.Keccak256.hash(&domain_data);
+}
+
+fn computeOrderContentsHash(order: CtfOrder) [32]u8 {
+    const order_type_hash = comptime blk: {
+        @setEvalBranchQuota(100000);
+        break :blk crypto.Keccak256.hash(ORDER_V2_TYPE_STRING);
+    };
+
+    var struct_data: [12 * 32]u8 = undefined;
+    @memcpy(struct_data[0..32], &order_type_hash);
+    writeU256_wide(struct_data[32..64], order.salt);
+    writeAddrPadded(struct_data[64..96], order.maker);
+    writeAddrPadded(struct_data[96..128], order.signer);
+    writeU256_wide(struct_data[128..160], order.token_id);
+    writeU256_wide(struct_data[160..192], order.maker_amount);
+    writeU256_wide(struct_data[192..224], order.taker_amount);
+    writeU256(struct_data[224..256], order.side);
+    writeU256(struct_data[256..288], order.signature_type);
+    writeU256_wide(struct_data[288..320], order.timestamp);
+    @memcpy(struct_data[320..352], &order.metadata);
+    @memcpy(struct_data[352..384], &order.builder);
+    return crypto.Keccak256.hash(&struct_data);
+}
+
+fn bytesToHexInto(bytes: []const u8, out: []u8) []const u8 {
+    std.debug.assert(out.len >= bytes.len * 2);
+    const charset = "0123456789abcdef";
+    for (bytes, 0..) |b, i| {
+        out[i * 2] = charset[b >> 4];
+        out[i * 2 + 1] = charset[b & 0x0f];
+    }
+    return out[0 .. bytes.len * 2];
+}
+
 /// Parse a 40-char hex string into a 20-byte address at comptime.
 fn parseAddr(comptime hex: *const [40]u8) [20]u8 {
     var out: [20]u8 = undefined;
@@ -744,8 +896,8 @@ test "formatSignature: produces 0x-prefixed 130-char hex" {
 
 test "parseAddr: constant addresses" {
     // Verify the constant addresses parse without error
-    try testing.expectEqual(@as(u8, 0x4b), CTF_EXCHANGE[0]);
-    try testing.expectEqual(@as(u8, 0xC5), NEG_RISK_CTF_EXCHANGE[0]);
+    try testing.expectEqual(@as(u8, 0xE1), CTF_EXCHANGE[0]);
+    try testing.expectEqual(@as(u8, 0xe2), NEG_RISK_CTF_EXCHANGE[0]);
 }
 
 test "buildOrderDigest: produces 32-byte digest" {
@@ -753,19 +905,53 @@ test "buildOrderDigest: produces 32-byte digest" {
         .salt = 123456,
         .maker = [_]u8{0x01} ** 20,
         .signer = [_]u8{0x02} ** 20,
-        .taker = [_]u8{0} ** 20,
         .token_id = 999,
         .maker_amount = 1_000_000,
         .taker_amount = 2_000_000,
-        .expiration = 0,
-        .nonce = 0,
-        .fee_rate_bps = 100,
         .side = 0,
         .signature_type = 0,
+        .timestamp = 1_713_398_400_000,
+        .metadata = [_]u8{0} ** 32,
+        .builder = [_]u8{0} ** 32,
     };
     const digest = buildOrderDigest(order, CHAIN_ID, CTF_EXCHANGE);
     const zero32 = [_]u8{0} ** 32;
     try testing.expect(!std.mem.eql(u8, &digest, &zero32));
+}
+
+test "buildOrderDigest/signature: matches official V2 EOA reference" {
+    const private_key = hexToBytes("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+    const signer = try parseAddress("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+    const exchange = try parseAddress("0xE111180000d2663C0091e4f400237545B87B996B");
+
+    const order = CtfOrder{
+        .salt = 479249096354,
+        .maker = signer,
+        .signer = signer,
+        .token_id = 1234,
+        .maker_amount = 100000000,
+        .taker_amount = 50000000,
+        .side = 0,
+        .signature_type = 0,
+        .timestamp = 1710000000000,
+        .metadata = [_]u8{0} ** 32,
+        .builder = [_]u8{0} ** 32,
+    };
+
+    const digest = buildOrderDigest(order, 80002, exchange);
+    var digest_hex_buf: [64]u8 = undefined;
+    const digest_hex = bytesToHexTest(&digest, &digest_hex_buf);
+    try testing.expectEqualStrings(
+        "962c97b18bea292cc94b9479272aa74fb59a905e84a621a40eb339131e9fb6ba",
+        digest_hex,
+    );
+
+    const sig = try crypto.signEip712(digest, private_key);
+    const sig_hex = formatSignature(sig);
+    try testing.expectEqualStrings(
+        "0x518472f1b081f6bd713d638bb11d1bf0720ed577e93c52eb00ec9f5f325f7d510c65cbfdfe9130de2602185f4a500863d777d8b838cb28abc75ecc1b5330315d1c",
+        sig_hex[0..],
+    );
 }
 
 test "parseApiCredentials: valid JSON" {
@@ -812,7 +998,17 @@ test "parseSignatureType: accepts ids and names" {
     try testing.expectEqual(@as(u8, 1), try parseSignatureType("proxy"));
     try testing.expectEqual(@as(u8, 2), try parseSignatureType("GNOSIS_SAFE"));
     try testing.expectEqual(@as(u8, 2), try parseSignatureType("safe"));
-    try testing.expectError(error.InvalidSignatureType, parseSignatureType("3"));
+    try testing.expectEqual(@as(u8, 3), try parseSignatureType("3"));
+    try testing.expectEqual(@as(u8, 3), try parseSignatureType("POLY_1271"));
+    try testing.expectEqual(@as(u8, 3), try parseSignatureType("deposit_wallet"));
+    try testing.expectError(error.InvalidSignatureType, parseSignatureType("4"));
+}
+
+test "signatureTypeName: renders API enum names" {
+    try testing.expectEqualStrings("EOA", signatureTypeName(0));
+    try testing.expectEqualStrings("POLY_PROXY", signatureTypeName(1));
+    try testing.expectEqualStrings("GNOSIS_SAFE", signatureTypeName(2));
+    try testing.expectEqualStrings("POLY_1271", signatureTypeName(3));
 }
 
 test "parseAddress: accepts 0x and plain hex" {
