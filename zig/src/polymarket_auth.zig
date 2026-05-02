@@ -335,14 +335,16 @@ pub fn computeOrderAmounts(side: u8, price_f: f64, size_f: f64) !OrderAmounts {
 // USDC balance fetch (L2 GET /balance-allowance)
 // ---------------------------------------------------------------------------
 
-/// Fetch the current USDC (collateral) balance for `signer_address` from the
-/// Polymarket CLOB. Returns the balance in whole USDC units (i.e. raw 1e6
-/// units divided by 1e6). The HMAC signs only the path "/balance-allowance"
-/// (without the query string), matching py-clob-client behaviour.
+/// Fetch the current USDC (collateral) balance for the Polymarket account
+/// address that actually holds funds. In proxy / Safe setups this may differ
+/// from the signing key address. Returns the balance in whole USDC units
+/// (i.e. raw 1e6 units divided by 1e6). The HMAC signs only the path
+/// "/balance-allowance" (without the query string), matching py-clob-client
+/// behaviour.
 pub fn fetchUsdcBalance(
     allocator: std.mem.Allocator,
     creds: ApiCredentials,
-    signer_address: [20]u8,
+    account_address: [20]u8,
     signature_type: u8,
 ) !f64 {
     // Path used in the HMAC signature (no query string).
@@ -376,7 +378,7 @@ pub fn fetchUsdcBalance(
     addr_hex[0] = '0';
     addr_hex[1] = 'x';
     const charset = "0123456789abcdef";
-    for (signer_address, 0..) |b, i| {
+    for (account_address, 0..) |b, i| {
         addr_hex[2 + i * 2] = charset[b >> 4];
         addr_hex[2 + i * 2 + 1] = charset[b & 0x0f];
     }

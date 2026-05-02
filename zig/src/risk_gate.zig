@@ -200,28 +200,22 @@ pub fn validateOrder(request: OrderRequest, database: *db.DB, config: RiskConfig
         return .{ .reject = rejection };
     }
 
-    // Check 2b: Balance commitment ratio (only when balance snapshots are available)
+    // Check 2b: Balance commitment ratio (only when a usable balance snapshot is available)
     if (balance_opt) |usdc_balance| {
         if (usdc_balance <= 0) {
-            const rejection = Rejection{
-                .reason = .invalid_input, // or add a new enum value if desired
-                .check_name = "invalid_balance_snapshot",
-                .limit_value = 0.0,
-                .actual_value = usdc_balance,
-            };
-            persistRejection(database, request, rejection);
-            return .{ .reject = rejection };
-        }
-        const balance_limit = usdc_balance * config.max_balance_commitment_ratio;
-        if (current_exposure + notional > balance_limit) {
-            const rejection = Rejection{
-                .reason = .balance_commitment_exceeded,
-                .check_name = "max_balance_commitment_ratio",
-                .limit_value = balance_limit,
-                .actual_value = current_exposure + notional,
-            };
-            persistRejection(database, request, rejection);
-            return .{ .reject = rejection };
+            log.warn("risk_gate", "ignoring non-positive balance snapshot: {d:.6}", .{usdc_balance});
+        } else {
+            const balance_limit = usdc_balance * config.max_balance_commitment_ratio;
+            if (current_exposure + notional > balance_limit) {
+                const rejection = Rejection{
+                    .reason = .balance_commitment_exceeded,
+                    .check_name = "max_balance_commitment_ratio",
+                    .limit_value = balance_limit,
+                    .actual_value = current_exposure + notional,
+                };
+                persistRejection(database, request, rejection);
+                return .{ .reject = rejection };
+            }
         }
     }
 

@@ -299,10 +299,11 @@ pub fn main() !void {
         if (om_config.api_creds) |creds| {
             // Initial synchronous fetch so the engine has a real balance
             // before the strategy worker (and risk gate) start firing.
+            const balance_address = om_config.funder_address orelse om_config.signer_address;
             const bal0 = poly_auth.fetchUsdcBalance(
                 allocator,
                 creds,
-                om_config.signer_address,
+                balance_address,
                 om_config.signature_type,
             ) catch |e| blk: {
                 log.warn("engine", "initial USDC balance fetch failed: {s}", .{@errorName(e)});
@@ -323,7 +324,7 @@ pub fn main() !void {
                 .database = &database,
                 .pt = &pt,
                 .creds = creds,
-                .signer_address = om_config.signer_address,
+                .balance_address = balance_address,
                 .signature_type = om_config.signature_type,
                 .allocator = allocator,
                 .should_stop = std.atomic.Value(bool).init(false),
@@ -1031,7 +1032,7 @@ const BalanceTickerCtx = struct {
     database: *db.DB,
     pt: *portfolio.PortfolioTracker,
     creds: poly_auth.ApiCredentials,
-    signer_address: [20]u8,
+    balance_address: [20]u8,
     signature_type: u8,
     allocator: std.mem.Allocator,
     should_stop: std.atomic.Value(bool),
@@ -1056,7 +1057,7 @@ fn balanceTicker(ctx: *BalanceTickerCtx) void {
         const bal = poly_auth.fetchUsdcBalance(
             ctx.allocator,
             ctx.creds,
-            ctx.signer_address,
+            ctx.balance_address,
             ctx.signature_type,
         ) catch |e| {
             log.warn("balance_ticker", "failed to fetch USDC balance: {s}", .{@errorName(e)});

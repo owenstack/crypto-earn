@@ -568,10 +568,10 @@ pub const DB = struct {
         return c.sqlite3_column_double(stmt, 0);
     }
 
-    /// Query the latest USDC balance from balance_snapshots.
-    /// Returns null if no snapshot exists or it's older than max_age_seconds.
+    /// Query the latest usable USDC balance from balance_snapshots.
+    /// Returns null if no recent positive snapshot exists.
     pub fn queryLatestUsdcBalance(self: DB, max_age_seconds: i64) !?f64 {
-        const sql = "SELECT CAST(usdc_balance AS REAL), snapshot_at FROM balance_snapshots ORDER BY snapshot_at DESC LIMIT 1;" ++ &[_:0]u8{};
+        const sql = "SELECT id, CAST(usdc_balance AS REAL), snapshot_at FROM balance_snapshots ORDER BY snapshot_at DESC, id DESC;" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
             log.err("db", "failed to prepare queryLatestUsdcBalance", .{});
@@ -579,27 +579,32 @@ pub const DB = struct {
         }
         defer _ = c.sqlite3_finalize(stmt);
 
-        const rc = c.sqlite3_step(stmt);
-        if (rc == c.SQLITE_ROW) {
-            // proceed
-        } else if (rc == c.SQLITE_DONE) {
-            return null; // no snapshots
-        } else {
-            const err_msg = c.sqlite3_errmsg(self.handle);
-            log.err("db", "failed to execute queryLatestUsdcBalance: {s}", .{err_msg});
-            return error.DBExecFailed;
-        }
-
-        const balance = c.sqlite3_column_double(stmt, 0);
-        const snapshot_at = c.sqlite3_column_int64(stmt, 1);
         const now = std.time.timestamp();
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_ROW) {
+                const row_id = c.sqlite3_column_int64(stmt, 0);
+                const balance = c.sqlite3_column_double(stmt, 1);
+                const snapshot_at = c.sqlite3_column_int64(stmt, 2);
+                const age = now - snapshot_at;
 
-        if (now - snapshot_at > max_age_seconds) {
-            log.warn("db", "balance snapshot stale: age={d}s max={d}s", .{ now - snapshot_at, max_age_seconds });
-            return null;
+                if (age > max_age_seconds) {
+                    log.warn("db", "balance snapshot stale: id={d} age={d}s max={d}s", .{ row_id, age, max_age_seconds });
+                    return null;
+                }
+                if (balance <= 0 or !std.math.isFinite(balance)) {
+                    log.warn("db", "ignoring invalid balance snapshot: id={d} balance={d:.6}", .{ row_id, balance });
+                    continue;
+                }
+                return balance;
+            } else if (rc == c.SQLITE_DONE) {
+                return null;
+            } else {
+                const err_msg = c.sqlite3_errmsg(self.handle);
+                log.err("db", "failed to execute queryLatestUsdcBalance: {s}", .{err_msg});
+                return error.DBExecFailed;
+            }
         }
-
-        return balance;
     }
 
     /// Insert a USDC balance snapshot.

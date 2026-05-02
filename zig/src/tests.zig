@@ -641,6 +641,34 @@ test "risk_gate: allows duplicate when configured" {
     try testing.expect(result == .pass);
 }
 
+test "risk_gate: falls back when latest balance snapshot is non-positive" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.insertBalanceSnapshot(10.0, 0.0, 0.0, 0.0);
+    try database.insertBalanceSnapshot(0.0, 0.0, 0.0, 0.0);
+
+    const config = risk_gate.RiskConfig{
+        .max_position_usd_fallback = 50.0,
+        .max_portfolio_exposure_usd_fallback = 100.0,
+        .max_daily_drawdown_usd_fallback = 25.0,
+        .max_balance_commitment_ratio = 0.70,
+    };
+
+    const request = risk_gate.OrderRequest{
+        .market_id = "test-market",
+        .side = "buy",
+        .size = "10",
+        .price = "0.50",
+        .order_type = "limit",
+        .client_order_id = "test-invalid-balance-fallback",
+    };
+
+    const result = risk_gate.validateOrder(request, &database, config);
+    try testing.expect(result == .pass);
+}
+
 test "risk_gate: rejection reason names are correct" {
     try testing.expectEqualStrings("MaxPositionExceeded", risk_gate.rejectionReasonName(.max_position_exceeded));
     try testing.expectEqualStrings("MaxPortfolioExposureExceeded", risk_gate.rejectionReasonName(.max_portfolio_exposure_exceeded));
@@ -716,6 +744,18 @@ test "db: migration 002 creates risk_events and balance_snapshots tables" {
     // These should not error - tables exist
     try database.execZ("SELECT count(*) FROM risk_events;");
     try database.execZ("SELECT count(*) FROM balance_snapshots;");
+}
+
+test "db: queryLatestUsdcBalance skips invalid recent snapshots" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.insertBalanceSnapshot(25.0, 0.0, 0.0, 0.0);
+    try database.insertBalanceSnapshot(0.0, 0.0, 0.0, 0.0);
+
+    const balance = try database.queryLatestUsdcBalance(600);
+    try testing.expectEqual(@as(?f64, 25.0), balance);
 }
 
 test "db: insertOrder and queryOpenOrderCount" {
