@@ -444,6 +444,35 @@ pub const ApiCredentials = struct {
     passphrase_len: usize,
 };
 
+pub fn parseSignatureType(value: []const u8) !u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "EOA") or std.mem.eql(u8, trimmed, "0")) return 0;
+    if (std.ascii.eqlIgnoreCase(trimmed, "POLY_PROXY") or
+        std.ascii.eqlIgnoreCase(trimmed, "POLYPROXY") or
+        std.ascii.eqlIgnoreCase(trimmed, "PROXY") or
+        std.mem.eql(u8, trimmed, "1")) return 1;
+    if (std.ascii.eqlIgnoreCase(trimmed, "GNOSIS_SAFE") or
+        std.ascii.eqlIgnoreCase(trimmed, "GNOSIS") or
+        std.ascii.eqlIgnoreCase(trimmed, "SAFE") or
+        std.mem.eql(u8, trimmed, "2")) return 2;
+    return error.InvalidSignatureType;
+}
+
+pub fn parseAddress(value: []const u8) ![20]u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    const hex = if (trimmed.len >= 2 and trimmed[0] == '0' and (trimmed[1] == 'x' or trimmed[1] == 'X'))
+        trimmed[2..]
+    else
+        trimmed;
+    if (hex.len != 40) return error.InvalidAddress;
+
+    var out: [20]u8 = undefined;
+    for (0..20) |i| {
+        out[i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch return error.InvalidAddress;
+    }
+    return out;
+}
+
 /// Bootstrap API credentials by deriving or creating via the CLOB auth endpoints.
 /// Tries GET /auth/derive-api-key first; on 4xx falls back to POST /auth/api-key.
 pub fn bootstrapApiCredentials(
@@ -772,6 +801,25 @@ test "parseBalanceResponse: zero balance" {
 test "parseBalanceResponse: missing balance field" {
     const body = "{\"allowance\":\"100\"}";
     try testing.expectError(error.ParseFailed, parseBalanceResponse(body));
+}
+
+test "parseSignatureType: accepts ids and names" {
+    try testing.expectEqual(@as(u8, 0), try parseSignatureType("0"));
+    try testing.expectEqual(@as(u8, 0), try parseSignatureType("EOA"));
+    try testing.expectEqual(@as(u8, 1), try parseSignatureType("POLY_PROXY"));
+    try testing.expectEqual(@as(u8, 1), try parseSignatureType("proxy"));
+    try testing.expectEqual(@as(u8, 2), try parseSignatureType("GNOSIS_SAFE"));
+    try testing.expectEqual(@as(u8, 2), try parseSignatureType("safe"));
+    try testing.expectError(error.InvalidSignatureType, parseSignatureType("3"));
+}
+
+test "parseAddress: accepts 0x and plain hex" {
+    const expected = hexToBytes("2c7536e3605d9c16a7a3d7b1898e529396a65c23");
+    const a = try parseAddress("0x2c7536e3605d9c16a7a3d7b1898e529396a65c23");
+    const b = try parseAddress("2c7536e3605d9c16a7a3d7b1898e529396a65c23");
+    try testing.expectEqualSlices(u8, &expected, &a);
+    try testing.expectEqualSlices(u8, &expected, &b);
+    try testing.expectError(error.InvalidAddress, parseAddress("0x1234"));
 }
 
 // Test helpers

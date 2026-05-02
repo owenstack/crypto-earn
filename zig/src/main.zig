@@ -106,6 +106,22 @@ pub fn main() !void {
         log.warn("engine", "POLYMARKET_PRIVATE_KEY not set — orders will fail", .{});
     }
 
+    if (std.posix.getenv("POLYMARKET_SIGNATURE_TYPE")) |sig_env| {
+        om_config.signature_type = poly_auth.parseSignatureType(sig_env) catch |e| {
+            log.err("engine", "invalid POLYMARKET_SIGNATURE_TYPE: {s} ({s})", .{ sig_env, @errorName(e) });
+            return e;
+        };
+        log.info("engine", "Polymarket signature_type={d}", .{om_config.signature_type});
+    }
+
+    if (std.posix.getenv("POLYMARKET_FUNDER_ADDRESS")) |funder_env| {
+        om_config.funder_address = poly_auth.parseAddress(funder_env) catch |e| {
+            log.err("engine", "invalid POLYMARKET_FUNDER_ADDRESS: {s} ({s})", .{ funder_env, @errorName(e) });
+            return e;
+        };
+        log.info("engine", "loaded POLYMARKET_FUNDER_ADDRESS", .{});
+    }
+
     // Initialize order manager
     var om = order_mgr.OrderManager.init(allocator, &database, risk_config, om_config);
     log.info("engine", "order manager ready", .{});
@@ -293,7 +309,8 @@ pub fn main() !void {
                 break :blk @as(?f64, null);
             };
             if (bal0) |b| {
-                database.insertBalanceSnapshot(b, 0.0, 0.0, 0.0) catch |e| {
+                const snap = pt.getSnapshot();
+                database.insertBalanceSnapshot(b, snap.total_exposure_usd, snap.unrealized_pnl, snap.realized_pnl_today) catch |e| {
                     log.warn("engine", "failed to seed initial balance snapshot: {s}", .{@errorName(e)});
                 };
                 pt.markBalanceDirty();
@@ -1060,6 +1077,7 @@ fn balanceTicker(ctx: *BalanceTickerCtx) void {
         };
 
         ctx.pt.markBalanceDirty();
+        ctx.pt.syncFromDB();
         log.info("balance_ticker", "USDC balance: ${d:.6}", .{bal});
     }
 

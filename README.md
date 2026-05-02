@@ -66,6 +66,13 @@ Required keys in `.env`:
   - Generate with: `openssl rand -hex 32`
   - Example: `d43b6fd9a0a81b7e5f6be4a6bd3d2f0e9f0c0ad4c08371d4d4f3d4a2df922e15`
 - `POLYMARKET_PRIVATE_KEY`: Polymarket wallet private key used by the engine for live order signing.
+- `POLYMARKET_PRIVATE_KEY`: Polymarket wallet private key used by the engine for live order signing.
+
+Optional/common keys:
+
+- `POLYMARKET_SIGNATURE_TYPE`: Wallet signature type for Polymarket live mode. Accepts `0`/`EOA`, `1`/`POLY_PROXY`, or `2`/`GNOSIS_SAFE`. Defaults to `0`.
+- `POLYMARKET_FUNDER_ADDRESS`: Required when the funded Polymarket wallet differs from the signing key, such as proxy or Safe wallets.
+- `KALSHI_API_KEY` (strongly recommended for primary probability data)
 
 Optional/common keys:
 
