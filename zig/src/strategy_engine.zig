@@ -24,7 +24,8 @@ pub const StrategyConfig = struct {
     news_delta_threshold: f64 = 0.06,
     news_confidence_min: f64 = 0.40,
 
-    /// News order size as fraction of balance. 0.12 on $10 = $1.20.
+    /// News order size as fraction of balance, converted into a share count by
+    /// the strategy/order layer. A minimum floor is enforced separately.
     news_order_size_pct: f64 = 0.12,
     news_order_size_fallback: f64 = 1.20,
 
@@ -32,17 +33,18 @@ pub const StrategyConfig = struct {
     lp_min_spread: f64 = 0.06,
     lp_exit_spread: f64 = 0.03,
 
-    /// LP order size as fraction of balance. 0.07 on $10 = $0.70.
+    /// LP order size as fraction of balance, converted into a share count by
+    /// the strategy/order layer. A minimum floor is enforced separately.
     lp_order_size_pct: f64 = 0.07,
     lp_order_size_fallback: f64 = 0.70,
 };
 
-/// Resolve a strategy order size from a balance and ratio config.
-/// Floors at $0.50 (Polymarket minimum viable order). Falls back to the
-/// absolute value when no balance is available.
+/// Resolve a strategy order size in shares from a balance-scaled config.
+/// Polymarket rejects dust orders well below 5 shares, so enforce that floor
+/// even when the balance-scaled target is smaller.
 pub fn resolveOrderSize(balance: f64, pct: f64, fallback: f64) f64 {
-    if (balance <= 0) return fallback;
-    return @max(balance * pct, 0.50);
+    if (balance <= 0) return @max(fallback, 5.0);
+    return @max(balance * pct, 5.0);
 }
 
 pub const StrategyStats = struct {
@@ -204,14 +206,19 @@ pub const StrategyEngine = struct {
         const spread = best_ask - best_bid;
         if (spread < self.config.lp_min_spread) return .{ .signals = undefined, .count = 0 };
 
-        // Check per-market inventory limit
+        // Check per-market inventory limit and current inventory. With the
+        // current token-resolution path, we can safely quote asks only against
+        // inventory we already own; otherwise asks are rejected by Polymarket
+        // as unsupported naked sells.
         const mid_price = (best_bid + best_ask) / 2.0;
+        var inventory_shares: f64 = 0.0;
         {
             self.state_mu.lock();
             defer self.state_mu.unlock();
             for (self.market_inventory[0..self.inventory_count]) |slot| {
                 if (slot) |inv| {
                     if (std.mem.eql(u8, inv.market_id[0..inv.market_id_len], market_id)) {
+                        inventory_shares = inv.net_shares;
                         const exposure = @abs(inv.net_shares) * mid_price;
                         if (exposure >= self.lp_max_position_usd) {
                             log.info("strategy", "LP signal blocked: inventory limit reached for {s} (exposure={d:.2} >= limit={d:.2})", .{
@@ -235,7 +242,6 @@ pub const StrategyEngine = struct {
 
         self.state_mu.lock();
         defer self.state_mu.unlock();
-        self.lp_stats.signals_emitted += 2;
 
         log.info("strategy", "lp signals: market={s} bid={d:.4} ask={d:.4} spread={d:.4}", .{
             market_id,
@@ -245,7 +251,35 @@ pub const StrategyEngine = struct {
         });
 
         const order_size = resolveOrderSize(balance, self.config.lp_order_size_pct, self.config.lp_order_size_fallback);
+        const ts = std.time.timestamp();
 
+        // Quote one side at a time:
+        // - no inventory: rest a bid to acquire shares
+        // - inventory >= 5 shares: rest an ask capped by holdings
+        if (inventory_shares >= 5.0) {
+            const sell_size = @min(order_size, inventory_shares);
+            self.lp_stats.signals_emitted += 1;
+            return .{
+                .signals = .{
+                    Signal{
+                        .strategy = .liquidity_provision,
+                        .market_id = mid,
+                        .market_id_len = mid_len,
+                        .direction = .sell,
+                        .price = ask_price,
+                        .size = sell_size,
+                        .confidence = confidence,
+                        .timestamp = ts,
+                        .best_bid = best_bid,
+                        .best_ask = best_ask,
+                    },
+                    undefined,
+                },
+                .count = 1,
+            };
+        }
+
+        self.lp_stats.signals_emitted += 1;
         return .{
             .signals = .{
                 Signal{
@@ -256,24 +290,13 @@ pub const StrategyEngine = struct {
                     .price = bid_price,
                     .size = order_size,
                     .confidence = confidence,
-                    .timestamp = std.time.timestamp(),
+                    .timestamp = ts,
                     .best_bid = best_bid,
                     .best_ask = best_ask,
                 },
-                Signal{
-                    .strategy = .liquidity_provision,
-                    .market_id = mid,
-                    .market_id_len = mid_len,
-                    .direction = .sell,
-                    .price = ask_price,
-                    .size = order_size,
-                    .confidence = confidence,
-                    .timestamp = std.time.timestamp(),
-                    .best_bid = best_bid,
-                    .best_ask = best_ask,
-                },
+                undefined,
             },
-            .count = 2,
+            .count = 1,
         };
     }
 

@@ -502,22 +502,25 @@ pub const OrderManager = struct {
             self.config.signer_address;
 
         // Build CTF Order struct
-        // Salt: match SDK pattern — timestamp * random(), fits in u64 for JSON integer compat
-        const ts_sec: u64 = @intCast(std.time.timestamp());
-        const ts_ms: u64 = @intCast(std.time.milliTimestamp());
+        // Match the official client: salt is a random integer bounded by Date.now().
+        const ts_ms_i64 = std.time.milliTimestamp();
+        const ts_ms: u64 = @intCast(@max(ts_ms_i64, 1));
         var rand_bytes: [8]u8 = undefined;
         std.crypto.random.bytes(&rand_bytes);
         const rand_val = std.mem.readInt(u64, &rand_bytes, .big);
-        const safe_ts = @max(ts_sec, 1);
-        const salt: u256 = @as(u256, safe_ts) *% (rand_val % safe_ts + 1);
+        const salt: u256 = @as(u256, rand_val % ts_ms + 1);
 
         const order = poly_auth.CtfOrder{
             .salt = salt,
             .maker = maker,
             .signer = order_signer,
+            .taker = [_]u8{0} ** 20,
             .token_id = token_id_u256,
             .maker_amount = amounts.maker_amount,
             .taker_amount = amounts.taker_amount,
+            .expiration = 0,
+            .nonce = 0,
+            .fee_rate_bps = 0,
             .side = side_u8,
             .signature_type = self.config.signature_type,
             .timestamp = ts_ms,
@@ -555,14 +558,20 @@ pub const OrderManager = struct {
             break :blk order_sig_hex_buf[0..];
         };
 
-        // Format address
-        const addr_hex = poly_auth.formatAddressEip55(self.config.signer_address);
+        // L2 authenticated requests always identify the signer EOA associated
+        // with the API key. The funded Safe/proxy is inferred server-side from
+        // signatureType and is not sent in POLY_ADDRESS.
+        const auth_address = self.config.signer_address;
+        const addr_hex = poly_auth.formatAddressEip55(auth_address);
 
         // Format maker address
         const maker_hex = poly_auth.formatAddressEip55(maker);
 
         // Format order signer address
         const order_signer_hex = poly_auth.formatAddressEip55(order_signer);
+
+        // Format taker address
+        const taker_hex = poly_auth.formatAddressEip55(order.taker);
 
         // Build the SendOrder JSON body
         var salt_buf: [80]u8 = undefined;
@@ -571,12 +580,9 @@ pub const OrderManager = struct {
         const maker_amt_str = std.fmt.bufPrint(&maker_amt_buf, "{d}", .{amounts.maker_amount}) catch "0";
         var taker_amt_buf: [32]u8 = undefined;
         const taker_amt_str = std.fmt.bufPrint(&taker_amt_buf, "{d}", .{amounts.taker_amount}) catch "0";
-
         var timestamp_buf: [32]u8 = undefined;
-        const timestamp_str = std.fmt.bufPrint(&timestamp_buf, "{d}", .{ts_ms}) catch "0";
+        const timestamp_str = std.fmt.bufPrint(&timestamp_buf, "{d}", .{order.timestamp}) catch "0";
         const zero_bytes32 = "0x0000000000000000000000000000000000000000000000000000000000000000";
-        const empty_metadata = "";
-
         var body_buf: [2048]u8 = undefined;
         // Map internal order types to CLOB-compatible types
         const clob_order_type: []const u8 = if (std.mem.eql(u8, order_type, "limit") or std.mem.eql(u8, order_type, "GTC"))
@@ -588,18 +594,19 @@ pub const OrderManager = struct {
         // owner = API key (UUID), not the signer address
         const api_key = creds.api_key[0..creds.api_key_len];
         const json_body = std.fmt.bufPrint(&body_buf,
-            \\{{"order":{{"salt":{s},"maker":"{s}","signer":"{s}","tokenId":"{s}","makerAmount":"{s}","takerAmount":"{s}","side":"{s}","expiration":"0","signatureType":{d},"timestamp":"{s}","metadata":"{s}","builder":"{s}","signature":"{s}"}},"owner":"{s}","orderType":"{s}","deferExec":false}}
+            \\{{"deferExec":false,"postOnly":false,"order":{{"salt":{s},"maker":"{s}","signer":"{s}","taker":"{s}","tokenId":"{s}","makerAmount":"{s}","takerAmount":"{s}","side":"{s}","signatureType":{d},"timestamp":"{s}","expiration":"0","metadata":"{s}","builder":"{s}","signature":"{s}"}},"owner":"{s}","orderType":"{s}"}}
         , .{
             salt_str,
             &maker_hex,
             &order_signer_hex,
+            &taker_hex,
             token_id,
             maker_amt_str,
             taker_amt_str,
             if (side_u8 == 0) "BUY" else "SELL",
             self.config.signature_type,
             timestamp_str,
-            empty_metadata,
+            zero_bytes32,
             zero_bytes32,
             order_sig_hex,
             api_key,
@@ -812,8 +819,8 @@ pub const OrderManager = struct {
             return false;
         };
 
-        // Format address
-        const addr_hex = poly_auth.formatAddressEip55(self.config.signer_address);
+        const auth_address = self.config.signer_address;
+        const addr_hex = poly_auth.formatAddressEip55(auth_address);
 
         var delay_ms: u64 = 1000;
         const max_delay_ms: u64 = 60_000;

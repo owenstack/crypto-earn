@@ -174,7 +174,8 @@ pub const FillPoller = struct {
             return null;
         };
 
-        const auth_addr_hex = poly_auth.formatAddressEip55(self.om.config.signer_address);
+        const auth_address = self.om.config.signer_address;
+        const auth_addr_hex = poly_auth.formatAddressEip55(auth_address);
 
         var client = http.HttpClient.init(self.allocator);
         defer client.deinit();
@@ -699,10 +700,8 @@ pub const FillPoller = struct {
         };
 
         // Step 1: Fetch all open orders from CLOB
-        const auth_addr_hex = poly_auth.formatAddressEip55(self.om.config.signer_address);
-        const maker_addr = self.om.config.funder_address orelse self.om.config.signer_address;
-        const maker_addr_hex = poly_auth.formatAddressEip55(maker_addr);
-
+        const auth_address = self.om.config.signer_address;
+        const auth_addr_hex = poly_auth.formatAddressEip55(auth_address);
         // Use ArrayList for dynamic order id storage
         var clob_order_ids: std.ArrayList([]const u8) = .empty;
         defer clob_order_ids.deinit(self.allocator);
@@ -713,24 +712,22 @@ pub const FillPoller = struct {
         while (page < 25) : (page += 1) {
             var url_buf: [512]u8 = undefined;
             const url = if (next_cursor_len > 0)
-                std.fmt.bufPrint(&url_buf, "{s}/orders?maker_address={s}&status=open&next_cursor={s}", .{
-                    CLOB_API_BASE, &maker_addr_hex, next_cursor[0..next_cursor_len],
+                std.fmt.bufPrint(&url_buf, "{s}/data/orders?status=open&next_cursor={s}", .{
+                    CLOB_API_BASE, next_cursor[0..next_cursor_len],
                 }) catch break
             else
-                std.fmt.bufPrint(&url_buf, "{s}/orders?maker_address={s}&status=open", .{
-                    CLOB_API_BASE, &maker_addr_hex,
-                }) catch break;
+                std.fmt.bufPrint(&url_buf, "{s}/data/orders?status=open", .{CLOB_API_BASE}) catch break;
 
             var ts_buf: [32]u8 = undefined;
             const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch break;
 
             var path_buf: [512]u8 = undefined;
             const req_path = if (next_cursor_len > 0)
-                std.fmt.bufPrint(&path_buf, "/orders?maker_address={s}&status=open&next_cursor={s}", .{
-                    &maker_addr_hex, next_cursor[0..next_cursor_len],
+                std.fmt.bufPrint(&path_buf, "/data/orders?status=open&next_cursor={s}", .{
+                    next_cursor[0..next_cursor_len],
                 }) catch break
             else
-                std.fmt.bufPrint(&path_buf, "/orders?maker_address={s}&status=open", .{&maker_addr_hex}) catch break;
+                std.fmt.bufPrint(&path_buf, "/data/orders?status=open", .{}) catch break;
 
             const hmac = poly_auth.buildHmacSignature(
                 creds.secret[0..creds.secret_len],
@@ -827,11 +824,11 @@ pub const FillPoller = struct {
 
             // Fetch order details from CLOB
             var url_buf: [512]u8 = undefined;
-            const order_url = std.fmt.bufPrint(&url_buf, "{s}/order/{s}", .{ CLOB_API_BASE, clob_id }) catch null;
+            const order_url = std.fmt.bufPrint(&url_buf, "{s}/data/order/{s}", .{ CLOB_API_BASE, clob_id }) catch null;
             var ts_buf: [32]u8 = undefined;
             const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch null;
             var path_buf: [256]u8 = undefined;
-            const path = std.fmt.bufPrint(&path_buf, "/order/{s}", .{clob_id}) catch null;
+            const path = std.fmt.bufPrint(&path_buf, "/data/order/{s}", .{clob_id}) catch null;
             var market_id: []const u8 = "unknown";
             var size: []const u8 = "0";
             var price: []const u8 = "0";

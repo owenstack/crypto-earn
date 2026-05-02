@@ -51,6 +51,7 @@ pub fn main() !void {
 
     // Parse private key from environment and bootstrap Polymarket auth
     var om_config = order_mgr.OrderManagerConfig{};
+    var api_bootstrap_err: ?[]const u8 = null;
     if (std.posix.getenv("POLYMARKET_PRIVATE_KEY")) |pk_env| {
         // Strip optional "0x" prefix
         const hex = if (pk_env.len >= 2 and pk_env[0] == '0' and (pk_env[1] == 'x' or pk_env[1] == 'X'))
@@ -85,6 +86,7 @@ pub fn main() !void {
                             creds.api_key[0..@min(creds.api_key_len, 8)],
                         });
                     } else |e| {
+                        api_bootstrap_err = @errorName(e);
                         log.err("engine", "failed to bootstrap API credentials: {s}", .{@errorName(e)});
                         log.warn("engine", "engine will start but order submission will fail", .{});
                     }
@@ -117,6 +119,8 @@ pub fn main() !void {
         };
         log.info("engine", "loaded POLYMARKET_FUNDER_ADDRESS", .{});
     }
+
+    emitPolymarketStartupDiagnostic(allocator, om_config, api_bootstrap_err);
 
     // Initialize order manager
     var om = order_mgr.OrderManager.init(allocator, &database, risk_config, om_config);
@@ -293,9 +297,28 @@ pub fn main() !void {
     var balance_thread_opt: ?std.Thread = null;
     if (!dry_run) {
         if (om_config.api_creds) |creds| {
+            const balance_address = om_config.funder_address orelse om_config.signer_address;
+            const auth_validation = validateLivePolymarketAuth(
+                allocator,
+                creds,
+                om_config.signer_address,
+                balance_address,
+                om_config.signature_type,
+            );
+            if (!auth_validation.ok) {
+                om.setPaused(true);
+                if (auth_validation.suggested_signature_type) |suggested| {
+                    log.err("engine", "live trading blocked: funded wallet authentication failed; set POLYMARKET_SIGNATURE_TYPE={d} ({s}) and restart", .{
+                        suggested,
+                        poly_auth.signatureTypeName(suggested),
+                    });
+                } else {
+                    log.err("engine", "live trading blocked: signer/funder authentication failed for configured Polymarket wallet", .{});
+                }
+            }
+
             // Initial synchronous fetch so the engine has a real balance
             // before the strategy worker (and risk gate) start firing.
-            const balance_address = om_config.funder_address orelse om_config.signer_address;
             const bal0 = fetchUsdcBalanceWithFallback(
                 allocator,
                 creds,
@@ -328,7 +351,9 @@ pub fn main() !void {
             balance_thread_opt = try std.Thread.spawn(.{}, balanceTicker, .{ctx});
             log.info("engine", "balance refresh ticker started (60s interval)", .{});
         } else {
+            om.setPaused(true);
             log.warn("engine", "no API credentials — USDC balance ticker disabled (orders will be rejected by risk gate)", .{});
+            log.err("engine", "live trading blocked: API credential bootstrap failed; fix Polymarket wallet auth and restart", .{});
         }
     }
     defer {
@@ -404,6 +429,10 @@ fn strategyWorker(ctx: *StrategyWorkerCtx) void {
         // Skip evaluation if engine is halted
         if (ctx.om.isHalted()) {
             log.debug("strategy_worker", "skipping evaluation: engine halted", .{});
+            continue;
+        }
+        if (ctx.om.isPaused()) {
+            log.debug("strategy_worker", "skipping evaluation: engine paused", .{});
             continue;
         }
 
@@ -1094,30 +1123,169 @@ fn fetchUsdcBalanceWithFallback(
     balance_address: [20]u8,
     signature_type: u8,
 ) ?f64 {
-    const primary_address = balance_address;
-    const fallback_address = signer_address;
-
     return poly_auth.fetchUsdcBalance(
         allocator,
         creds,
-        primary_address,
+        signer_address,
         signature_type,
-    ) catch |primary_err| blk: {
-        log.warn("engine", "USDC balance fetch failed for primary balance address: {s}", .{@errorName(primary_err)});
-        if (std.mem.eql(u8, primary_address[0..], fallback_address[0..])) break :blk null;
+    ) catch |err| blk: {
+        const balance_hex = poly_auth.formatAddressEip55(balance_address);
+        log.warn("engine", "collateral balance fetch failed for configured funder={s} signature_type={s}: {s}", .{
+            &balance_hex,
+            poly_auth.signatureTypeName(signature_type),
+            @errorName(err),
+        });
+        break :blk null;
+    };
+}
 
-        const bal = poly_auth.fetchUsdcBalance(
+const AuthValidationResult = struct {
+    ok: bool,
+    suggested_signature_type: ?u8 = null,
+};
+
+fn emitPolymarketStartupDiagnostic(
+    allocator: std.mem.Allocator,
+    om_config: order_mgr.OrderManagerConfig,
+    api_bootstrap_err: ?[]const u8,
+) void {
+    const signer_hex = poly_auth.formatAddressEip55(om_config.signer_address);
+    const balance_address = om_config.funder_address orelse om_config.signer_address;
+    const balance_hex = poly_auth.formatAddressEip55(balance_address);
+    const signer_equals_funder = std.mem.eql(u8, om_config.signer_address[0..], balance_address[0..]);
+    const sig_name = poly_auth.signatureTypeName(om_config.signature_type);
+
+    log.info("poly_diag", "startup diagnostic: signer={s} funder={s} same_address={} signature_type={d}({s}) creds={s}", .{
+        &signer_hex,
+        &balance_hex,
+        signer_equals_funder,
+        om_config.signature_type,
+        sig_name,
+        if (om_config.api_creds != null) "present" else "missing",
+    });
+
+    if (api_bootstrap_err) |err_name| {
+        log.err("poly_diag", "api credential bootstrap failed: {s}", .{err_name});
+    }
+
+    if (om_config.api_creds) |creds| {
+        const configured_probe = poly_auth.fetchUsdcBalance(
             allocator,
             creds,
-            fallback_address,
-            signature_type,
-        ) catch |fallback_err| {
-            log.warn("engine", "USDC balance fetch failed for signer-address fallback: {s}", .{@errorName(fallback_err)});
-            break :blk null;
-        };
-        log.info("engine", "USDC balance fetch succeeded via signer-address fallback", .{});
-        break :blk bal;
-    };
+            om_config.signer_address,
+            om_config.signature_type,
+        );
+        if (configured_probe) |bal| {
+            log.info("poly_diag", "configured funder probe OK: signature_type={s} balance=${d:.6}", .{
+                sig_name,
+                bal,
+            });
+        } else |e| {
+            log.warn("poly_diag", "configured funder probe failed: signature_type={s} err={s}", .{
+                sig_name,
+                @errorName(e),
+            });
+        }
+
+        const probe_types = [_]u8{ 0, 1, 2 };
+        for (probe_types) |candidate_type| {
+            if (candidate_type == om_config.signature_type) continue;
+            if (poly_auth.fetchUsdcBalance(
+                allocator,
+                creds,
+                om_config.signer_address,
+                candidate_type,
+            )) |bal| {
+                log.warn("poly_diag", "alternate funder probe OK: signature_type={d}({s}) balance=${d:.6}", .{
+                    candidate_type,
+                    poly_auth.signatureTypeName(candidate_type),
+                    bal,
+                });
+            } else |e| {
+                log.debug("poly_diag", "alternate funder probe failed: signature_type={d}({s}) err={s}", .{
+                    candidate_type,
+                    poly_auth.signatureTypeName(candidate_type),
+                    @errorName(e),
+                });
+            }
+        }
+
+        if (!signer_equals_funder) {
+            if (poly_auth.fetchUsdcBalance(
+                allocator,
+                creds,
+                om_config.signer_address,
+                om_config.signature_type,
+            )) |bal| {
+                log.info("poly_diag", "signer-address probe OK: signature_type={s} balance=${d:.6}", .{
+                    sig_name,
+                    bal,
+                });
+            } else |e| {
+                log.warn("poly_diag", "signer-address probe failed: signature_type={s} err={s}", .{
+                    sig_name,
+                    @errorName(e),
+                });
+            }
+        }
+    } else {
+        log.warn("poly_diag", "skipping balance probes because API credentials are unavailable", .{});
+    }
+}
+
+fn validateLivePolymarketAuth(
+    allocator: std.mem.Allocator,
+    creds: poly_auth.ApiCredentials,
+    signer_address: [20]u8,
+    balance_address: [20]u8,
+    configured_signature_type: u8,
+) AuthValidationResult {
+    if (poly_auth.fetchUsdcBalance(
+        allocator,
+        creds,
+        signer_address,
+        configured_signature_type,
+    )) |_| {
+        return .{ .ok = true };
+    } else |configured_err| {
+        log.warn("engine", "configured funder auth probe failed: signature_type={s} err={s}", .{
+            poly_auth.signatureTypeName(configured_signature_type),
+            @errorName(configured_err),
+        });
+    }
+
+    const supported_types = [_]u8{ 0, 1, 2 };
+    for (supported_types) |candidate_type| {
+        if (candidate_type == configured_signature_type) continue;
+        if (poly_auth.fetchUsdcBalance(
+            allocator,
+            creds,
+            signer_address,
+            candidate_type,
+        )) |bal| {
+            log.warn("engine", "alternate funder auth probe succeeded: signature_type={s} balance=${d:.6}", .{
+                poly_auth.signatureTypeName(candidate_type),
+                bal,
+            });
+            return .{
+                .ok = false,
+                .suggested_signature_type = candidate_type,
+            };
+        } else |_| {}
+    }
+
+    if (!std.mem.eql(u8, signer_address[0..], balance_address[0..])) {
+        if (poly_auth.fetchUsdcBalance(
+            allocator,
+            creds,
+            signer_address,
+            configured_signature_type,
+        )) |bal| {
+            log.warn("engine", "signer-address auth probe succeeded while funded wallet probe failed: signer_balance=${d:.6}", .{bal});
+        } else |_| {}
+    }
+
+    return .{ .ok = false };
 }
 
 fn queryLastMid(database: *db.DB, market_id: []const u8) ?f64 {
