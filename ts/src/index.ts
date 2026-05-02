@@ -6,7 +6,20 @@ import indexHtml from "./index.html";
 
 // 1. Initialize IPC Client to talk to Zig
 const ipc = new IPCClient();
-ipc.connect(); // Connects in background with auto-reconnect
+
+async function connectIpcWithRetry() {
+  for (;;) {
+    try {
+      await ipc.connect();
+      return;
+    } catch (err) {
+      console.warn(`⚠️ IPC initial connection failed: ${err instanceof Error ? err.message : String(err)}`);
+      await new Promise(resolve => setTimeout(resolve, 5000));
+    }
+  }
+}
+
+void connectIpcWithRetry();
 
 // 2. Initialize Telegram Bot (if token provided)
 if (Bun.env.TELEGRAM_BOT_TOKEN) {

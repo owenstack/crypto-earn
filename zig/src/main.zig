@@ -272,6 +272,60 @@ pub fn main() !void {
         log.info("engine", "dry-run initial balance: ${d:.2}", .{dry_run_initial_balance});
     }
 
+    // Spawn USDC balance refresh ticker (live mode only — when API credentials
+    // are available and not in dry-run). Polls Polymarket's L2
+    // /balance-allowance endpoint every 60s and writes the result to
+    // balance_snapshots so the risk gate, /balance dashboard, and dynamic
+    // order sizing see the user's real on-exchange USDC balance.
+    var balance_ticker_ctx_opt: ?*BalanceTickerCtx = null;
+    var balance_thread_opt: ?std.Thread = null;
+    if (!dry_run) {
+        if (om_config.api_creds) |creds| {
+            // Initial synchronous fetch so the engine has a real balance
+            // before the strategy worker (and risk gate) start firing.
+            const bal0 = poly_auth.fetchUsdcBalance(
+                allocator,
+                creds,
+                om_config.signer_address,
+                om_config.signature_type,
+            ) catch |e| blk: {
+                log.warn("engine", "initial USDC balance fetch failed: {s}", .{@errorName(e)});
+                break :blk @as(?f64, null);
+            };
+            if (bal0) |b| {
+                database.insertBalanceSnapshot(b, 0.0, 0.0, 0.0) catch |e| {
+                    log.warn("engine", "failed to seed initial balance snapshot: {s}", .{@errorName(e)});
+                };
+                pt.markBalanceDirty();
+                pt.syncFromDB();
+                log.info("engine", "initial USDC balance: ${d:.6}", .{b});
+            }
+
+            const ctx = try allocator.create(BalanceTickerCtx);
+            ctx.* = .{
+                .database = &database,
+                .pt = &pt,
+                .creds = creds,
+                .signer_address = om_config.signer_address,
+                .signature_type = om_config.signature_type,
+                .allocator = allocator,
+                .should_stop = std.atomic.Value(bool).init(false),
+            };
+            balance_ticker_ctx_opt = ctx;
+            balance_thread_opt = try std.Thread.spawn(.{}, balanceTicker, .{ctx});
+            log.info("engine", "balance refresh ticker started (60s interval)", .{});
+        } else {
+            log.warn("engine", "no API credentials — USDC balance ticker disabled (orders will be rejected by risk gate)", .{});
+        }
+    }
+    defer {
+        if (balance_ticker_ctx_opt) |ctx| {
+            ctx.should_stop.store(true, .seq_cst);
+            if (balance_thread_opt) |t| t.join();
+            allocator.destroy(ctx);
+        }
+    }
+
     // Spawn strategy worker thread
     var strategy_ctx = StrategyWorkerCtx{
         .se = &se,
@@ -952,6 +1006,64 @@ fn persistBalanceSnapshot(ctx: *StrategyWorkerCtx) void {
         snap.realized_pnl_today,
     ) catch {};
     ctx.pt.markBalanceDirty();
+}
+
+/// Context for the live USDC balance refresh ticker. Spawned only when
+/// API credentials are bootstrapped and DRY_RUN is false.
+const BalanceTickerCtx = struct {
+    database: *db.DB,
+    pt: *portfolio.PortfolioTracker,
+    creds: poly_auth.ApiCredentials,
+    signer_address: [20]u8,
+    signature_type: u8,
+    allocator: std.mem.Allocator,
+    should_stop: std.atomic.Value(bool),
+};
+
+/// Periodically poll Polymarket's L2 /balance-allowance endpoint and write
+/// the result to balance_snapshots. Sleeps in 1s slices so shutdown is
+/// responsive. Logs a warning on each failed fetch but keeps the loop alive
+/// — transient network errors should not take the engine down.
+fn balanceTicker(ctx: *BalanceTickerCtx) void {
+    const interval_ns: u64 = 60 * std.time.ns_per_s;
+    log.info("balance_ticker", "balance refresh loop started (60s interval)", .{});
+
+    while (!ctx.should_stop.load(.seq_cst)) {
+        var slept: u64 = 0;
+        while (slept < interval_ns and !ctx.should_stop.load(.seq_cst)) {
+            std.Thread.sleep(std.time.ns_per_s);
+            slept += std.time.ns_per_s;
+        }
+        if (ctx.should_stop.load(.seq_cst)) break;
+
+        const bal = poly_auth.fetchUsdcBalance(
+            ctx.allocator,
+            ctx.creds,
+            ctx.signer_address,
+            ctx.signature_type,
+        ) catch |e| {
+            log.warn("balance_ticker", "failed to fetch USDC balance: {s}", .{@errorName(e)});
+            continue;
+        };
+
+        // Preserve current exposure / pnl values from the in-memory snapshot
+        // so dashboard rows stay coherent.
+        const snap = ctx.pt.getSnapshot();
+        ctx.database.insertBalanceSnapshot(
+            bal,
+            snap.total_exposure_usd,
+            snap.unrealized_pnl,
+            snap.realized_pnl_today,
+        ) catch |e| {
+            log.warn("balance_ticker", "failed to insert balance snapshot: {s}", .{@errorName(e)});
+            continue;
+        };
+
+        ctx.pt.markBalanceDirty();
+        log.info("balance_ticker", "USDC balance: ${d:.6}", .{bal});
+    }
+
+    log.info("balance_ticker", "balance refresh loop stopped", .{});
 }
 
 fn queryLastMid(database: *db.DB, market_id: []const u8) ?f64 {

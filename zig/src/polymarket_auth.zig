@@ -332,6 +332,106 @@ pub fn computeOrderAmounts(side: u8, price_f: f64, size_f: f64) !OrderAmounts {
 }
 
 // ---------------------------------------------------------------------------
+// USDC balance fetch (L2 GET /balance-allowance)
+// ---------------------------------------------------------------------------
+
+/// Fetch the current USDC (collateral) balance for `signer_address` from the
+/// Polymarket CLOB. Returns the balance in whole USDC units (i.e. raw 1e6
+/// units divided by 1e6). The HMAC signs only the path "/balance-allowance"
+/// (without the query string), matching py-clob-client behaviour.
+pub fn fetchUsdcBalance(
+    allocator: std.mem.Allocator,
+    creds: ApiCredentials,
+    signer_address: [20]u8,
+    signature_type: u8,
+) !f64 {
+    // Path used in the HMAC signature (no query string).
+    const sign_path = "/balance-allowance";
+
+    // Path with query string actually sent to the server.
+    var path_q_buf: [128]u8 = undefined;
+    const path_with_query = std.fmt.bufPrint(
+        &path_q_buf,
+        "/balance-allowance?asset_type=COLLATERAL&signature_type={d}",
+        .{signature_type},
+    ) catch return error.FormatFailed;
+
+    var url_buf: [256]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "{s}{s}", .{ CLOB_API_BASE, path_with_query }) catch
+        return error.FormatFailed;
+
+    var ts_buf: [32]u8 = undefined;
+    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch
+        return error.FormatFailed;
+
+    const hmac = try buildHmacSignature(
+        creds.secret[0..creds.secret_len],
+        ts,
+        "GET",
+        sign_path,
+        null,
+    );
+
+    var addr_hex: [42]u8 = undefined;
+    addr_hex[0] = '0';
+    addr_hex[1] = 'x';
+    const charset = "0123456789abcdef";
+    for (signer_address, 0..) |b, i| {
+        addr_hex[2 + i * 2] = charset[b >> 4];
+        addr_hex[2 + i * 2 + 1] = charset[b & 0x0f];
+    }
+
+    var client = http.HttpClient.init(allocator);
+    defer client.deinit();
+
+    var response = client.getWithHeaders(url, &.{
+        .{ .name = "POLY_ADDRESS", .value = &addr_hex },
+        .{ .name = "POLY_SIGNATURE", .value = hmac.slice() },
+        .{ .name = "POLY_TIMESTAMP", .value = ts },
+        .{ .name = "POLY_API_KEY", .value = creds.api_key[0..creds.api_key_len] },
+        .{ .name = "POLY_PASSPHRASE", .value = creds.passphrase[0..creds.passphrase_len] },
+    }) catch |e| {
+        log.err("poly_auth", "balance-allowance request failed: {s}", .{@errorName(e)});
+        return error.RequestFailed;
+    };
+    defer response.deinit();
+
+    if (response.status.class() != .success) {
+        log.err("poly_auth", "balance-allowance status {d}: {s}", .{
+            @intFromEnum(response.status),
+            response.body[0..@min(response.body.len, 256)],
+        });
+        return error.RequestFailed;
+    }
+
+    return parseBalanceResponse(response.body);
+}
+
+/// Parse {"balance":"<raw_1e6>",...} into whole USDC units.
+pub fn parseBalanceResponse(body: []const u8) !f64 {
+    var parse_buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&parse_buf);
+    const alloc = fba.allocator();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch
+        return error.ParseFailed;
+
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.ParseFailed,
+    };
+
+    const bal_v = obj.get("balance") orelse return error.ParseFailed;
+    const bal_str = switch (bal_v) {
+        .string => |s| s,
+        else => return error.ParseFailed,
+    };
+
+    const raw = std.fmt.parseFloat(f64, bal_str) catch return error.ParseFailed;
+    return raw / 1_000_000.0;
+}
+
+// ---------------------------------------------------------------------------
 // API credential bootstrapping
 // ---------------------------------------------------------------------------
 
@@ -653,6 +753,25 @@ test "parseApiCredentials: missing field" {
         \\{"apiKey":"key123","secret":"sec456"}
     ;
     try testing.expectError(error.ParseFailed, parseApiCredentials(body));
+}
+
+test "parseBalanceResponse: parses raw 1e6 USDC string" {
+    const body =
+        \\{"asset_address":"0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174","balance":"12345670","allowance":"99999","asset_type":"COLLATERAL"}
+    ;
+    const bal = try parseBalanceResponse(body);
+    try testing.expectApproxEqAbs(@as(f64, 12.34567), bal, 1e-9);
+}
+
+test "parseBalanceResponse: zero balance" {
+    const body = "{\"balance\":\"0\"}";
+    const bal = try parseBalanceResponse(body);
+    try testing.expectEqual(@as(f64, 0.0), bal);
+}
+
+test "parseBalanceResponse: missing balance field" {
+    const body = "{\"allowance\":\"100\"}";
+    try testing.expectError(error.ParseFailed, parseBalanceResponse(body));
 }
 
 // Test helpers

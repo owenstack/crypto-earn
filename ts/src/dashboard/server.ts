@@ -92,6 +92,9 @@ export function dashboardRoutes(ipc: IPCClient) {
       async GET(req: Request) {
         if (!bearerAuth(req)) return unauthorized();
         if (!ipc.connected) return json({ diagnosis: "offline" }, 503);
+        if (typeof ipc.dryRunAnalysis !== "function") {
+          return json({ diagnosis: "unavailable" }, 501);
+        }
         const res = await ipc.dryRunAnalysis().catch(() => null);
         return json(res?.payload ?? { diagnosis: "unavailable" }, res ? 200 : 502);
       },
