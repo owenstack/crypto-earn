@@ -202,7 +202,9 @@ export function createBot(ipc: IPCClient): Bot {
       `💰 *Balance & P&L*\n` +
       "```\n" +
       `Cash (USDC):       $${fmtNum(p.usdc_balance)}\n` +
-      `Exposure:          $${fmtNum(p.total_exposure_usd)}\n` +
+      `Exposure (total):  $${fmtNum(p.committed_capital_usd ?? p.total_exposure_usd)}\n` +
+      `  positions:       $${fmtNum(p.total_exposure_usd)}\n` +
+      `  open orders:     $${fmtNum(p.open_orders_exposure_usd)}\n` +
       `Unrealized P&L:    $${fmtNum(p.unrealized_pnl)}\n` +
       `Realized (today):  $${fmtNum(p.realized_pnl_today)}\n` +
       `Open positions:    ${positionCount}\n` +
@@ -327,7 +329,8 @@ export function createBot(ipc: IPCClient): Bot {
       `Uptime:       ${status?.uptime_ms != null ? `${(status.uptime_ms / 1000).toFixed(0)}s` : "N/A"}\n` +
       `Reconcile:    ${reconcile?.status ?? "unknown"}\n` +
       `Cash USDC:    $${n(portfolio?.usdc_balance)}\n` +
-      `Exposure:     $${n(portfolio?.total_exposure_usd)}\n` +
+      `Exposure:     $${n(portfolio?.committed_capital_usd ?? portfolio?.total_exposure_usd)}` +
+      ` (pos $${n(portfolio?.total_exposure_usd)} / ord $${n(portfolio?.open_orders_exposure_usd)})\n` +
       `Unrealized:   $${n(portfolio?.unrealized_pnl)}\n` +
       `Realized day: $${n(portfolio?.realized_pnl_today ?? pnl?.realized_pnl)}\n` +
       `P&L W/L:      ${(pnl?.win_count ?? 0)} / ${(pnl?.loss_count ?? 0)}\n` +

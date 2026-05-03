@@ -396,6 +396,8 @@ pub const KalshiWsClient = struct {
         if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return null;
         defer _ = c.sqlite3_finalize(stmt);
 
+        var best_score: u32 = 0;
+        var best_len: usize = 0;
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const id_ptr = c.sqlite3_column_text(stmt, 0);
             const base_ptr = c.sqlite3_column_text(stmt, 1);
@@ -404,14 +406,16 @@ pub const KalshiWsClient = struct {
             const base = if (base_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
             const symbol = if (symbol_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
 
-            if (!normalizedEql(base, question) and !normalizedEql(symbol, question)) continue;
+            const score = @max(matchScore(base, question), matchScore(symbol, question));
+            if (score < best_score or score < 60) continue;
 
-            const len = @min(id.len, out.len);
-            @memcpy(out[0..len], id[0..len]);
-            return out[0..len];
+            best_score = score;
+            best_len = @min(id.len, out.len);
+            @memcpy(out[0..best_len], id[0..best_len]);
         }
 
-        return null;
+        if (best_score == 0) return null;
+        return out[0..best_len];
     }
 };
 
@@ -545,6 +549,67 @@ fn normalizedEql(a: []const u8, b: []const u8) bool {
     return ia == a.len and ib == b.len;
 }
 
+fn matchScore(candidate: []const u8, query: []const u8) u32 {
+    if (candidate.len == 0 or query.len == 0) return 0;
+    if (normalizedEql(candidate, query)) return 100;
+
+    var candidate_norm_buf: [256]u8 = undefined;
+    var query_norm_buf: [256]u8 = undefined;
+    const candidate_norm = normalizeForMatch(candidate, &candidate_norm_buf);
+    const query_norm = normalizeForMatch(query, &query_norm_buf);
+
+    if (candidate_norm.len == 0 or query_norm.len == 0) return 0;
+    if (std.mem.indexOf(u8, candidate_norm, query_norm) != null or
+        std.mem.indexOf(u8, query_norm, candidate_norm) != null)
+    {
+        return 90;
+    }
+
+    const shared = sharedTokenCount(candidate_norm, query_norm);
+    if (shared >= 5) return 80;
+    if (shared >= 4) return 72;
+    if (shared >= 3) return 64;
+    if (shared >= 2) return 52;
+    return 0;
+}
+
+fn normalizeForMatch(src: []const u8, buf: []u8) []const u8 {
+    var j: usize = 0;
+    var prev_space = true;
+    for (src) |ch| {
+        const lowered = std.ascii.toLower(ch);
+        if (std.ascii.isAlphanumeric(lowered)) {
+            if (j >= buf.len) break;
+            buf[j] = lowered;
+            j += 1;
+            prev_space = false;
+        } else if (!prev_space) {
+            if (j >= buf.len) break;
+            buf[j] = ' ';
+            j += 1;
+            prev_space = true;
+        }
+    }
+    if (j > 0 and buf[j - 1] == ' ') j -= 1;
+    return buf[0..j];
+}
+
+fn sharedTokenCount(a_norm: []const u8, b_norm: []const u8) u32 {
+    var count: u32 = 0;
+    var it = std.mem.tokenizeScalar(u8, a_norm, ' ');
+    while (it.next()) |token| {
+        if (token.len < 3) continue;
+        var bit = std.mem.tokenizeScalar(u8, b_norm, ' ');
+        while (bit.next()) |other| {
+            if (std.mem.eql(u8, token, other)) {
+                count += 1;
+                break;
+            }
+        }
+    }
+    return count;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -603,6 +668,23 @@ test "kalshi_ws: lifecycle message seeds ticker mapping" {
 
     var buf: [64]u8 = undefined;
     const gamma_id = database.lookupKalshiMapping("KXFEDCUT", &buf);
+    try std.testing.expect(gamma_id != null);
+    try std.testing.expectEqualStrings("m1", gamma_id.?);
+}
+
+test "kalshi_ws: lifecycle message matches by fuzzy subtitle" {
+    var database = try db_mod.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote,status,clob_token_ids) VALUES('m1','fed-cuts-september','Will the Fed cut rates in September 2026?','USDC','active','[\"yes-1\"]');");
+
+    var client = KalshiWsClient.init(std.testing.allocator, &database);
+    client.handleMessage(
+        \\{"type":"market_lifecycle_v2","sid":13,"msg":{"market_ticker":"KXFEDCUTSEP","event_type":"created","additional_metadata":{"title":"Fed September decision","yes_sub_title":"Will the Fed cut rates in September 2026?","no_sub_title":"The Fed does not cut rates in September 2026","event_ticker":"KXFED"}}}
+    );
+
+    var buf: [64]u8 = undefined;
+    const gamma_id = database.lookupKalshiMapping("KXFEDCUTSEP", &buf);
     try std.testing.expect(gamma_id != null);
     try std.testing.expectEqualStrings("m1", gamma_id.?);
 }

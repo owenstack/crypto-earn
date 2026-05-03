@@ -79,6 +79,8 @@ interface StatusData {
   uptime_ms: number;
   usdc_balance?: string;
   total_exposure_usd?: string;
+  open_orders_exposure_usd?: string;
+  committed_capital_usd?: string;
   realized_pnl_today?: string;
   unrealized_pnl?: string;
 }
@@ -124,6 +126,8 @@ interface MarketRow {
 interface PortfolioData {
   positions: PositionRow[];
   total_exposure_usd?: string;
+  open_orders_exposure_usd?: string;
+  committed_capital_usd?: string;
   unrealized_pnl?: string;
   realized_pnl_today?: string;
   usdc_balance?: string;
@@ -175,7 +179,17 @@ export function Dashboard() {
 
   // Derive KPI values — prefer portfolio snapshot fields, fall back to status
   const usdcBalance = portfolio?.usdc_balance ?? status?.usdc_balance;
-  const totalExposure = portfolio?.total_exposure_usd ?? status?.total_exposure_usd;
+  // "Total Exposure" = committed capital (filled positions + USDC locked in
+  // open, unfilled orders). Falls back to position-only exposure for older
+  // engines that don't emit the new fields.
+  const totalExposure =
+    portfolio?.committed_capital_usd ??
+    status?.committed_capital_usd ??
+    portfolio?.total_exposure_usd ??
+    status?.total_exposure_usd;
+  const positionsExposure = portfolio?.total_exposure_usd ?? status?.total_exposure_usd;
+  const openOrdersExposure =
+    portfolio?.open_orders_exposure_usd ?? status?.open_orders_exposure_usd;
   const dailyPnl = portfolio?.realized_pnl_today ?? status?.realized_pnl_today;
   const engineState = status?.engine ?? "unknown";
 
@@ -213,6 +227,11 @@ export function Dashboard() {
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">{formatUsd(totalExposure)}</div>
+            {(positionsExposure !== undefined || openOrdersExposure !== undefined) && (
+              <div className="text-xs text-muted-foreground mt-1">
+                positions {formatUsd(positionsExposure)} · open orders {formatUsd(openOrdersExposure)}
+              </div>
+            )}
           </CardContent>
         </Card>
 

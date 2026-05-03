@@ -24,27 +24,43 @@ pub const StrategyConfig = struct {
     news_delta_threshold: f64 = 0.06,
     news_confidence_min: f64 = 0.40,
 
-    /// News order size as fraction of balance, converted into a share count by
-    /// the strategy/order layer. A minimum floor is enforced separately.
+    /// News order notional as fraction of USDC balance. Interpreted as
+    /// dollars-of-collateral, then divided by quote price to derive the
+    /// share count submitted to the CLOB.
     news_order_size_pct: f64 = 0.12,
-    news_order_size_fallback: f64 = 1.20,
+    /// Dollar notional fallback when balance is unknown (cold start).
+    news_order_fallback_usd: f64 = 1.20,
 
     // Liquidity provision
     lp_min_spread: f64 = 0.06,
     lp_exit_spread: f64 = 0.03,
 
-    /// LP order size as fraction of balance, converted into a share count by
-    /// the strategy/order layer. A minimum floor is enforced separately.
+    /// LP TOTAL pair notional as fraction of USDC balance (covers BOTH legs
+    /// combined). Interpreted as dollars-of-collateral, then split per leg
+    /// and divided by leg price to derive shares.
     lp_order_size_pct: f64 = 0.07,
-    lp_order_size_fallback: f64 = 0.70,
+    /// Dollar notional fallback (per-pair-total) when balance is unknown.
+    lp_order_fallback_usd: f64 = 0.70,
 };
 
-/// Resolve a strategy order size in shares from a balance-scaled config.
-/// Polymarket rejects dust orders well below 5 shares, so enforce that floor
-/// even when the balance-scaled target is smaller.
-pub fn resolveOrderSize(balance: f64, pct: f64, fallback: f64) f64 {
-    if (balance <= 0) return @max(fallback, 5.0);
-    return @max(balance * pct, 5.0);
+/// Polymarket CLOB share floor. Orders below this are dust-rejected.
+pub const MIN_ORDER_SHARES: f64 = 5.0;
+/// Polymarket CLOB notional floor (USD). Orders smaller than this are dust.
+pub const MIN_ORDER_NOTIONAL_USD: f64 = 1.0;
+
+/// Resolve a strategy order size (in shares) from a balance-scaled DOLLAR
+/// fraction at a given quote price. Replaces the legacy share-only sizing,
+/// which ignored price and over-committed at low prices.
+///
+/// Semantics:
+///   target_usd = balance > 0 ? balance * pct : fallback_usd
+///   notional   = max(target_usd, MIN_ORDER_NOTIONAL_USD)
+///   shares     = max(notional / price, MIN_ORDER_SHARES)
+pub fn resolveOrderSize(balance: f64, pct: f64, price: f64, fallback_usd: f64) f64 {
+    const px = std.math.clamp(price, 0.01, 0.99);
+    const target_usd = if (balance <= 0) fallback_usd else balance * pct;
+    const notional_usd = @max(target_usd, MIN_ORDER_NOTIONAL_USD);
+    return @max(notional_usd / px, MIN_ORDER_SHARES);
 }
 
 pub const StrategyStats = struct {
@@ -174,7 +190,12 @@ pub const StrategyEngine = struct {
             confidence,
         });
 
-        const order_size = resolveOrderSize(balance, self.config.news_order_size_pct, self.config.news_order_size_fallback);
+        const order_size = resolveOrderSize(
+            balance,
+            self.config.news_order_size_pct,
+            external_prob,
+            self.config.news_order_fallback_usd,
+        );
 
         return Signal{
             .strategy = .news_repricing,
@@ -207,9 +228,8 @@ pub const StrategyEngine = struct {
         if (spread < self.config.lp_min_spread) return .{ .signals = undefined, .count = 0 };
 
         // Check per-market inventory limit and current inventory. With the
-        // current token-resolution path, we can safely quote asks only against
-        // inventory we already own; otherwise asks are rejected by Polymarket
-        // as unsupported naked sells.
+        // current token-resolution path, we can only quote a paired LP bid+ask
+        // when we already own enough inventory to safely back the sell leg.
         const mid_price = (best_bid + best_ask) / 2.0;
         var inventory_shares: f64 = 0.0;
         {
@@ -250,36 +270,36 @@ pub const StrategyEngine = struct {
             spread,
         });
 
-        const order_size = resolveOrderSize(balance, self.config.lp_order_size_pct, self.config.lp_order_size_fallback);
+        // Each leg gets half the configured pair notional, so the pair-total
+        // matches lp_order_size_pct of balance instead of doubling it.
+        const per_leg_pct = self.config.lp_order_size_pct * 0.5;
+        const per_leg_fallback_usd = self.config.lp_order_fallback_usd * 0.5;
+
+        const buy_size = resolveOrderSize(balance, per_leg_pct, bid_price, per_leg_fallback_usd);
+        const ask_leg_size = resolveOrderSize(balance, per_leg_pct, ask_price, per_leg_fallback_usd);
         const ts = std.time.timestamp();
 
-        // Quote one side at a time:
-        // - no inventory: rest a bid to acquire shares
-        // - inventory >= 5 shares: rest an ask capped by holdings
-        if (inventory_shares >= 5.0) {
-            const sell_size = @min(order_size, inventory_shares);
-            self.lp_stats.signals_emitted += 1;
-            return .{
-                .signals = .{
-                    Signal{
-                        .strategy = .liquidity_provision,
-                        .market_id = mid,
-                        .market_id_len = mid_len,
-                        .direction = .sell,
-                        .price = ask_price,
-                        .size = sell_size,
-                        .confidence = confidence,
-                        .timestamp = ts,
-                        .best_bid = best_bid,
-                        .best_ask = best_ask,
-                    },
-                    undefined,
-                },
-                .count = 1,
-            };
+        // LP must never emit a naked sell. If we do not already own enough
+        // inventory to back the ask leg, skip this market entirely rather than
+        // place an orphan buy that cannot be paired.
+        if (inventory_shares < MIN_ORDER_SHARES) {
+            log.info("strategy", "LP skipped: insufficient inventory for paired quote on {s} (inventory={d:.4})", .{
+                market_id,
+                inventory_shares,
+            });
+            return .{ .signals = undefined, .count = 0 };
         }
 
-        self.lp_stats.signals_emitted += 1;
+        const sell_size = @min(ask_leg_size, inventory_shares);
+        if (sell_size < MIN_ORDER_SHARES) {
+            log.info("strategy", "LP skipped: sell leg below minimum size on {s} (size={d:.4})", .{
+                market_id,
+                sell_size,
+            });
+            return .{ .signals = undefined, .count = 0 };
+        }
+
+        self.lp_stats.signals_emitted += 2;
         return .{
             .signals = .{
                 Signal{
@@ -288,15 +308,26 @@ pub const StrategyEngine = struct {
                     .market_id_len = mid_len,
                     .direction = .buy,
                     .price = bid_price,
-                    .size = order_size,
+                    .size = buy_size,
                     .confidence = confidence,
                     .timestamp = ts,
                     .best_bid = best_bid,
                     .best_ask = best_ask,
                 },
-                undefined,
+                Signal{
+                    .strategy = .liquidity_provision,
+                    .market_id = mid,
+                    .market_id_len = mid_len,
+                    .direction = .sell,
+                    .price = ask_price,
+                    .size = sell_size,
+                    .confidence = confidence,
+                    .timestamp = ts,
+                    .best_bid = best_bid,
+                    .best_ask = best_ask,
+                },
             },
-            .count = 1,
+            .count = 2,
         };
     }
 

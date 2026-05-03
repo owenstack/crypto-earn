@@ -580,6 +580,29 @@ test "risk_gate: rejects when max open orders reached" {
     }
 }
 
+test "risk_gate: pair preflight rejects when only one open-order slot remains" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
+    try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50", null);
+
+    const config = risk_gate.RiskConfig{
+        .max_position_usd_fallback = 500.0,
+        .max_portfolio_exposure_usd_fallback = 5000.0,
+        .max_open_orders = 2,
+    };
+
+    const result = risk_gate.validatePairPreflight(&database, config, 5.0, 5.0);
+    switch (result) {
+        .reject => |r| {
+            try testing.expectEqual(risk_gate.RejectionReason.max_open_orders_exceeded, r.reason);
+        },
+        .pass => try testing.expect(false),
+    }
+}
+
 test "risk_gate: rejects duplicate position" {
     var database = try openTempDb();
     defer database.close();
@@ -869,7 +892,7 @@ test "strategy_engine: news repricing triggers on sufficient delta" {
     var se = strategy_engine.StrategyEngine.init(.{
         .news_delta_threshold = 0.05,
         .news_confidence_min = 0.3,
-        .news_order_size_fallback = 10.0,
+        .news_order_fallback_usd = 10.0,
     });
 
     // Delta = |0.70 - 0.50| = 0.20, well above threshold
@@ -879,7 +902,8 @@ test "strategy_engine: news repricing triggers on sufficient delta" {
     try testing.expectEqual(strategy_engine.StrategyName.news_repricing, s.strategy);
     try testing.expectEqual(strategy_engine.SignalDirection.buy, s.direction);
     try testing.expectEqual(@as(f64, 0.70), s.price);
-    try testing.expectEqual(@as(f64, 10.0), s.size);
+    // Size = max($10/$0.70, 5 shares) = ~14.2857 shares
+    try testing.expectApproxEqAbs(@as(f64, 14.285714285714286), s.size, 1e-9);
     try testing.expect(s.confidence >= 0.3);
     try testing.expect(s.confidence <= 1.0);
     try testing.expectEqual(@as(u64, 1), se.news_stats.signals_emitted);
@@ -925,22 +949,36 @@ test "strategy_engine: news repricing confidence bounds" {
     try testing.expectApproxEqAbs(@as(f64, 0.25), sig2.?.confidence, 1e-9);
 }
 
-test "strategy_engine: LP emits paired signals when spread wide" {
+test "strategy_engine: LP emits no signals without inventory" {
     var se = strategy_engine.StrategyEngine.init(.{
         .lp_min_spread = 0.04,
-        .lp_order_size_fallback = 5.0,
+        .lp_order_fallback_usd = 5.0,
     });
 
     // Spread = 0.60 - 0.40 = 0.20, well above min_spread
     const result = se.evaluateLiquidityProvision("test-market", 0.40, 0.60, 0.0);
-    try testing.expectEqual(@as(u8, 2), result.count);
+    try testing.expectEqual(@as(usize, 0), result.count);
+    try testing.expectEqual(@as(u64, 0), se.lp_stats.signals_emitted);
+}
+
+test "strategy_engine: LP emits paired signals when spread wide and inventory exists" {
+    var se = strategy_engine.StrategyEngine.init(.{
+        .lp_min_spread = 0.04,
+        .lp_order_fallback_usd = 5.0,
+    });
+    se.updateInventory("test-market", .buy, 10.0);
+
+    // Spread = 0.60 - 0.40 = 0.20, well above min_spread
+    const result = se.evaluateLiquidityProvision("test-market", 0.40, 0.60, 0.0);
+    try testing.expectEqual(@as(usize, 2), result.count);
     try testing.expectEqual(strategy_engine.SignalDirection.buy, result.signals[0].direction);
     try testing.expectEqual(strategy_engine.SignalDirection.sell, result.signals[1].direction);
-    try testing.expectEqual(@as(f64, 5.0), result.signals[0].size);
-    // bid = 0.40 + 0.20 * 0.25 = 0.45
+    // bid = 0.40 + 0.20 * 0.25 = 0.45 → buy size = max($2.50/$0.45, 5) = ~5.555
     try testing.expectApproxEqAbs(@as(f64, 0.45), result.signals[0].price, 1e-9);
-    // ask = 0.60 - 0.20 * 0.25 = 0.55
+    try testing.expectApproxEqAbs(@as(f64, 2.5 / 0.45), result.signals[0].size, 1e-9);
+    // ask = 0.60 - 0.20 * 0.25 = 0.55 → sell size = max($2.50/$0.55, 5) = ~5.0
     try testing.expectApproxEqAbs(@as(f64, 0.55), result.signals[1].price, 1e-9);
+    try testing.expectApproxEqAbs(@max(@as(f64, 2.5 / 0.55), @as(f64, 5.0)), result.signals[1].size, 1e-9);
     try testing.expectEqual(@as(u64, 2), se.lp_stats.signals_emitted);
 }
 

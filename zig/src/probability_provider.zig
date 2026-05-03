@@ -9,6 +9,8 @@ const c = db_mod.c;
 
 const KALSHI_EVENTS_URL = "https://api.elections.kalshi.com/trade-api/v2/events";
 const MANIFOLD_MARKETS_URL = "https://api.manifold.markets/v0/markets";
+const KALSHI_REST_PAGE_LIMIT = 200;
+const KALSHI_REST_MAX_PAGES = 8;
 
 pub const ExternalEstimate = struct {
     market_id: [64]u8,
@@ -188,32 +190,25 @@ pub const ProbabilityProvider = struct {
                 const ticker = std.mem.trim(u8, raw_ticker, " ");
                 if (ticker.len == 0) continue;
 
-                var url_buf: [256]u8 = undefined;
-                const url = std.fmt.bufPrint(&url_buf, KALSHI_EVENTS_URL ++ "?status=open&with_nested_markets=true&limit=200&series_ticker={s}", .{ticker}) catch continue;
+                var base_url_buf: [256]u8 = undefined;
+                const base_url = std.fmt.bufPrint(
+                    &base_url_buf,
+                    KALSHI_EVENTS_URL ++ "?status=open&with_nested_markets=true&limit={d}&series_ticker={s}",
+                    .{ KALSHI_REST_PAGE_LIMIT, ticker },
+                ) catch continue;
 
-                var response = client.get(url) catch {
-                    log.warn("prob_provider", "Kalshi REST poll failed for series {s}", .{ticker});
-                    continue;
-                };
-                defer response.deinit();
-
-                _ = self.parseKalshiRestInto(response.body, &acc, &acc_count) catch |err| {
-                    log.warn("prob_provider", "Kalshi REST parse failed for series {s}: {s}", .{ ticker, @errorName(err) });
-                    continue;
-                };
+                self.pollKalshiRestPages(&client, base_url, ticker, &acc, &acc_count);
             }
         } else {
-            // Fallback: unfiltered (mostly sports MVE markets, low signal)
-            var response = client.get(KALSHI_EVENTS_URL ++ "?status=open&with_nested_markets=true&limit=200") catch {
-                log.err("prob_provider", "Kalshi REST poll failed", .{});
-                return false;
-            };
-            defer response.deinit();
-
-            _ = self.parseKalshiRestInto(response.body, &acc, &acc_count) catch |err| {
-                log.err("prob_provider", "Kalshi REST parse failed: {s}", .{@errorName(err)});
-                return false;
-            };
+            // Fallback: unfiltered. Walk several cursor pages so overlap is not
+            // limited to whatever happens to be in Kalshi's first page.
+            self.pollKalshiRestPages(
+                &client,
+                KALSHI_EVENTS_URL ++ "?status=open&with_nested_markets=true&limit=200",
+                null,
+                &acc,
+                &acc_count,
+            );
         }
 
         if (acc_count > 0) {
@@ -228,6 +223,53 @@ pub const ProbabilityProvider = struct {
         self.last_poll_ts = std.time.timestamp();
         self.current_mode = .kalshi_rest;
         return true;
+    }
+
+    fn pollKalshiRestPages(
+        self: *ProbabilityProvider,
+        client: *http.HttpClient,
+        base_url: []const u8,
+        series_ticker: ?[]const u8,
+        acc: *[MAX_ESTIMATES]?ExternalEstimate,
+        acc_count: *usize,
+    ) void {
+        var cursor_buf: [256]u8 = undefined;
+        var url_buf: [512]u8 = undefined;
+        var cursor: ?[]const u8 = null;
+        var page_count: usize = 0;
+
+        while (page_count < KALSHI_REST_MAX_PAGES and acc_count.* < MAX_ESTIMATES) : (page_count += 1) {
+            const url = if (cursor) |next_cursor|
+                std.fmt.bufPrint(&url_buf, "{s}&cursor={s}", .{ base_url, next_cursor }) catch break
+            else
+                base_url;
+
+            var response = client.get(url) catch {
+                if (series_ticker) |ticker| {
+                    log.warn("prob_provider", "Kalshi REST poll failed for series {s} page {d}", .{ ticker, page_count + 1 });
+                } else {
+                    log.err("prob_provider", "Kalshi REST poll failed on page {d}", .{page_count + 1});
+                }
+                return;
+            };
+            defer response.deinit();
+
+            const page = self.parseKalshiRestInto(response.body, &acc, &acc_count, &cursor_buf) catch |err| {
+                if (series_ticker) |ticker| {
+                    log.warn("prob_provider", "Kalshi REST parse failed for series {s} page {d}: {s}", .{
+                        ticker,
+                        page_count + 1,
+                        @errorName(err),
+                    });
+                } else {
+                    log.err("prob_provider", "Kalshi REST parse failed on page {d}: {s}", .{ page_count + 1, @errorName(err) });
+                }
+                return;
+            };
+
+            if (page.cursor_len == 0) break;
+            cursor = cursor_buf[0..page.cursor_len];
+        }
     }
 
     fn pollManifold(self: *ProbabilityProvider) void {
@@ -245,21 +287,34 @@ pub const ProbabilityProvider = struct {
         self.current_mode = .manifold;
     }
 
+    const KalshiRestPageResult = struct {
+        added: usize,
+        cursor_len: usize,
+    };
+
     /// Parse Kalshi REST response and append estimates to an accumulator array.
-    /// Returns number of estimates appended. Does NOT call publishEstimates.
+    /// Returns the number of estimates appended plus the next-page cursor length.
     fn parseKalshiRestInto(
         self: *ProbabilityProvider,
         body: []const u8,
         acc: *[MAX_ESTIMATES]?ExternalEstimate,
         acc_count: *usize,
-    ) !usize {
+        cursor_out: ?[]u8,
+    ) !KalshiRestPageResult {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
         defer parsed.deinit();
 
+        var cursor_len: usize = 0;
         var added: usize = 0;
         var skip_no_prob: usize = 0;
         var skip_no_market: usize = 0;
         const now = std.time.timestamp();
+
+        if (cursor_out) |buf| {
+            if (extractCursor(parsed.value, buf)) |cursor| {
+                cursor_len = cursor.len;
+            }
+        }
 
         if (extractArray(parsed.value, &.{"events"})) |events| {
             for (events) |event_item| {
@@ -287,7 +342,7 @@ pub const ProbabilityProvider = struct {
             log.info("prob_provider", "Kalshi REST events: {d} events, {d} published (skipped: {d} no-prob, {d} no-market)", .{
                 events.len, added, skip_no_prob, skip_no_market,
             });
-            return added;
+            return .{ .added = added, .cursor_len = cursor_len };
         }
 
         const items = extractArray(parsed.value, &.{ "markets", "data", "trades" }) orelse
@@ -307,7 +362,7 @@ pub const ProbabilityProvider = struct {
         log.info("prob_provider", "Kalshi REST: {d} items, {d} published (skipped: {d} no-prob, {d} no-market)", .{
             items.len, added, skip_no_prob, skip_no_market,
         });
-        return added;
+        return .{ .added = added, .cursor_len = cursor_len };
     }
 
     const KalshiAppendOutcome = enum {
@@ -361,9 +416,9 @@ pub const ProbabilityProvider = struct {
     fn parseKalshiRestResponse(self: *ProbabilityProvider, body: []const u8) !usize {
         var acc = [_]?ExternalEstimate{null} ** MAX_ESTIMATES;
         var count: usize = 0;
-        const added = try self.parseKalshiRestInto(body, &acc, &count);
+        const page = try self.parseKalshiRestInto(body, &acc, &count, null);
         self.publishEstimates(acc, count);
-        return added;
+        return page.added;
     }
 
     fn parseManifoldResponse(self: *ProbabilityProvider, body: []const u8) void {
@@ -628,6 +683,8 @@ pub const ProbabilityProvider = struct {
         if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return null;
         defer _ = c.sqlite3_finalize(stmt);
 
+        var best_score: u32 = 0;
+        var best_len: usize = 0;
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const id_ptr = c.sqlite3_column_text(stmt, 0);
             const base_ptr = c.sqlite3_column_text(stmt, 1);
@@ -636,14 +693,16 @@ pub const ProbabilityProvider = struct {
             const base = if (base_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
             const symbol = if (symbol_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
 
-            if (!normalizedEql(base, question) and !normalizedEql(symbol, question)) continue;
+            const score = @max(matchScore(base, question), matchScore(symbol, question));
+            if (score < best_score or score < 60) continue;
 
-            const len = @min(id.len, out.len);
-            @memcpy(out[0..len], id[0..len]);
-            return out[0..len];
+            best_score = score;
+            best_len = @min(id.len, out.len);
+            @memcpy(out[0..best_len], id[0..best_len]);
         }
 
-        return null;
+        if (best_score == 0) return null;
+        return out[0..best_len];
     }
 
     fn resolveTokenId(self: *ProbabilityProvider, market_id: []const u8, buf: *[80]u8, len: *usize) void {
@@ -688,6 +747,21 @@ fn extractArray(root: std.json.Value, keys: []const []const u8) ?[]const std.jso
         },
         else => null,
     };
+}
+
+fn extractCursor(root: std.json.Value, buf: []u8) ?[]const u8 {
+    const obj = switch (root) {
+        .object => |o| o,
+        else => return null,
+    };
+    const value = obj.get("cursor") orelse return null;
+    const cursor = switch (value) {
+        .string => |s| s,
+        else => return null,
+    };
+    if (cursor.len == 0 or cursor.len > buf.len) return null;
+    @memcpy(buf[0..cursor.len], cursor);
+    return buf[0..cursor.len];
 }
 
 fn objectString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -768,6 +842,67 @@ fn normalizedEql(a: []const u8, b: []const u8) bool {
     return ia == a.len and ib == b.len;
 }
 
+fn matchScore(candidate: []const u8, query: []const u8) u32 {
+    if (candidate.len == 0 or query.len == 0) return 0;
+    if (normalizedEql(candidate, query)) return 100;
+
+    var candidate_norm_buf: [256]u8 = undefined;
+    var query_norm_buf: [256]u8 = undefined;
+    const candidate_norm = normalizeForMatch(candidate, &candidate_norm_buf);
+    const query_norm = normalizeForMatch(query, &query_norm_buf);
+
+    if (candidate_norm.len == 0 or query_norm.len == 0) return 0;
+    if (std.mem.indexOf(u8, candidate_norm, query_norm) != null or
+        std.mem.indexOf(u8, query_norm, candidate_norm) != null)
+    {
+        return 90;
+    }
+
+    const shared = sharedTokenCount(candidate_norm, query_norm);
+    if (shared >= 5) return 80;
+    if (shared >= 4) return 72;
+    if (shared >= 3) return 64;
+    if (shared >= 2) return 52;
+    return 0;
+}
+
+fn normalizeForMatch(src: []const u8, buf: []u8) []const u8 {
+    var j: usize = 0;
+    var prev_space = true;
+    for (src) |ch| {
+        const lowered = std.ascii.toLower(ch);
+        if (std.ascii.isAlphanumeric(lowered)) {
+            if (j >= buf.len) break;
+            buf[j] = lowered;
+            j += 1;
+            prev_space = false;
+        } else if (!prev_space) {
+            if (j >= buf.len) break;
+            buf[j] = ' ';
+            j += 1;
+            prev_space = true;
+        }
+    }
+    if (j > 0 and buf[j - 1] == ' ') j -= 1;
+    return buf[0..j];
+}
+
+fn sharedTokenCount(a_norm: []const u8, b_norm: []const u8) u32 {
+    var count: u32 = 0;
+    var it = std.mem.tokenizeScalar(u8, a_norm, ' ');
+    while (it.next()) |token| {
+        if (token.len < 3) continue;
+        var bit = std.mem.tokenizeScalar(u8, b_norm, ' ');
+        while (bit.next()) |other| {
+            if (std.mem.eql(u8, token, other)) {
+                count += 1;
+                break;
+            }
+        }
+    }
+    return count;
+}
+
 test "probability_provider: manifold response maps by slug" {
     var database = try db_mod.DB.open(":memory:");
     defer database.close();
@@ -832,4 +967,21 @@ test "probability_provider: kalshi trades response uses persisted ticker mapping
 test "probability_provider: normalizedEql ignores punctuation and case" {
     try std.testing.expect(normalizedEql("Will the Fed cut rates?", "will-the-fed-cut-rates"));
     try std.testing.expect(!normalizedEql("A", "B"));
+}
+
+test "probability_provider: kalshi rest response matches by event context subtitle" {
+    var database = try db_mod.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote,status,clob_token_ids) VALUES('m1','fed-cuts-september','Will the Fed cut rates in September 2026?','USDC','active','[\"yes-1\"]');");
+
+    var kws = kalshi_ws.KalshiWsClient.init(std.testing.allocator, &database);
+    var pp = ProbabilityProvider.init(std.testing.allocator, &database, &kws);
+    _ = try pp.parseKalshiRestResponse(
+        \\{"events":[{"event_ticker":"KXFED","title":"Fed September decision","sub_title":"Will the Fed cut rates in September 2026?","markets":[{"ticker":"KXFEDCUTSEP","title":"Fed cut in September","yes_bid_dollars":"0.6100","yes_ask_dollars":"0.6500"}]}],"cursor":""}
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), pp.estimate_count);
+    var buf: [64]u8 = undefined;
+    try std.testing.expect(database.lookupKalshiMapping("KXFEDCUTSEP", &buf) != null);
 }

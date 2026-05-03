@@ -91,7 +91,12 @@ export interface StatusPayload     { engine: string; db: string; uptime_ms: numb
 export interface PortfolioPayload  {
   positions: unknown[];
   note?: string;
+  /** Notional of *filled* positions (size * current_price). */
   total_exposure_usd?: string;
+  /** Collateral committed by *open, unfilled* orders (size * limit_price). */
+  open_orders_exposure_usd?: string;
+  /** total_exposure_usd + open_orders_exposure_usd. */
+  committed_capital_usd?: string;
   unrealized_pnl?: string;
   realized_pnl_today?: string;
   usdc_balance?: string;
@@ -214,6 +219,8 @@ export interface OrderEventPayload {
 export interface PortfolioSnapshotPayload {
   positions: PositionInfo[];
   total_exposure_usd: string;
+  open_orders_exposure_usd?: string;
+  committed_capital_usd?: string;
   unrealized_pnl: string;
   realized_pnl_today: string;
   usdc_balance: string;

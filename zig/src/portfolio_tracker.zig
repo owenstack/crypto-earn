@@ -19,7 +19,16 @@ pub const Position = struct {
 
 pub const PortfolioSnapshot = struct {
     positions: []const Position,
+    /// Notional of *filled* positions (size * current_price).
     total_exposure_usd: f64,
+    /// Notional collateral committed by *open, unfilled* orders on the CLOB
+    /// (size * limit_price). Sourced from the orders table — same metric the
+    /// risk gate enforces against. Surfaced separately so dashboards don't
+    /// show "$0.00 exposure" when capital is locked in resting orders.
+    open_orders_exposure_usd: f64,
+    /// Sum of position exposure + open-order exposure. Truer "capital at
+    /// risk" number than position-only exposure.
+    committed_capital_usd: f64,
     unrealized_pnl: f64,
     realized_pnl_today: f64,
     usdc_balance: f64,
@@ -400,9 +409,16 @@ pub const PortfolioTracker = struct {
             total_unrealized += pos.unrealized_pnl;
         }
 
+        // Open-order notional: USDC committed to resting (unfilled) orders.
+        // The risk gate already enforces against this; surface it here so the
+        // dashboard doesn't report "$0.00 exposure" while capital is locked.
+        const open_orders_exposure: f64 = self.database.queryOpenExposureUsd() catch 0.0;
+
         return .{
             .positions = self.positions[0..self.position_count],
             .total_exposure_usd = total_exposure,
+            .open_orders_exposure_usd = open_orders_exposure,
+            .committed_capital_usd = total_exposure + open_orders_exposure,
             .unrealized_pnl = total_unrealized,
             .realized_pnl_today = self.realized_pnl_today,
             .usdc_balance = self.usdc_balance,
@@ -432,13 +448,19 @@ pub const PortfolioTracker = struct {
             try writeJsonEscapedString(writer, pos.side[0..pos.side_len]);
             try writer.writeAll(num_str);
         }
-        var summary_buf: [256]u8 = undefined;
-        const summary = std.fmt.bufPrint(&summary_buf, "],\"total_exposure_usd\":{d:.2},\"unrealized_pnl\":{d:.2},\"realized_pnl_today\":{d:.2},\"usdc_balance\":{d:.2}}}", .{
-            snap.total_exposure_usd,
-            snap.unrealized_pnl,
-            snap.realized_pnl_today,
-            snap.usdc_balance,
-        }) catch return error.Overflow;
+        var summary_buf: [384]u8 = undefined;
+        const summary = std.fmt.bufPrint(
+            &summary_buf,
+            "],\"total_exposure_usd\":{d:.2},\"open_orders_exposure_usd\":{d:.2},\"committed_capital_usd\":{d:.2},\"unrealized_pnl\":{d:.2},\"realized_pnl_today\":{d:.2},\"usdc_balance\":{d:.2}}}",
+            .{
+                snap.total_exposure_usd,
+                snap.open_orders_exposure_usd,
+                snap.committed_capital_usd,
+                snap.unrealized_pnl,
+                snap.realized_pnl_today,
+                snap.usdc_balance,
+            },
+        ) catch return error.Overflow;
         try writer.writeAll(summary);
 
         return fbs.getWritten();

@@ -501,6 +501,8 @@ fn evaluateNewsSignals(ctx: *StrategyWorkerCtx) void {
 }
 
 fn evaluateLpSignals(ctx: *StrategyWorkerCtx) void {
+    cancelOrphanLpBuys(ctx);
+
     // Read cooldown from runtime_config; default 15s, clamp 5–300s.
     var cd_buf: [16]u8 = undefined;
     const cd_str = ctx.database.getConfig("lp_cooldown_seconds", &cd_buf) orelse "15";
@@ -535,6 +537,44 @@ fn evaluateLpSignals(ctx: *StrategyWorkerCtx) void {
             for (lp_result.signals[0..lp_result.count]) |signal| {
                 dispatchSignal(ctx, signal);
             }
+        }
+    }
+}
+
+fn cancelOrphanLpBuys(ctx: *StrategyWorkerCtx) void {
+    const sql =
+        "SELECT o.id, o.market_id FROM orders o " ++
+        "WHERE o.status IN ('placed','partially_filled') " ++
+        "AND o.strategy_origin='liquidity_provision' " ++
+        "AND o.side='buy' " ++
+        "AND NOT EXISTS (" ++
+        "SELECT 1 FROM orders s " ++
+        "WHERE s.market_id=o.market_id " ++
+        "AND s.status IN ('placed','partially_filled') " ++
+        "AND s.strategy_origin='liquidity_provision' " ++
+        "AND s.side='sell'" ++
+        ");" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    if (db.c.sqlite3_prepare_v2(ctx.database.handle, sql.ptr, -1, &stmt, null) != db.c.SQLITE_OK) return;
+    defer _ = db.c.sqlite3_finalize(stmt);
+
+    while (db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW) {
+        const oid_raw = db.c.sqlite3_column_text(stmt, 0);
+        const mid_raw = db.c.sqlite3_column_text(stmt, 1);
+        const oid_span = if (oid_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else continue;
+        const mid_span = if (mid_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "unknown";
+
+        var oid_buf: [68]u8 = undefined;
+        const oid_len = @min(oid_span.len, oid_buf.len);
+        @memcpy(oid_buf[0..oid_len], oid_span[0..oid_len]);
+        const order_id = oid_buf[0..oid_len];
+
+        if (ctx.om.cancelOrder(order_id)) {
+            ctx.se.untrackOrder(order_id);
+            ctx.se.incrementCancels(.liquidity_provision);
+            log.warn("strategy_worker", "cancelled orphan LP buy {s} on {s}", .{ order_id, mid_span });
+        } else {
+            log.err("strategy_worker", "failed to cancel orphan LP buy {s} on {s}", .{ order_id, mid_span });
         }
     }
 }
@@ -866,61 +906,116 @@ fn dispatchLpPair(ctx: *StrategyWorkerCtx, buy_signal: strategy.Signal, sell_sig
 
     const origin = "liquidity_provision";
 
+    // PAIR PRE-FLIGHT: Validate the COMBINED notional of both legs against
+    // the risk gate before placing either. The per-order gate would otherwise
+    // accept the buy (which then bumps current_exposure) and reject the sell,
+    // leaving a naked buy on the CLOB. This is the root cause of the bug
+    // where 7 buys ended up unpaired.
+    const buy_notional = buy_size * buy_price;
+    const sell_notional = sell_size * sell_price;
+    const preflight = risk.validatePairPreflight(
+        ctx.om.database,
+        ctx.om.risk_config,
+        buy_notional,
+        sell_notional,
+    );
+    if (preflight == .reject) {
+        ctx.se.incrementOrdersRejected(.liquidity_provision);
+        ctx.se.incrementOrdersRejected(.liquidity_provision);
+        log.warn(
+            "strategy_worker",
+            "lp_pair: preflight rejected ({s}); skipping pair (buy_notional={d:.2} sell_notional={d:.2})",
+            .{ preflight.reject.check_name, buy_notional, sell_notional },
+        );
+        return;
+    }
+
+    // ATOMICITY: Place buy first. Only attempt the sell if the buy was
+    // accepted AND tracked. If the sell is rejected (e.g. by the risk gate
+    // because the buy already committed capital), cancel the buy so we
+    // never leave a naked long leg on the CLOB.
+
     // Place buy leg
     const buy_result = ctx.om.placeOrder(buy_market_id, "buy", buy_size_str, buy_price_str, "limit", origin);
-    // Place sell leg
-    const sell_result = ctx.om.placeOrder(sell_market_id, "sell", sell_size_str, sell_price_str, "limit", origin);
-    crash_trace.breadcrumb("strategy", "lp pair returned buy={s} sell={s}", .{
+    crash_trace.breadcrumb("strategy", "lp pair buy returned market={s}", .{
         buy_market_id[0..@min(buy_market_id.len, 24)],
+    });
+
+    if (buy_result != .success) {
+        ctx.se.incrementOrdersRejected(.liquidity_provision);
+        const reason: []const u8 = switch (buy_result) {
+            .rejected => |r| r.reason,
+            .failed => |f| f.reason,
+            else => "unknown",
+        };
+        log.warn("strategy_worker", "lp_pair: buy leg not placed ({s}); skipping sell leg", .{reason});
+        return;
+    }
+
+    // Buy succeeded — attempt to track it. If tracking fails, cancel and bail.
+    const buy_tracked = ctx.se.trackOrder(buy_result.success.order_id, buy_market_id, .liquidity_provision, .buy, buy_signal.price);
+    if (!buy_tracked) {
+        ctx.se.incrementOrdersRejected(.liquidity_provision);
+        log.err("strategy_worker", "lp_pair: failed to track buy leg, cancelling: {s}", .{buy_result.success.order_id});
+        _ = ctx.om.cancelOrder(buy_result.success.order_id);
+        ctx.om.allocator.free(buy_result.success.order_id);
+        return;
+    }
+    ctx.se.incrementOrdersAccepted(.liquidity_provision);
+    ctx.database.insertStrategySignal(buy_market_id, origin, buy_signal.confidence, "") catch {};
+
+    // Place sell leg. From here on, any failure must roll back the buy.
+    const sell_result = ctx.om.placeOrder(sell_market_id, "sell", sell_size_str, sell_price_str, "limit", origin);
+    crash_trace.breadcrumb("strategy", "lp pair sell returned market={s}", .{
         sell_market_id[0..@min(sell_market_id.len, 24)],
     });
 
-    var buy_tracked = false;
-    var sell_tracked = false;
-
-    if (buy_result == .success) {
-        buy_tracked = ctx.se.trackOrder(buy_result.success.order_id, buy_market_id, .liquidity_provision, .buy, buy_signal.price);
-        if (buy_tracked) {
-            ctx.se.incrementOrdersAccepted(.liquidity_provision);
-            ctx.database.insertStrategySignal(buy_market_id, origin, buy_signal.confidence, "") catch {};
-        } else {
-            ctx.se.incrementOrdersRejected(.liquidity_provision);
-            log.err("strategy_worker", "lp_pair: failed to track buy leg, attempting cancel: {s}", .{buy_result.success.order_id});
-            _ = ctx.om.cancelOrder(buy_result.success.order_id);
-        }
-    } else {
+    if (sell_result != .success) {
         ctx.se.incrementOrdersRejected(.liquidity_provision);
+        const reason: []const u8 = switch (sell_result) {
+            .rejected => |r| r.reason,
+            .failed => |f| f.reason,
+            else => "unknown",
+        };
+        log.warn("strategy_worker", "lp_pair: sell rejected ({s}); cancelling paired buy {s}", .{
+            reason, buy_result.success.order_id,
+        });
+        _ = ctx.om.cancelOrder(buy_result.success.order_id);
+        ctx.se.untrackOrder(buy_result.success.order_id);
+        ctx.om.allocator.free(buy_result.success.order_id);
+        return;
     }
 
-    if (sell_result == .success) {
-        sell_tracked = ctx.se.trackOrder(sell_result.success.order_id, sell_market_id, .liquidity_provision, .sell, sell_signal.price);
-        if (sell_tracked) {
-            ctx.se.incrementOrdersAccepted(.liquidity_provision);
-            ctx.database.insertStrategySignal(sell_market_id, origin, sell_signal.confidence, "") catch {};
-        } else {
-            ctx.se.incrementOrdersRejected(.liquidity_provision);
-            log.err("strategy_worker", "lp_pair: failed to track sell leg, attempting cancel: {s}", .{sell_result.success.order_id});
-            _ = ctx.om.cancelOrder(sell_result.success.order_id);
-        }
-    } else {
+    // Sell succeeded — attempt to track it. If tracking fails, cancel both legs.
+    const sell_tracked = ctx.se.trackOrder(sell_result.success.order_id, sell_market_id, .liquidity_provision, .sell, sell_signal.price);
+    if (!sell_tracked) {
         ctx.se.incrementOrdersRejected(.liquidity_provision);
+        log.err("strategy_worker", "lp_pair: failed to track sell leg, cancelling both legs: buy={s} sell={s}", .{
+            buy_result.success.order_id, sell_result.success.order_id,
+        });
+        _ = ctx.om.cancelOrder(sell_result.success.order_id);
+        _ = ctx.om.cancelOrder(buy_result.success.order_id);
+        ctx.se.untrackOrder(buy_result.success.order_id);
+        ctx.om.allocator.free(buy_result.success.order_id);
+        ctx.om.allocator.free(sell_result.success.order_id);
+        return;
     }
+    ctx.se.incrementOrdersAccepted(.liquidity_provision);
+    ctx.database.insertStrategySignal(sell_market_id, origin, sell_signal.confidence, "") catch {};
 
     // Link the two tracked orders so a fill on one triggers cancel of the other.
-    if (buy_tracked and sell_tracked) {
-        if (ctx.se.findOrderIndex(buy_result.success.order_id)) |bi| {
-            if (ctx.se.findOrderIndex(sell_result.success.order_id)) |si| {
-                ctx.se.linkPair(bi, si);
-                log.info("strategy_worker", "lp_pair linked: buy={s} sell={s}", .{
-                    buy_result.success.order_id, sell_result.success.order_id,
-                });
-            }
+    if (ctx.se.findOrderIndex(buy_result.success.order_id)) |bi| {
+        if (ctx.se.findOrderIndex(sell_result.success.order_id)) |si| {
+            ctx.se.linkPair(bi, si);
+            log.info("strategy_worker", "lp_pair linked: buy={s} sell={s}", .{
+                buy_result.success.order_id, sell_result.success.order_id,
+            });
         }
     }
 
     // Free heap-owned order IDs returned by placeOrder.
-    if (buy_result == .success) ctx.om.allocator.free(buy_result.success.order_id);
-    if (sell_result == .success) ctx.om.allocator.free(sell_result.success.order_id);
+    ctx.om.allocator.free(buy_result.success.order_id);
+    ctx.om.allocator.free(sell_result.success.order_id);
 }
 
 /// Returns true if the engine is at capacity (max open orders OR balance

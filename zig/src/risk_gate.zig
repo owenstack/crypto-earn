@@ -318,6 +318,110 @@ pub fn validateOrder(request: OrderRequest, database: *db.DB, config: RiskConfig
     return .{ .pass = {} };
 }
 
+/// Pre-flight check for a paired buy + sell submission.
+///
+/// Validates that the COMBINED notional of both legs would still fit under the
+/// portfolio exposure and balance commitment limits, given current open
+/// exposure. Lets the dispatcher reject the pair atomically before placing
+/// either leg, instead of placing the buy and getting the sell rejected by
+/// the per-order gate (which is what produces naked buys).
+///
+/// `buy_notional` and `sell_notional` are the dollar collateral commitments
+/// of each leg (size_shares * price).
+pub fn validatePairPreflight(
+    database: *db.DB,
+    config: RiskConfig,
+    buy_notional: f64,
+    sell_notional: f64,
+) ValidationResult {
+    const total_notional = buy_notional + sell_notional;
+
+    const balance_opt = database.queryLatestUsdcBalance(config.balance_snapshot_max_age_seconds) catch {
+        return .{ .reject = .{
+            .reason = .db_error,
+            .check_name = "pair_preflight_balance_query_failed",
+            .limit_value = 0.0,
+            .actual_value = 0.0,
+        } };
+    };
+    const limits = resolveLimits(config, balance_opt);
+
+    // Per-leg max position
+    if (buy_notional > limits.max_position_usd) {
+        return .{ .reject = .{
+            .reason = .max_position_exceeded,
+            .check_name = "pair_preflight_buy_max_position_usd",
+            .limit_value = limits.max_position_usd,
+            .actual_value = buy_notional,
+        } };
+    }
+    if (sell_notional > limits.max_position_usd) {
+        return .{ .reject = .{
+            .reason = .max_position_exceeded,
+            .check_name = "pair_preflight_sell_max_position_usd",
+            .limit_value = limits.max_position_usd,
+            .actual_value = sell_notional,
+        } };
+    }
+
+    const current_exposure = database.queryOpenExposureUsd() catch {
+        return .{ .reject = .{
+            .reason = .db_error,
+            .check_name = "pair_preflight_open_exposure_query_failed",
+            .limit_value = 0.0,
+            .actual_value = 0.0,
+        } };
+    };
+
+    if (current_exposure + total_notional > limits.max_portfolio_exposure_usd) {
+        return .{ .reject = .{
+            .reason = .max_portfolio_exposure_exceeded,
+            .check_name = "pair_preflight_max_portfolio_exposure_usd",
+            .limit_value = limits.max_portfolio_exposure_usd,
+            .actual_value = current_exposure + total_notional,
+        } };
+    }
+
+    if (balance_opt) |usdc_balance| {
+        if (usdc_balance > 0) {
+            const balance_limit = usdc_balance * config.max_balance_commitment_ratio;
+            if (current_exposure + total_notional > balance_limit) {
+                return .{ .reject = .{
+                    .reason = .balance_commitment_exceeded,
+                    .check_name = "pair_preflight_max_balance_commitment_ratio",
+                    .limit_value = balance_limit,
+                    .actual_value = current_exposure + total_notional,
+                } };
+            }
+        }
+    }
+
+    const open_orders = database.queryOpenOrderCount() catch {
+        return .{ .reject = .{
+            .reason = .db_error,
+            .check_name = "pair_preflight_open_orders_query_failed",
+            .limit_value = 0.0,
+            .actual_value = 0.0,
+        } };
+    };
+    const effective_max_orders = dynamicMaxOpenOrders(
+        balance_opt,
+        config.max_balance_commitment_ratio,
+        config.nominal_order_notional_usd,
+        config.max_open_orders,
+    );
+    if (open_orders + 2 > effective_max_orders) {
+        return .{ .reject = .{
+            .reason = .max_open_orders_exceeded,
+            .check_name = "pair_preflight_max_open_orders",
+            .limit_value = @floatFromInt(effective_max_orders),
+            .actual_value = @floatFromInt(open_orders + 2),
+        } };
+    }
+
+    return .{ .pass = {} };
+}
+
 /// Format a rejection reason as a human-readable string.
 pub fn rejectionReasonName(reason: RejectionReason) []const u8 {
     return switch (reason) {
