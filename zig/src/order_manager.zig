@@ -27,6 +27,16 @@ fn applyCancelledUpdate(stmt: *c.sqlite3_stmt, order_id: []const u8) bool {
     return c.sqlite3_step(stmt) == c.SQLITE_DONE;
 }
 
+fn parseOrderStatus(raw: []const u8) ?OrderStatus {
+    if (std.mem.eql(u8, raw, "pending")) return .pending;
+    if (std.mem.eql(u8, raw, "placed")) return .placed;
+    if (std.mem.eql(u8, raw, "partially_filled")) return .partially_filled;
+    if (std.mem.eql(u8, raw, "filled")) return .filled;
+    if (std.mem.eql(u8, raw, "cancelled")) return .cancelled;
+    if (std.mem.eql(u8, raw, "rejected")) return .rejected;
+    return null;
+}
+
 pub const OrderSide = enum { buy, sell };
 
 pub const OrderType = enum { limit, market, GTC, FOK };
@@ -50,6 +60,11 @@ pub const Order = struct {
     order_type: OrderType,
     status: OrderStatus,
     created_at: i64,
+};
+
+const CancelCandidate = struct {
+    id: []u8,
+    should_cancel_remote: bool,
 };
 
 pub const OrderResult = union(enum) {
@@ -242,7 +257,30 @@ pub const OrderManager = struct {
 
     /// Cancel a specific order by ID.
     pub fn cancelOrder(self: *OrderManager, order_id: []const u8) bool {
-        if (!self.cancelOnCLOB(order_id)) {
+        var should_cancel_remote = true;
+        const status_sql = "SELECT status FROM orders WHERE id=? LIMIT 1;" ++ &[_:0]u8{};
+        var status_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.database.handle, status_sql.ptr, -1, &status_stmt, null) == c.SQLITE_OK) {
+            defer _ = c.sqlite3_finalize(status_stmt);
+            if (c.sqlite3_bind_text(status_stmt, 1, order_id.ptr, @intCast(order_id.len), null) == c.SQLITE_OK and
+                c.sqlite3_step(status_stmt) == c.SQLITE_ROW)
+            {
+                const status_raw = c.sqlite3_column_text(status_stmt, 0);
+                const status_str = if (status_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+                if (parseOrderStatus(status_str)) |status| {
+                    should_cancel_remote = switch (status) {
+                        .placed, .partially_filled => true,
+                        .pending => false,
+                        .filled, .cancelled, .rejected => {
+                            log.warn("order_mgr", "cancel ignored for non-open order {s} status={s}", .{ order_id, status_str });
+                            return false;
+                        },
+                    };
+                }
+            }
+        }
+
+        if (should_cancel_remote and !self.cancelOnCLOB(order_id)) {
             log.err("order_mgr", "failed to cancel order on CLOB: {s}", .{order_id});
             return false;
         }
@@ -278,7 +316,7 @@ pub const OrderManager = struct {
             return 0;
         }
 
-        const select_sql = "SELECT id FROM orders WHERE status NOT IN ('filled','cancelled','rejected');" ++ &[_:0]u8{};
+        const select_sql = "SELECT id, status FROM orders WHERE status NOT IN ('filled','cancelled','rejected');" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.database.handle, select_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
             log.err("order_mgr", "cancelAll failed: unable to prepare open-order query", .{});
@@ -286,10 +324,10 @@ pub const OrderManager = struct {
         }
         defer _ = c.sqlite3_finalize(stmt);
 
-        var order_ids: std.ArrayList([]u8) = .empty;
+        var candidates: std.ArrayList(CancelCandidate) = .empty;
         defer {
-            for (order_ids.items) |id| self.allocator.free(id);
-            order_ids.deinit(self.allocator);
+            for (candidates.items) |candidate| self.allocator.free(candidate.id);
+            candidates.deinit(self.allocator);
         }
 
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
@@ -298,13 +336,23 @@ pub const OrderManager = struct {
             const order_id = std.mem.span(order_id_ptr);
             if (order_id.len == 0) continue;
 
+            const status_raw = c.sqlite3_column_text(stmt, 1);
+            const status_str = if (status_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+            const should_cancel_remote = if (parseOrderStatus(status_str)) |status|
+                status != .pending
+            else
+                true;
+
             const owned_id = self.allocator.dupe(u8, order_id) catch {
                 log.err("order_mgr", "cancelAll failed to allocate order id copy", .{});
                 continue;
             };
-            order_ids.append(self.allocator, owned_id) catch {
+            candidates.append(self.allocator, .{
+                .id = owned_id,
+                .should_cancel_remote = should_cancel_remote,
+            }) catch {
                 self.allocator.free(owned_id);
-                log.err("order_mgr", "cancelAll failed to append order id", .{});
+                log.err("order_mgr", "cancelAll failed to append order candidate", .{});
                 continue;
             };
         }
@@ -319,18 +367,18 @@ pub const OrderManager = struct {
         }
         defer _ = c.sqlite3_finalize(upd_stmt);
 
-        for (order_ids.items) |order_id| {
-            if (!self.cancelOnCLOB(order_id)) {
-                log.err("order_mgr", "cancelAll failed CLOB cancel for order {s}", .{order_id});
+        for (candidates.items) |candidate| {
+            if (candidate.should_cancel_remote and !self.cancelOnCLOB(candidate.id)) {
+                log.err("order_mgr", "cancelAll failed CLOB cancel for order {s}", .{candidate.id});
                 continue;
             }
 
-            if (!applyCancelledUpdate(upd_stmt.?, order_id)) {
-                log.err("order_mgr", "cancelAll DB update failed for order {s}", .{order_id});
+            if (!applyCancelledUpdate(upd_stmt.?, candidate.id)) {
+                log.err("order_mgr", "cancelAll DB update failed for order {s}", .{candidate.id});
                 continue;
             }
 
-            log.info("order_mgr", "cancelAll: cancelled order {s} on CLOB", .{order_id});
+            log.info("order_mgr", "cancelAll: cancelled order {s} on CLOB", .{candidate.id});
             cancelled_count += 1;
         }
 

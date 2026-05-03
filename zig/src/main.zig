@@ -15,10 +15,23 @@ const kalshi_ws = @import("kalshi_ws.zig");
 const prob_provider = @import("probability_provider.zig");
 const crash_trace = @import("crash_trace.zig");
 
+fn roundUpToCents(value: f64) f64 {
+    const step = 100.0;
+    return @ceil((value - 1e-9) * step) / step;
+}
+
+test "roundUpToCents rounds fractional cents upward" {
+    try std.testing.expectApproxEqAbs(@as(f64, 6.67), roundUpToCents(6.661), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 6.67), roundUpToCents(6.67), 1e-9);
+}
+
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // The engine fans out work across many threads (WS, IPC, scanner, fill
+    // poller, strategy worker, retention, etc). GeneralPurposeAllocator is
+    // not safe to share across threads, and doing so causes sporadic memory
+    // corruption/segfaults under live WS traffic. Use the libc allocator here
+    // because malloc/free are thread-safe and the process is long-lived.
+    const allocator = std.heap.c_allocator;
 
     log.init();
     crash_trace.install();
@@ -409,6 +422,9 @@ const StrategyWorkerCtx = struct {
     /// managing existing orders. Cleared when capacity frees (a fill closes
     /// an order or balance grows).
     saturated: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Throttle repeated max_position_usd preflight logs while strategies are
+    /// generating signals that are obviously above the current per-order cap.
+    max_position_log_after_ms: i64 = 0,
     /// Counter ticking 5s per increment; used to throttle balance/stats DB
     /// inserts so they happen ~1/min instead of every 5s.
     persist_tick: u64 = 0,
@@ -795,10 +811,17 @@ fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
         }
     }
 
+    if (signal.direction == .buy) {
+        effective_size = roundUpToCents(effective_size);
+    }
+
     var price_buf: [32]u8 = undefined;
     const price_str = std.fmt.bufPrint(&price_buf, "{d:.2}", .{clamped_price}) catch "0";
     var size_buf: [32]u8 = undefined;
     const size_str = std.fmt.bufPrint(&size_buf, "{d:.2}", .{effective_size}) catch "0";
+
+    const notional = effective_size * clamped_price;
+    if (shouldSkipForMaxPosition(ctx, market_id, side_str, notional)) return;
 
     const origin = @tagName(signal.strategy);
 
@@ -847,6 +870,23 @@ fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
             ctx.se.incrementOrdersRejected(signal.strategy);
         },
     }
+}
+
+fn shouldSkipForMaxPosition(ctx: *StrategyWorkerCtx, market_id: []const u8, side: []const u8, notional: f64) bool {
+    const balance_opt = ctx.database.queryLatestUsdcBalance(ctx.om.risk_config.balance_snapshot_max_age_seconds) catch null;
+    const limits = risk.resolveLimits(ctx.om.risk_config, balance_opt);
+    if (notional <= limits.max_position_usd) return false;
+
+    const now_ms = std.time.milliTimestamp();
+    if (now_ms >= ctx.max_position_log_after_ms) {
+        log.warn(
+            "strategy_worker",
+            "preflight skipped signal: check=max_position_usd market={s} side={s} limit={d:.2} actual={d:.2}; suppressing repeated risk rejections",
+            .{ market_id, side, limits.max_position_usd, notional },
+        );
+        ctx.max_position_log_after_ms = now_ms + 60_000;
+    }
+    return true;
 }
 
 /// Dispatch a paired LP buy+sell signal, placing both legs and linking them
