@@ -254,7 +254,7 @@ pub const ProbabilityProvider = struct {
             };
             defer response.deinit();
 
-            const page = self.parseKalshiRestInto(response.body, &acc, &acc_count, &cursor_buf) catch |err| {
+            const page = self.parseKalshiRestInto(response.body, acc, acc_count, &cursor_buf) catch |err| {
                 if (series_ticker) |ticker| {
                     log.warn("prob_provider", "Kalshi REST parse failed for series {s} page {d}: {s}", .{
                         ticker,
