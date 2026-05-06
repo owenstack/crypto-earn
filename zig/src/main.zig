@@ -495,10 +495,17 @@ fn evaluateNewsSignals(ctx: *StrategyWorkerCtx) void {
         if (yes_token_id.len == 0) continue;
         if (market_id.len == 0) continue;
 
-        const mid = queryLastMidByAsset(ctx.database, yes_token_id) orelse continue;
-        const implied_prob = priceToImpliedProb(mid);
+        const book = queryLastBookByAsset(ctx.database, yes_token_id) orelse continue;
+        const implied_prob = priceToImpliedProb(book.mid);
 
-        if (ctx.se.evaluateNewsRepricing(market_id, est.probability, implied_prob, ctx.pt.usdc_balance)) |signal| {
+        if (ctx.se.evaluateNewsRepricing(
+            market_id,
+            est.probability,
+            implied_prob,
+            ctx.pt.usdc_balance,
+            book.best_bid,
+            book.best_ask,
+        )) |signal| {
             dispatchSignal(ctx, signal);
         }
 
@@ -1445,6 +1452,39 @@ fn queryLastMidByAsset(database: *db.DB, asset_id: []const u8) ?f64 {
     if (db.c.sqlite3_step(stmt) != db.c.SQLITE_ROW) return null;
     if (db.c.sqlite3_column_type(stmt, 0) == db.c.SQLITE_NULL) return null;
     return db.c.sqlite3_column_double(stmt, 0);
+}
+
+const BookTop = struct { mid: f64, best_bid: f64, best_ask: f64 };
+
+/// Query the most recent mid_price + best_bid + best_ask for an asset_id.
+fn queryLastBookByAsset(database: *db.DB, asset_id: []const u8) ?BookTop {
+    const sql = "SELECT mid_price, best_bid, best_ask FROM orderbooks WHERE asset_id=? ORDER BY created_at DESC LIMIT 1;" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    if (db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) != db.c.SQLITE_OK) return null;
+    defer _ = db.c.sqlite3_finalize(stmt);
+    if (db.c.sqlite3_bind_text(stmt, 1, asset_id.ptr, @intCast(asset_id.len), null) != db.c.SQLITE_OK) return null;
+    if (db.c.sqlite3_step(stmt) != db.c.SQLITE_ROW) return null;
+    if (db.c.sqlite3_column_type(stmt, 0) == db.c.SQLITE_NULL) return null;
+
+    const mid = db.c.sqlite3_column_double(stmt, 0);
+    // best_bid / best_ask are stored as TEXT in orderbooks; parse defensively.
+    var best_bid: f64 = 0.0;
+    var best_ask: f64 = 0.0;
+    if (db.c.sqlite3_column_type(stmt, 1) != db.c.SQLITE_NULL) {
+        const raw = db.c.sqlite3_column_text(stmt, 1);
+        if (raw) |p| {
+            const span = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+            best_bid = std.fmt.parseFloat(f64, span) catch 0.0;
+        }
+    }
+    if (db.c.sqlite3_column_type(stmt, 2) != db.c.SQLITE_NULL) {
+        const raw = db.c.sqlite3_column_text(stmt, 2);
+        if (raw) |p| {
+            const span = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+            best_ask = std.fmt.parseFloat(f64, span) catch 0.0;
+        }
+    }
+    return .{ .mid = mid, .best_bid = best_bid, .best_ask = best_ask };
 }
 
 /// Global database handle for the WS callback (set before spawning WS thread).

@@ -555,6 +555,31 @@ pub const DB = struct {
         return @intCast(c.sqlite3_column_int(stmt, 0));
     }
 
+    /// Count live (placed/partially_filled) AND locally pending orders for a
+    /// specific market. Used by the risk gate to block stacking duplicate
+    /// resting orders on the same market while the previous one waits to
+    /// fill or be acknowledged.
+    pub fn queryOpenOrderCountByMarket(self: DB, market_id: []const u8) !u32 {
+        const sql = "SELECT count(*) FROM orders WHERE market_id=? AND status IN ('pending','placed','partially_filled');" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare queryOpenOrderCountByMarket", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK) {
+            log.err("db", "failed to bind queryOpenOrderCountByMarket parameters", .{});
+            return error.DBExecFailed;
+        }
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) {
+            log.err("db", "failed to execute queryOpenOrderCountByMarket", .{});
+            return error.DBExecFailed;
+        }
+        return @intCast(c.sqlite3_column_int(stmt, 0));
+    }
+
     pub fn queryOpenExposureUsd(self: DB) !f64 {
         // Match queryOpenOrderCount: only placed / partially_filled orders
         // represent real exchange exposure.

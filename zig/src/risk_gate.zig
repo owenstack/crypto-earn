@@ -112,6 +112,7 @@ pub const RejectionReason = enum {
     max_daily_drawdown_exceeded,
     max_open_orders_exceeded,
     duplicate_position,
+    duplicate_open_order,
     balance_commitment_exceeded,
 };
 
@@ -287,6 +288,28 @@ pub fn validateOrder(request: OrderRequest, database: *db.DB, config: RiskConfig
         return .{ .reject = rejection };
     };
 
+    // Check 4b: Duplicate open order guard
+    //
+    // The position guard below only sees filled positions, so without this
+    // check the strategy can stack identical resting orders on the same
+    // market every evaluation tick while the first one waits to fill.
+    if (!config.allow_duplicate_positions) {
+        const open_orders_on_market = database.queryOpenOrderCountByMarket(request.market_id) catch blk: {
+            log.warn("risk_gate", "queryOpenOrderCountByMarket failed; treating as 0", .{});
+            break :blk @as(u32, 0);
+        };
+        if (open_orders_on_market > 0) {
+            const rejection = Rejection{
+                .reason = .duplicate_open_order,
+                .check_name = "duplicate_open_order_guard",
+                .limit_value = 0.0,
+                .actual_value = @floatFromInt(open_orders_on_market),
+            };
+            persistRejection(database, request, rejection);
+            return .{ .reject = rejection };
+        }
+    }
+
     // Check 5: Duplicate position guard
     if (!config.allow_duplicate_positions) {
         const has_position = database.queryPositionByMarketDirection(request.market_id, position_side) catch {
@@ -432,6 +455,7 @@ pub fn rejectionReasonName(reason: RejectionReason) []const u8 {
         .max_daily_drawdown_exceeded => "MaxDailyDrawdownExceeded",
         .max_open_orders_exceeded => "MaxOpenOrdersExceeded",
         .duplicate_position => "DuplicatePosition",
+        .duplicate_open_order => "DuplicateOpenOrder",
         .balance_commitment_exceeded => "BalanceCommitmentExceeded",
     };
 }

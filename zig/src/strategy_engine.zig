@@ -158,12 +158,18 @@ pub const StrategyEngine = struct {
     /// News repricing evaluator: compare external_prob vs market_mid.
     /// Returns a signal if delta exceeds threshold and confidence passes.
     /// `balance` is the current USDC balance — used to scale order size.
+    /// `best_bid`/`best_ask` are the current top-of-book prices (0.0 if
+    /// unavailable). When provided, the limit price is adjusted to cross
+    /// the spread (take liquidity) instead of resting on the book, as long
+    /// as the cross still respects our fair value.
     pub fn evaluateNewsRepricing(
         self: *StrategyEngine,
         market_id: []const u8,
         external_prob: f64,
         market_mid: f64,
         balance: f64,
+        best_bid: f64,
+        best_ask: f64,
     ) ?Signal {
         if (self.paused.load(.seq_cst)) return null;
         // enable check should live at worker level
@@ -197,17 +203,37 @@ pub const StrategyEngine = struct {
             self.config.news_order_fallback_usd,
         );
 
+        // Cross the spread if a counterparty is already offering a price at
+        // least as good as our fair value. This trades a sliver of edge for
+        // an instant fill instead of resting on the book until somebody
+        // happens to lift our bid.
+        var order_price = external_prob;
+        switch (direction) {
+            .buy => {
+                // Pay up to best_ask if it's still <= our fair value.
+                if (best_ask > 0.0 and best_ask <= external_prob) {
+                    order_price = best_ask;
+                }
+            },
+            .sell => {
+                // Sell down to best_bid if it's still >= our fair value.
+                if (best_bid > 0.0 and best_bid >= external_prob) {
+                    order_price = best_bid;
+                }
+            },
+        }
+
         return Signal{
             .strategy = .news_repricing,
             .market_id = mid,
             .market_id_len = mid_len,
             .direction = direction,
-            .price = external_prob,
+            .price = order_price,
             .size = order_size,
             .confidence = confidence,
             .timestamp = std.time.timestamp(),
-            .best_bid = 0.0,
-            .best_ask = 0.0,
+            .best_bid = best_bid,
+            .best_ask = best_ask,
         };
     }
 

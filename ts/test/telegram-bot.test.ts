@@ -1,5 +1,6 @@
 import { test, expect, describe } from "bun:test";
-import { createBot, createAllowedIds, isAllowedChatId, registerEventPush } from "../src/telegram/bot.ts";
+import { createBot, createAllowedIds, isAllowedChatId, registerEventPush, shouldNotifyTelegramPush } from "../src/telegram/bot.ts";
+import type { Envelope } from "../src/ipc/types.ts";
 
 describe("createBot", () => {
   test("throws if TELEGRAM_BOT_TOKEN is not set", async () => {
@@ -77,5 +78,40 @@ describe("Phase 4 event push notifications", () => {
     expect(isAllowedChatId(111, allowed)).toBe(true);
     expect(isAllowedChatId(222, allowed)).toBe(true);
     expect(isAllowedChatId(999, allowed)).toBe(false);
+  });
+
+  test("rejected-order pushes are throttled by signature", () => {
+    const env: Envelope = {
+      v: 1,
+      id: "evt-1",
+      ts: Date.now(),
+      type: "event.order.rejected",
+      payload: {
+        order_id: "o-1",
+        market_id: "m-1",
+        side: "sell",
+        reason: "BalanceCommitmentExceeded",
+      },
+    };
+
+    expect(shouldNotifyTelegramPush(env, 1_000)).toBe(true);
+    expect(shouldNotifyTelegramPush(env, 2_000)).toBe(false);
+    expect(shouldNotifyTelegramPush(env, 302_000)).toBe(true);
+  });
+
+  test("non-rejection event pushes are not throttled", () => {
+    const env: Envelope = {
+      v: 1,
+      id: "evt-2",
+      ts: Date.now(),
+      type: "event.engine.halted",
+      payload: {
+        status: "halted",
+        cancelled_orders: 2,
+      },
+    };
+
+    expect(shouldNotifyTelegramPush(env, 1_000)).toBe(true);
+    expect(shouldNotifyTelegramPush(env, 2_000)).toBe(true);
   });
 });

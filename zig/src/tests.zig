@@ -549,10 +549,14 @@ test "risk_gate: rejects when max open orders reached" {
     defer database.close();
     try database.runMigrations();
 
-    // Insert a market first (required by foreign key)
+    // Insert markets first (required by foreign key). Use distinct markets so
+    // the new duplicate_open_order guard does not fire before the
+    // max_open_orders check.
     try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m2','SYM','B','Q');");
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m3','SYM','B','Q');");
 
-    // Insert max_open_orders pending orders
+    // Insert max_open_orders pending orders, one per market.
     const config = risk_gate.RiskConfig{
         .max_position_usd_fallback = 500.0,
         .max_portfolio_exposure_usd_fallback = 5000.0,
@@ -560,10 +564,10 @@ test "risk_gate: rejects when max open orders reached" {
     };
 
     try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50", null);
-    try database.insertOrder("o2", "m1", "co2", "limit", "sell", "10", "0.50", null);
+    try database.insertOrder("o2", "m2", "co2", "limit", "sell", "10", "0.50", null);
 
     const request = risk_gate.OrderRequest{
-        .market_id = "m1",
+        .market_id = "m3",
         .side = "buy",
         .size = "10",
         .price = "0.50",
@@ -632,6 +636,42 @@ test "risk_gate: rejects duplicate position" {
     switch (result) {
         .reject => |r| {
             try testing.expectEqual(risk_gate.RejectionReason.duplicate_position, r.reason);
+        },
+        .pass => try testing.expect(false),
+    }
+}
+
+test "risk_gate: rejects duplicate open order on same market" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    // Insert a market and a resting (pending) order — no position yet, since
+    // the order has not filled.
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
+    try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.14", null);
+
+    const config = risk_gate.RiskConfig{
+        .max_position_usd_fallback = 500.0,
+        .max_portfolio_exposure_usd_fallback = 5000.0,
+        .allow_duplicate_positions = false,
+    };
+
+    // Strategy emits the same buy signal again on the next tick — must be
+    // blocked by the new open-order guard, even though no position exists.
+    const request = risk_gate.OrderRequest{
+        .market_id = "m1",
+        .side = "buy",
+        .size = "10",
+        .price = "0.14",
+        .order_type = "limit",
+        .client_order_id = "test-dup-open",
+    };
+
+    const result = risk_gate.validateOrder(request, &database, config);
+    switch (result) {
+        .reject => |r| {
+            try testing.expectEqual(risk_gate.RejectionReason.duplicate_open_order, r.reason);
         },
         .pass => try testing.expect(false),
     }
@@ -896,7 +936,7 @@ test "strategy_engine: news repricing triggers on sufficient delta" {
     });
 
     // Delta = |0.70 - 0.50| = 0.20, well above threshold
-    const signal = se.evaluateNewsRepricing("test-market", 0.70, 0.50, 0.0);
+    const signal = se.evaluateNewsRepricing("test-market", 0.70, 0.50, 0.0, 0.0, 0.0);
     try testing.expect(signal != null);
     const s = signal.?;
     try testing.expectEqual(strategy_engine.StrategyName.news_repricing, s.strategy);
@@ -909,13 +949,60 @@ test "strategy_engine: news repricing triggers on sufficient delta" {
     try testing.expectEqual(@as(u64, 1), se.news_stats.signals_emitted);
 }
 
+test "strategy_engine: news repricing crosses spread on buy when ask is favorable" {
+    var se = strategy_engine.StrategyEngine.init(.{
+        .news_delta_threshold = 0.05,
+        .news_confidence_min = 0.3,
+        .news_order_fallback_usd = 10.0,
+    });
+
+    // external_prob = 0.70 fair value, market mid 0.50 (delta 0.20).
+    // Best bid = 0.45, best ask = 0.60. Ask 0.60 <= 0.70, so the engine
+    // should buy at the ask (0.60) for an instant fill instead of resting
+    // on the book at 0.70.
+    const signal = se.evaluateNewsRepricing("m-spread", 0.70, 0.50, 0.0, 0.45, 0.60);
+    try testing.expect(signal != null);
+    try testing.expectEqual(strategy_engine.SignalDirection.buy, signal.?.direction);
+    try testing.expectEqual(@as(f64, 0.60), signal.?.price);
+    try testing.expectEqual(@as(f64, 0.45), signal.?.best_bid);
+    try testing.expectEqual(@as(f64, 0.60), signal.?.best_ask);
+}
+
+test "strategy_engine: news repricing keeps fair price when ask is too high" {
+    var se = strategy_engine.StrategyEngine.init(.{
+        .news_delta_threshold = 0.05,
+        .news_confidence_min = 0.3,
+        .news_order_fallback_usd = 10.0,
+    });
+
+    // Best ask 0.85 > fair value 0.70 — refuse to chase, post bid at 0.70.
+    const signal = se.evaluateNewsRepricing("m-wide", 0.70, 0.50, 0.0, 0.05, 0.85);
+    try testing.expect(signal != null);
+    try testing.expectEqual(@as(f64, 0.70), signal.?.price);
+}
+
+test "strategy_engine: news repricing crosses spread on sell when bid is favorable" {
+    var se = strategy_engine.StrategyEngine.init(.{
+        .news_delta_threshold = 0.05,
+        .news_confidence_min = 0.3,
+        .news_order_fallback_usd = 10.0,
+    });
+
+    // external_prob = 0.30 fair value, market mid 0.50 — sell signal.
+    // Best bid 0.40 >= 0.30, so the engine should sell into the bid at 0.40.
+    const signal = se.evaluateNewsRepricing("m-sell", 0.30, 0.50, 0.0, 0.40, 0.55);
+    try testing.expect(signal != null);
+    try testing.expectEqual(strategy_engine.SignalDirection.sell, signal.?.direction);
+    try testing.expectEqual(@as(f64, 0.40), signal.?.price);
+}
+
 test "strategy_engine: news repricing returns null when delta below threshold" {
     var se = strategy_engine.StrategyEngine.init(.{
         .news_delta_threshold = 0.05,
     });
 
     // Delta = |0.52 - 0.50| = 0.02, below threshold
-    const signal = se.evaluateNewsRepricing("test-market", 0.52, 0.50, 0.0);
+    const signal = se.evaluateNewsRepricing("test-market", 0.52, 0.50, 0.0, 0.0, 0.0);
     try testing.expect(signal == null);
     try testing.expectEqual(@as(u64, 0), se.news_stats.signals_emitted);
 }
@@ -927,7 +1014,7 @@ test "strategy_engine: news repricing sell direction" {
     });
 
     // external_prob < market_mid => sell signal
-    const signal = se.evaluateNewsRepricing("test-market", 0.30, 0.50, 0.0);
+    const signal = se.evaluateNewsRepricing("test-market", 0.30, 0.50, 0.0, 0.0, 0.0);
     try testing.expect(signal != null);
     try testing.expectEqual(strategy_engine.SignalDirection.sell, signal.?.direction);
 }
@@ -939,12 +1026,12 @@ test "strategy_engine: news repricing confidence bounds" {
     });
 
     // Delta = 0.30 => confidence = min(1.0, 0.30/0.2) = 1.0 (capped)
-    const sig1 = se.evaluateNewsRepricing("m1", 0.80, 0.50, 0.0);
+    const sig1 = se.evaluateNewsRepricing("m1", 0.80, 0.50, 0.0, 0.0, 0.0);
     try testing.expect(sig1 != null);
     try testing.expectEqual(@as(f64, 1.0), sig1.?.confidence);
 
     // Delta = 0.05 => confidence = min(1.0, 0.05/0.2) = 0.25
-    const sig2 = se.evaluateNewsRepricing("m2", 0.55, 0.50, 0.0);
+    const sig2 = se.evaluateNewsRepricing("m2", 0.55, 0.50, 0.0, 0.0, 0.0);
     try testing.expect(sig2 != null);
     try testing.expectApproxEqAbs(@as(f64, 0.25), sig2.?.confidence, 1e-9);
 }
@@ -1065,7 +1152,7 @@ test "strategy_engine: halt suppresses evaluation gating" {
     });
 
     // When not enabled, evaluator still produces signals (enable check is at worker level)
-    const signal = se.evaluateNewsRepricing("m1", 0.70, 0.50, 0.0);
+    const signal = se.evaluateNewsRepricing("m1", 0.70, 0.50, 0.0, 0.0, 0.0);
     try testing.expect(signal != null);
 
     // isEnabled returns false by default
@@ -1081,7 +1168,7 @@ test "strategy_engine: stats tracking" {
     try testing.expectEqual(@as(u64, 0), ns.orders_accepted);
 
     // After signals
-    _ = se.evaluateNewsRepricing("m1", 0.80, 0.50, 0.0);
+    _ = se.evaluateNewsRepricing("m1", 0.80, 0.50, 0.0, 0.0, 0.0);
     const ns2 = se.getStats(.news_repricing);
     try testing.expectEqual(@as(u64, 1), ns2.signals_emitted);
 }
@@ -1444,12 +1531,12 @@ test "strategy_engine: paused state blocks signal generation" {
     });
 
     // Not paused — signals generated
-    const signal1 = se.evaluateNewsRepricing("m1", 0.80, 0.50, 0.0);
+    const signal1 = se.evaluateNewsRepricing("m1", 0.80, 0.50, 0.0, 0.0, 0.0);
     try testing.expect(signal1 != null);
 
     // Pause — no signals
     se.paused.store(true, .seq_cst);
-    const signal2 = se.evaluateNewsRepricing("m1", 0.80, 0.50, 0.0);
+    const signal2 = se.evaluateNewsRepricing("m1", 0.80, 0.50, 0.0, 0.0, 0.0);
     try testing.expect(signal2 == null);
 
     const lp = se.evaluateLiquidityProvision("m1", 0.40, 0.60, 0.0);
@@ -1457,7 +1544,7 @@ test "strategy_engine: paused state blocks signal generation" {
 
     // Unpause — signals resume
     se.paused.store(false, .seq_cst);
-    const signal3 = se.evaluateNewsRepricing("m1", 0.80, 0.50, 0.0);
+    const signal3 = se.evaluateNewsRepricing("m1", 0.80, 0.50, 0.0, 0.0, 0.0);
     try testing.expect(signal3 != null);
 }
 

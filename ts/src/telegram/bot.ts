@@ -50,23 +50,39 @@ export function isAllowedChatId(chatId: number, allowedIds: Set<number> = ALLOWE
   return allowedIds.has(chatId);
 }
 
+async function safeReply(ctx: Context, text: string, options?: Parameters<Context["reply"]>[1]): Promise<void> {
+  try {
+    await ctx.reply(text, options);
+  } catch (err) {
+    console.error(JSON.stringify({
+      ts: Date.now(),
+      level: "WARN",
+      component: "telegram",
+      msg: `reply failed for chat ${ctx.chat?.id ?? "unknown"}: ${err instanceof Error ? err.message : String(err)}`,
+    }));
+  }
+}
+
 function guard(handler: (ctx: Context) => Promise<void>) {
   return async (ctx: Context) => {
     if (!isAllowed(ctx)) {
-      await ctx.reply("⛔ Unauthorized.");
+      await safeReply(ctx, "⛔ Unauthorized.");
       return;
     }
     try {
       await handler(ctx);
     } catch (err) {
-      await ctx.reply(`❌ Error: ${err instanceof Error ? err.message : String(err)}`);
+      await safeReply(ctx, `❌ Error: ${err instanceof Error ? err.message : String(err)}`);
     }
   };
 }
 
 // Phase 4: Event push notification support
 const DEDUP_MAX_SIZE = 500;
+const REJECTION_PUSH_WINDOW_MS = 5 * 60 * 1000;
 const recentEventIds = new Set<string>();
+const rejectionPushThrottle = new Map<string, number>();
+const chatPushCooldownUntil = new Map<number, number>();
 
 /**
  * Deduplicates event IDs with a bounded FIFO set.
@@ -82,6 +98,39 @@ function dedup(eventId: string): boolean {
     if (first) recentEventIds.delete(first);
   }
   return false;
+}
+
+export function shouldNotifyTelegramPush(env: Envelope, now = Date.now()): boolean {
+  if (env.type !== "event.order.rejected" && env.type !== "event.risk.rejection") return true;
+
+  const payload = env.payload as Record<string, unknown>;
+  const signature = [
+    env.type,
+    String(payload.market_id ?? ""),
+    String(payload.side ?? ""),
+    String(payload.check_name ?? ""),
+    String(payload.reason ?? ""),
+  ].join("|");
+
+  const lastSent = rejectionPushThrottle.get(signature);
+  if (lastSent !== undefined && now - lastSent < REJECTION_PUSH_WINDOW_MS) {
+    return false;
+  }
+
+  rejectionPushThrottle.set(signature, now);
+  return true;
+}
+
+function chatPushCooldownActive(chatId: number, now = Date.now()): boolean {
+  const cooldownUntil = chatPushCooldownUntil.get(chatId);
+  return cooldownUntil !== undefined && cooldownUntil > now;
+}
+
+function noteChatPushFailure(chatId: number, err: unknown, now = Date.now()): void {
+  const retryAfter = (err as { parameters?: { retry_after?: unknown } })?.parameters?.retry_after;
+  if (typeof retryAfter === "number" && Number.isFinite(retryAfter) && retryAfter > 0) {
+    chatPushCooldownUntil.set(chatId, now + retryAfter * 1000);
+  }
 }
 
 function escapeHtml(value: unknown): string {
@@ -142,6 +191,14 @@ export function createBot(ipc: IPCClient): Bot {
   if (!token) throw new Error("TELEGRAM_BOT_TOKEN not set");
 
   const bot = new Bot(token);
+  bot.catch(async ({ error, ctx }) => {
+    console.error(JSON.stringify({
+      ts: Date.now(),
+      level: "ERROR",
+      component: "telegram",
+      msg: `bot middleware error for chat ${ctx.chat?.id ?? "unknown"}: ${error instanceof Error ? error.message : String(error)}`,
+    }));
+  });
 
   bot.command("start", guard(async ctx => {
     await ctx.reply(
@@ -580,14 +637,17 @@ export function createBot(ipc: IPCClient): Bot {
 export function registerEventPush(ipc: IPCClient, bot: InstanceType<typeof Bot>): void {
   ipc.onEvent("*", async (env: Envelope) => {
     if (dedup(env.id)) return;
+    if (!shouldNotifyTelegramPush(env)) return;
     const text = formatEvent(env);
     if (!text) return;
 
     const chatIds = Array.from(ALLOWED_IDS);
     for (const chatId of chatIds) {
+      if (chatPushCooldownActive(chatId)) continue;
       try {
         await bot.api.sendMessage(chatId, text, { parse_mode: "HTML" });
       } catch (err) {
+        noteChatPushFailure(chatId, err);
         console.error(JSON.stringify({
           ts: Date.now(),
           level: "WARN",
