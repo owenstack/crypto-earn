@@ -8,9 +8,6 @@ const db = @import("db.zig");
 const crypto = @import("crypto.zig");
 const http_client = @import("http_client.zig");
 const websocket = @import("websocket.zig");
-const gamma_api = @import("gamma_api.zig");
-const clob_orderbook = @import("clob_orderbook.zig");
-const market_scanner = @import("market_scanner.zig");
 
 // Phase 2 modules
 const risk_gate = @import("risk_gate.zig");
@@ -19,19 +16,12 @@ const portfolio_tracker = @import("portfolio_tracker.zig");
 
 // Phase 3 modules
 const strategy_engine = @import("strategy_engine.zig");
-const news_sources = @import("news_sources.zig");
 
 // Phase 4 modules
 const ipc = @import("ipc.zig");
 
-// Polymarket auth module
-const polymarket_auth = @import("polymarket_auth.zig");
-
 // Phase 2 PRD modules (fill detection)
 const fill_poller = @import("fill_poller.zig");
-
-// Phase 3 PRD modules (probability provider)
-const probability_provider = @import("probability_provider.zig");
 
 // ─── Logger tests ───────────────────────────────────────────────────────────
 
@@ -1271,16 +1261,6 @@ test "portfolio_tracker: writeOrdersJson reports truncation metadata" {
 
     try testing.expect(std.mem.indexOf(u8, json, "\"truncated\":true") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"skipped_count\":1") != null);
-}
-
-// ─── Phase 3: News sources tests ────────────────────────────────────────────
-
-test "news_sources: init and empty cache" {
-    var nc = news_sources.NewsClient.init(testing.allocator, .{});
-    try testing.expectEqual(@as(usize, 0), nc.cached_count);
-
-    const est = nc.getEstimate("nonexistent");
-    try testing.expect(est == null);
 }
 
 // ─── Phase 4: IPC event types and writeEvent ────────────────────────────────

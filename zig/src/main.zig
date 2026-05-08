@@ -3,16 +3,12 @@ const log = @import("logger.zig");
 const db = @import("db.zig");
 const ipc = @import("ipc.zig");
 const ipc_types = @import("ipc_types.zig");
-const scanner = @import("market_scanner.zig");
 const order_mgr = @import("order_manager.zig");
-const poly_auth = @import("polymarket_auth.zig");
 const risk = @import("risk_gate.zig");
 const portfolio = @import("portfolio_tracker.zig");
 const strategy = @import("strategy_engine.zig");
 const ws = @import("websocket.zig");
 const fill_poller = @import("fill_poller.zig");
-const kalshi_ws = @import("kalshi_ws.zig");
-const prob_provider = @import("probability_provider.zig");
 const crash_trace = @import("crash_trace.zig");
 
 fn roundUpToCents(value: f64) f64 {
@@ -62,78 +58,8 @@ pub fn main() !void {
     // Initialize risk config
     const risk_config = risk.RiskConfig{};
 
-    // Parse private key from environment and bootstrap Polymarket auth
+    // Order manager config (Polymarket auth removed in Phase 1; HL auth lands in Phase 2)
     var om_config = order_mgr.OrderManagerConfig{};
-    var api_bootstrap_err: ?[]const u8 = null;
-    if (std.posix.getenv("POLYMARKET_PRIVATE_KEY")) |pk_env| {
-        // Strip optional "0x" prefix
-        const hex = if (pk_env.len >= 2 and pk_env[0] == '0' and (pk_env[1] == 'x' or pk_env[1] == 'X'))
-            pk_env[2..]
-        else
-            pk_env;
-        if (hex.len == 64) {
-            var valid = true;
-            for (0..32) |i| {
-                om_config.private_key[i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch {
-                    valid = false;
-                    break;
-                };
-            }
-            if (valid) {
-                log.info("engine", "loaded POLYMARKET_PRIVATE_KEY", .{});
-
-                // Derive Ethereum address and bootstrap API credentials
-                if (poly_auth.deriveAddress(om_config.private_key)) |addr| {
-                    om_config.signer_address = addr;
-                    const addr_hex = poly_auth.formatAddressEip55(om_config.signer_address);
-                    log.info("engine", "signer address: {s}", .{&addr_hex});
-
-                    // Bootstrap API credentials
-                    if (poly_auth.bootstrapApiCredentials(
-                        allocator,
-                        om_config.private_key,
-                        om_config.signer_address,
-                    )) |creds| {
-                        om_config.api_creds = creds;
-                        log.info("engine", "API credentials bootstrapped (key={s}...)", .{
-                            creds.api_key[0..@min(creds.api_key_len, 8)],
-                        });
-                    } else |e| {
-                        api_bootstrap_err = @errorName(e);
-                        log.err("engine", "failed to bootstrap API credentials: {s}", .{@errorName(e)});
-                        log.warn("engine", "engine will start but order submission will fail", .{});
-                    }
-                } else |_| {
-                    log.err("engine", "failed to derive signer address from private key", .{});
-                }
-            } else {
-                log.err("engine", "invalid POLYMARKET_PRIVATE_KEY hex", .{});
-                om_config.private_key = [_]u8{0} ** 32;
-            }
-        } else {
-            log.err("engine", "POLYMARKET_PRIVATE_KEY must be 64 hex chars (got {d})", .{hex.len});
-        }
-    } else {
-        log.warn("engine", "POLYMARKET_PRIVATE_KEY not set — orders will fail", .{});
-    }
-
-    if (std.posix.getenv("POLYMARKET_SIGNATURE_TYPE")) |sig_env| {
-        om_config.signature_type = poly_auth.parseSignatureType(sig_env) catch |e| {
-            log.err("engine", "invalid POLYMARKET_SIGNATURE_TYPE: {s} ({s})", .{ sig_env, @errorName(e) });
-            return e;
-        };
-        log.info("engine", "Polymarket signature_type={d}", .{om_config.signature_type});
-    }
-
-    if (std.posix.getenv("POLYMARKET_FUNDER_ADDRESS")) |funder_env| {
-        om_config.funder_address = poly_auth.parseAddress(funder_env) catch |e| {
-            log.err("engine", "invalid POLYMARKET_FUNDER_ADDRESS: {s} ({s})", .{ funder_env, @errorName(e) });
-            return e;
-        };
-        log.info("engine", "loaded POLYMARKET_FUNDER_ADDRESS", .{});
-    }
-
-    emitPolymarketStartupDiagnostic(allocator, om_config, api_bootstrap_err);
 
     // Initialize order manager
     var om = order_mgr.OrderManager.init(allocator, &database, risk_config, om_config);
@@ -148,17 +74,6 @@ pub fn main() !void {
     ws_client.setCallback(&wsPriceCallback);
     g_database = &database;
     log.info("engine", "websocket client ready", .{});
-
-    // Spawn market scanner thread (no longer feeds news client — Phase 3 removed that dependency)
-    var scan = scanner.Scanner.init(allocator, &database, .{});
-    scan.setWebSocketClient(&ws_client);
-    const scanner_thread = try std.Thread.spawn(.{}, scanner.Scanner.run, .{&scan});
-    defer {
-        scan.stop();
-        scanner_thread.join();
-        scan.deinit();
-    }
-    log.info("engine", "market scanner started", .{});
 
     // Spawn WebSocket thread for real-time orderbook feeds
     const ws_thread = try std.Thread.spawn(.{}, ws.WebSocketClient.connectAndRun, .{&ws_client});
@@ -215,24 +130,6 @@ pub fn main() !void {
     }
     log.info("engine", "fill poller WebSocket thread started", .{});
     log.info("engine", "fill poller REST polling thread started", .{});
-
-    // Initialize Kalshi WebSocket client (primary probability source)
-    var kws = kalshi_ws.KalshiWsClient.init(allocator, &database);
-    const kalshi_thread = try std.Thread.spawn(.{}, kalshi_ws.KalshiWsClient.run, .{&kws});
-    defer {
-        kws.stop();
-        kalshi_thread.join();
-    }
-    log.info("engine", "Kalshi WebSocket client started", .{});
-
-    // Initialize probability provider (Kalshi WS primary, HTTP polling fallback)
-    var pp = prob_provider.ProbabilityProvider.init(allocator, &database, &kws);
-    const pp_thread = try std.Thread.spawn(.{}, prob_provider.ProbabilityProvider.run, .{&pp});
-    defer {
-        pp.stop();
-        pp_thread.join();
-    }
-    log.info("engine", "probability provider started", .{});
 
     // Strategy engine was initialized earlier (above fill poller). Now load
     // its runtime config and resolve lp_max_position_usd.
@@ -301,81 +198,8 @@ pub fn main() !void {
         log.info("engine", "dry-run initial balance: ${d:.2}", .{dry_run_initial_balance});
     }
 
-    // Spawn USDC balance refresh ticker (live mode only — when API credentials
-    // are available and not in dry-run). Polls Polymarket's L2
-    // /balance-allowance endpoint every 60s and writes the result to
-    // balance_snapshots so the risk gate, /balance dashboard, and dynamic
-    // order sizing see the user's real on-exchange USDC balance.
-    var balance_ticker_ctx_opt: ?*BalanceTickerCtx = null;
-    var balance_thread_opt: ?std.Thread = null;
-    if (!dry_run) {
-        if (om_config.api_creds) |creds| {
-            const balance_address = om_config.funder_address orelse om_config.signer_address;
-            const auth_validation = validateLivePolymarketAuth(
-                allocator,
-                creds,
-                om_config.signer_address,
-                balance_address,
-                om_config.signature_type,
-            );
-            if (!auth_validation.ok) {
-                om.setPaused(true);
-                if (auth_validation.suggested_signature_type) |suggested| {
-                    log.err("engine", "live trading blocked: funded wallet authentication failed; set POLYMARKET_SIGNATURE_TYPE={d} ({s}) and restart", .{
-                        suggested,
-                        poly_auth.signatureTypeName(suggested),
-                    });
-                } else {
-                    log.err("engine", "live trading blocked: signer/funder authentication failed for configured Polymarket wallet", .{});
-                }
-            }
-
-            // Initial synchronous fetch so the engine has a real balance
-            // before the strategy worker (and risk gate) start firing.
-            const bal0 = fetchUsdcBalanceWithFallback(
-                allocator,
-                creds,
-                om_config.signer_address,
-                balance_address,
-                om_config.signature_type,
-            );
-            if (bal0) |b| {
-                const snap = pt.getSnapshot();
-                database.insertBalanceSnapshot(b, snap.total_exposure_usd, snap.unrealized_pnl, snap.realized_pnl_today) catch |e| {
-                    log.warn("engine", "failed to seed initial balance snapshot: {s}", .{@errorName(e)});
-                };
-                pt.markBalanceDirty();
-                pt.syncFromDB();
-                log.info("engine", "initial USDC balance: ${d:.6}", .{b});
-            }
-
-            const ctx = try allocator.create(BalanceTickerCtx);
-            ctx.* = .{
-                .database = &database,
-                .pt = &pt,
-                .creds = creds,
-                .signer_address = om_config.signer_address,
-                .balance_address = balance_address,
-                .signature_type = om_config.signature_type,
-                .allocator = allocator,
-                .should_stop = std.atomic.Value(bool).init(false),
-            };
-            balance_ticker_ctx_opt = ctx;
-            balance_thread_opt = try std.Thread.spawn(.{}, balanceTicker, .{ctx});
-            log.info("engine", "balance refresh ticker started (60s interval)", .{});
-        } else {
-            om.setPaused(true);
-            log.warn("engine", "no API credentials — USDC balance ticker disabled (orders will be rejected by risk gate)", .{});
-            log.err("engine", "live trading blocked: API credential bootstrap failed; fix Polymarket wallet auth and restart", .{});
-        }
-    }
-    defer {
-        if (balance_ticker_ctx_opt) |ctx| {
-            ctx.should_stop.store(true, .seq_cst);
-            if (balance_thread_opt) |t| t.join();
-            allocator.destroy(ctx);
-        }
-    }
+    // USDC balance refresh ticker removed in Phase 1 (Polymarket-specific).
+    // HL equity/portfolio polling lands in Phase 2 via hl_portfolio_tracker.
 
     // Spawn strategy worker thread
     var strategy_ctx = StrategyWorkerCtx{
@@ -1200,235 +1024,9 @@ fn persistBalanceSnapshot(ctx: *StrategyWorkerCtx) void {
     ctx.pt.markBalanceDirty();
 }
 
-/// Context for the live USDC balance refresh ticker. Spawned only when
-/// API credentials are bootstrapped and DRY_RUN is false.
-const BalanceTickerCtx = struct {
-    database: *db.DB,
-    pt: *portfolio.PortfolioTracker,
-    creds: poly_auth.ApiCredentials,
-    signer_address: [20]u8,
-    balance_address: [20]u8,
-    signature_type: u8,
-    allocator: std.mem.Allocator,
-    should_stop: std.atomic.Value(bool),
-};
-
-/// Periodically poll Polymarket's L2 /balance-allowance endpoint and write
-/// the result to balance_snapshots. Sleeps in 1s slices so shutdown is
-/// responsive. Logs a warning on each failed fetch but keeps the loop alive
-/// — transient network errors should not take the engine down.
-fn balanceTicker(ctx: *BalanceTickerCtx) void {
-    const interval_ns: u64 = 60 * std.time.ns_per_s;
-    log.info("balance_ticker", "balance refresh loop started (60s interval)", .{});
-
-    while (!ctx.should_stop.load(.seq_cst)) {
-        var slept: u64 = 0;
-        while (slept < interval_ns and !ctx.should_stop.load(.seq_cst)) {
-            std.Thread.sleep(std.time.ns_per_s);
-            slept += std.time.ns_per_s;
-        }
-        if (ctx.should_stop.load(.seq_cst)) break;
-
-        const bal = fetchUsdcBalanceWithFallback(
-            ctx.allocator,
-            ctx.creds,
-            ctx.signer_address,
-            ctx.balance_address,
-            ctx.signature_type,
-        ) orelse continue;
-
-        // Preserve current exposure / pnl values from the in-memory snapshot
-        // so dashboard rows stay coherent.
-        const snap = ctx.pt.getSnapshot();
-        ctx.database.insertBalanceSnapshot(
-            bal,
-            snap.total_exposure_usd,
-            snap.unrealized_pnl,
-            snap.realized_pnl_today,
-        ) catch |e| {
-            log.warn("balance_ticker", "failed to insert balance snapshot: {s}", .{@errorName(e)});
-            continue;
-        };
-
-        ctx.pt.markBalanceDirty();
-        ctx.pt.syncFromDB();
-        log.info("balance_ticker", "USDC balance: ${d:.6}", .{bal});
-    }
-
-    log.info("balance_ticker", "balance refresh loop stopped", .{});
-}
-
-fn fetchUsdcBalanceWithFallback(
-    allocator: std.mem.Allocator,
-    creds: poly_auth.ApiCredentials,
-    signer_address: [20]u8,
-    balance_address: [20]u8,
-    signature_type: u8,
-) ?f64 {
-    return poly_auth.fetchUsdcBalance(
-        allocator,
-        creds,
-        signer_address,
-        signature_type,
-    ) catch |err| blk: {
-        const balance_hex = poly_auth.formatAddressEip55(balance_address);
-        log.warn("engine", "collateral balance fetch failed for configured funder={s} signature_type={s}: {s}", .{
-            &balance_hex,
-            poly_auth.signatureTypeName(signature_type),
-            @errorName(err),
-        });
-        break :blk null;
-    };
-}
-
-const AuthValidationResult = struct {
-    ok: bool,
-    suggested_signature_type: ?u8 = null,
-};
-
-fn emitPolymarketStartupDiagnostic(
-    allocator: std.mem.Allocator,
-    om_config: order_mgr.OrderManagerConfig,
-    api_bootstrap_err: ?[]const u8,
-) void {
-    const signer_hex = poly_auth.formatAddressEip55(om_config.signer_address);
-    const balance_address = om_config.funder_address orelse om_config.signer_address;
-    const balance_hex = poly_auth.formatAddressEip55(balance_address);
-    const signer_equals_funder = std.mem.eql(u8, om_config.signer_address[0..], balance_address[0..]);
-    const sig_name = poly_auth.signatureTypeName(om_config.signature_type);
-
-    log.info("poly_diag", "startup diagnostic: signer={s} funder={s} same_address={} signature_type={d}({s}) creds={s}", .{
-        &signer_hex,
-        &balance_hex,
-        signer_equals_funder,
-        om_config.signature_type,
-        sig_name,
-        if (om_config.api_creds != null) "present" else "missing",
-    });
-
-    if (api_bootstrap_err) |err_name| {
-        log.err("poly_diag", "api credential bootstrap failed: {s}", .{err_name});
-    }
-
-    if (om_config.api_creds) |creds| {
-        const configured_probe = poly_auth.fetchUsdcBalance(
-            allocator,
-            creds,
-            om_config.signer_address,
-            om_config.signature_type,
-        );
-        if (configured_probe) |bal| {
-            log.info("poly_diag", "configured funder probe OK: signature_type={s} balance=${d:.6}", .{
-                sig_name,
-                bal,
-            });
-        } else |e| {
-            log.warn("poly_diag", "configured funder probe failed: signature_type={s} err={s}", .{
-                sig_name,
-                @errorName(e),
-            });
-        }
-
-        const probe_types = [_]u8{ 0, 1, 2 };
-        for (probe_types) |candidate_type| {
-            if (candidate_type == om_config.signature_type) continue;
-            if (poly_auth.fetchUsdcBalance(
-                allocator,
-                creds,
-                om_config.signer_address,
-                candidate_type,
-            )) |bal| {
-                log.warn("poly_diag", "alternate funder probe OK: signature_type={d}({s}) balance=${d:.6}", .{
-                    candidate_type,
-                    poly_auth.signatureTypeName(candidate_type),
-                    bal,
-                });
-            } else |e| {
-                log.debug("poly_diag", "alternate funder probe failed: signature_type={d}({s}) err={s}", .{
-                    candidate_type,
-                    poly_auth.signatureTypeName(candidate_type),
-                    @errorName(e),
-                });
-            }
-        }
-
-        if (!signer_equals_funder) {
-            if (poly_auth.fetchUsdcBalance(
-                allocator,
-                creds,
-                om_config.signer_address,
-                om_config.signature_type,
-            )) |bal| {
-                log.info("poly_diag", "signer-address probe OK: signature_type={s} balance=${d:.6}", .{
-                    sig_name,
-                    bal,
-                });
-            } else |e| {
-                log.warn("poly_diag", "signer-address probe failed: signature_type={s} err={s}", .{
-                    sig_name,
-                    @errorName(e),
-                });
-            }
-        }
-    } else {
-        log.warn("poly_diag", "skipping balance probes because API credentials are unavailable", .{});
-    }
-}
-
-fn validateLivePolymarketAuth(
-    allocator: std.mem.Allocator,
-    creds: poly_auth.ApiCredentials,
-    signer_address: [20]u8,
-    balance_address: [20]u8,
-    configured_signature_type: u8,
-) AuthValidationResult {
-    if (poly_auth.fetchUsdcBalance(
-        allocator,
-        creds,
-        signer_address,
-        configured_signature_type,
-    )) |_| {
-        return .{ .ok = true };
-    } else |configured_err| {
-        log.warn("engine", "configured funder auth probe failed: signature_type={s} err={s}", .{
-            poly_auth.signatureTypeName(configured_signature_type),
-            @errorName(configured_err),
-        });
-    }
-
-    const supported_types = [_]u8{ 0, 1, 2 };
-    for (supported_types) |candidate_type| {
-        if (candidate_type == configured_signature_type) continue;
-        if (poly_auth.fetchUsdcBalance(
-            allocator,
-            creds,
-            signer_address,
-            candidate_type,
-        )) |bal| {
-            log.warn("engine", "alternate funder auth probe succeeded: signature_type={s} balance=${d:.6}", .{
-                poly_auth.signatureTypeName(candidate_type),
-                bal,
-            });
-            return .{
-                .ok = false,
-                .suggested_signature_type = candidate_type,
-            };
-        } else |_| {}
-    }
-
-    if (!std.mem.eql(u8, signer_address[0..], balance_address[0..])) {
-        if (poly_auth.fetchUsdcBalance(
-            allocator,
-            creds,
-            signer_address,
-            configured_signature_type,
-        )) |bal| {
-            log.warn("engine", "signer-address auth probe succeeded while funded wallet probe failed: signer_balance=${d:.6}", .{bal});
-        } else |_| {}
-    }
-
-    return .{ .ok = false };
-}
+// Polymarket-specific balance ticker, USDC balance fallback fetch, and
+// auth validation/diagnostic helpers were removed in Phase 1. HL equivalents
+// will be reintroduced in Phase 2 (hl_portfolio_tracker / hl_auth).
 
 fn queryLastMid(database: *db.DB, market_id: []const u8) ?f64 {
     const sql = "SELECT mid_price FROM orderbooks WHERE market=? ORDER BY created_at DESC LIMIT 1;" ++ &[_:0]u8{};
