@@ -10,6 +10,7 @@ const strategy = @import("strategy_engine.zig");
 const ws = @import("websocket.zig");
 const fill_poller = @import("fill_poller.zig");
 const crash_trace = @import("crash_trace.zig");
+const hl_auth = @import("hl_auth.zig");
 
 fn roundUpToCents(value: f64) f64 {
     const step = 100.0;
@@ -19,6 +20,77 @@ fn roundUpToCents(value: f64) f64 {
 test "roundUpToCents rounds fractional cents upward" {
     try std.testing.expectApproxEqAbs(@as(f64, 6.67), roundUpToCents(6.661), 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 6.67), roundUpToCents(6.67), 1e-9);
+}
+
+const HlEnvError = error{
+    HlMissingPrivateKey,
+    HlInvalidPrivateKey,
+    HlMissingNetwork,
+    HlInvalidNetwork,
+    HlInvalidVerifier,
+    HlInvalidChainIdOverride,
+    HlAuthInternal,
+};
+
+/// Load Hyperliquid signing config from the environment. In dry-run mode
+/// missing fields fall back to safe defaults (network=testnet, zero key);
+/// in live mode the private key + network are mandatory.
+fn loadHlConfig(dry_run: bool) HlEnvError!order_mgr.HlConfig {
+    var cfg = order_mgr.HlConfig{};
+
+    // Network: testnet|mainnet
+    if (std.posix.getenv("HL_NETWORK")) |raw| {
+        cfg.network = hl_auth.parseNetwork(raw) catch return error.HlInvalidNetwork;
+    } else if (!dry_run) {
+        return error.HlMissingNetwork;
+    }
+
+    // Optional chain id override
+    if (std.posix.getenv("HL_CHAIN_ID")) |raw| {
+        cfg.chain_id = std.fmt.parseInt(u64, raw, 10) catch
+            return error.HlInvalidChainIdOverride;
+    } else {
+        cfg.chain_id = hl_auth.resolveChainId(cfg.network, null);
+    }
+
+    // Domain name + version (configurable, with safe defaults)
+    if (std.posix.getenv("HL_EIP712_NAME")) |raw| cfg.domain_name = raw;
+    if (std.posix.getenv("HL_EIP712_VERSION")) |raw| cfg.domain_version = raw;
+
+    // Verifying contract per network
+    const verifier_env: ?[]const u8 = switch (cfg.network) {
+        .mainnet => std.posix.getenv("HL_EIP712_VERIFIER_MAINNET"),
+        .testnet => std.posix.getenv("HL_EIP712_VERIFIER_TESTNET"),
+    };
+    if (verifier_env) |raw| {
+        cfg.verifying_contract = hl_auth.parseAddressHex(raw) catch
+            return error.HlInvalidVerifier;
+    }
+
+    // API base URL derived from network.
+    cfg.api_base = switch (cfg.network) {
+        .mainnet => order_mgr.HL_API_BASE_MAINNET,
+        .testnet => order_mgr.HL_API_BASE_TESTNET,
+    };
+
+    // Private key — never logged.
+    if (std.posix.getenv("HL_API_PRIVATE_KEY")) |raw| {
+        cfg.private_key = hl_auth.parsePrivateKeyHex(raw) catch
+            return error.HlInvalidPrivateKey;
+        cfg.signer_address = hl_auth.derivePublicAddress(cfg.private_key) catch
+            return error.HlAuthInternal;
+        cfg.enabled = true;
+    } else if (!dry_run) {
+        return error.HlMissingPrivateKey;
+    }
+
+    return cfg;
+}
+
+test "loadHlConfig: chain id resolution from network" {
+    try std.testing.expectEqual(@as(u64, 998), hl_auth.resolveChainId(.testnet, null));
+    try std.testing.expectEqual(@as(u64, 999), hl_auth.resolveChainId(.mainnet, null));
+    try std.testing.expectEqual(@as(u64, 31337), hl_auth.resolveChainId(.testnet, 31337));
 }
 
 pub fn main() !void {
@@ -58,8 +130,31 @@ pub fn main() !void {
     // Initialize risk config
     const risk_config = risk.RiskConfig{};
 
-    // Order manager config (Polymarket auth removed in Phase 1; HL auth lands in Phase 2)
-    var om_config = order_mgr.OrderManagerConfig{};
+    // Phase 2: parse Hyperliquid config from env. dry_run can run with
+    // defaults; live mode requires a valid private key + network.
+    const dry_run_env = if (std.posix.getenv("DRY_RUN")) |v|
+        (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true"))
+    else
+        false;
+
+    const hl_config = loadHlConfig(dry_run_env) catch |e| {
+        log.err("engine", "Hyperliquid config invalid: {s}", .{@errorName(e)});
+        return e;
+    };
+
+    if (hl_config.enabled) {
+        const addr_hex = hl_auth.formatAddressEip55(hl_config.signer_address);
+        log.info("engine", "HL signer address: {s} (network={s} chainId={d})", .{
+            addr_hex,
+            @tagName(hl_config.network),
+            hl_config.chain_id,
+        });
+    } else {
+        log.warn("engine", "HL signing disabled (dry_run={any}); orders will not be submitted to /exchange", .{dry_run_env});
+    }
+
+    // Order manager config (Phase 2 wires HL signing into the submit path).
+    const om_config = order_mgr.OrderManagerConfig{ .hl = hl_config };
 
     // Initialize order manager
     var om = order_mgr.OrderManager.init(allocator, &database, risk_config, om_config);
@@ -205,7 +300,6 @@ pub fn main() !void {
     var strategy_ctx = StrategyWorkerCtx{
         .se = &se,
         .om = &om,
-        .pp = &pp,
         .pt = &pt,
         .database = &database,
         .should_stop = std.atomic.Value(bool).init(false),
@@ -236,7 +330,6 @@ pub fn main() !void {
 const StrategyWorkerCtx = struct {
     se: *strategy.StrategyEngine,
     om: *order_mgr.OrderManager,
-    pp: *prob_provider.ProbabilityProvider,
     pt: *portfolio.PortfolioTracker,
     database: *db.DB,
     should_stop: std.atomic.Value(bool),
@@ -276,10 +369,8 @@ fn strategyWorker(ctx: *StrategyWorkerCtx) void {
             continue;
         }
 
-        // Evaluate news repricing for cached estimates
-        if (ctx.se.isEnabled(.news_repricing)) {
-            evaluateNewsSignals(ctx);
-        }
+        // News repricing strategy was removed in Phase 1 (no probability
+        // provider on Hyperliquid). The arb strategy lands in Phase 6.
 
         // Evaluate liquidity provision using recent orderbook data
         if (ctx.se.isEnabled(.liquidity_provision)) {
@@ -306,45 +397,6 @@ fn strategyWorker(ctx: *StrategyWorkerCtx) void {
     }
 
     log.info("strategy_worker", "strategy evaluation loop stopped", .{});
-}
-
-fn evaluateNewsSignals(ctx: *StrategyWorkerCtx) void {
-    var snap: [prob_provider.MAX_ESTIMATES]prob_provider.ExternalEstimate = undefined;
-    const snap_count = ctx.pp.snapshot(&snap);
-
-    for (snap[0..snap_count]) |est| {
-        const market_id = est.market_id[0..est.market_id_len];
-        const yes_token_id = est.yes_token_id[0..est.yes_token_id_len];
-
-        if (yes_token_id.len == 0) continue;
-        if (market_id.len == 0) continue;
-
-        const book = queryLastBookByAsset(ctx.database, yes_token_id) orelse continue;
-        const implied_prob = priceToImpliedProb(book.mid);
-
-        if (ctx.se.evaluateNewsRepricing(
-            market_id,
-            est.probability,
-            implied_prob,
-            ctx.pt.usdc_balance,
-            book.best_bid,
-            book.best_ask,
-        )) |signal| {
-            dispatchSignal(ctx, signal);
-        }
-
-        // Check for collapsed edges — cancel orders where edge disappeared
-        const delta = @abs(est.probability - implied_prob);
-        const collapsed = ctx.se.findCollapsedEdgeOrders(market_id, delta);
-        for (0..collapsed.count) |ci| {
-            const oid = collapsed.order_ids[ci][0..collapsed.order_id_lens[ci]];
-            if (ctx.om.cancelOrder(oid)) {
-                ctx.se.untrackOrder(oid);
-                ctx.se.incrementCancels(.news_repricing);
-                log.info("strategy_worker", "cancelled collapsed-edge order: {s}", .{oid});
-            }
-        }
-    }
 }
 
 fn evaluateLpSignals(ctx: *StrategyWorkerCtx) void {

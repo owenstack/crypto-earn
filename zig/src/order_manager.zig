@@ -1,18 +1,23 @@
-//! Order manager — lifecycle management, signed CLOB submission, staleness handling.
-//! Retry policy (429 backoff) is kept here, not in http_client.zig.
+//! Order manager — lifecycle management, signed Hyperliquid `/exchange`
+//! submission, and staleness handling. Phase 2 of the HL migration replaces
+//! the Polymarket CTF/CLOB submission path with the HL msgpack + EIP-712
+//! signed action envelope. The retry policy (7-step exponential backoff)
+//! and risk-gate integration are preserved.
 const std = @import("std");
 const log = @import("logger.zig");
 const db_mod = @import("db.zig");
 const http = @import("http_client.zig");
 const crypto = @import("crypto.zig");
-const poly_auth = @import("polymarket_auth.zig");
+const hl_auth = @import("hl_auth.zig");
+const msgpack = @import("msgpack.zig");
 const risk = @import("risk_gate.zig");
 const ipc = @import("ipc.zig");
 const ipc_types = @import("ipc_types.zig");
 const crash_trace = @import("crash_trace.zig");
 const c = db_mod.c;
 
-const CLOB_API_BASE = "https://clob.polymarket.com";
+pub const HL_API_BASE_MAINNET = "https://api.hyperliquid.xyz";
+pub const HL_API_BASE_TESTNET = "https://api.hyperliquid-testnet.xyz";
 
 fn applyCancelledUpdate(stmt: *c.sqlite3_stmt, order_id: []const u8) bool {
     if (order_id.len == 0) return false;
@@ -80,15 +85,25 @@ pub const OrderResult = union(enum) {
     },
 };
 
+/// Hyperliquid signing/connection config. Empty by default so existing tests
+/// (which don't exercise the live path) keep working.
+pub const HlConfig = struct {
+    enabled: bool = false,
+    network: hl_auth.Network = .testnet,
+    private_key: [32]u8 = [_]u8{0} ** 32,
+    signer_address: [20]u8 = [_]u8{0} ** 20,
+    chain_id: u64 = hl_auth.CHAIN_ID_TESTNET,
+    domain_name: []const u8 = "Exchange",
+    domain_version: []const u8 = "1",
+    verifying_contract: [20]u8 = [_]u8{0} ** 20,
+    api_base: []const u8 = HL_API_BASE_TESTNET,
+};
+
 pub const OrderManagerConfig = struct {
     max_order_age_hours: u32 = 24,
     stale_scan_interval_min: u32 = 5,
     max_retry_attempts: u32 = 7,
-    private_key: [32]u8 = [_]u8{0} ** 32,
-    signer_address: [20]u8 = [_]u8{0} ** 20,
-    funder_address: ?[20]u8 = null,
-    signature_type: u8 = 0, // 0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE
-    api_creds: ?poly_auth.ApiCredentials = null,
+    hl: HlConfig = .{},
 };
 
 pub const OrderManager = struct {
@@ -99,9 +114,8 @@ pub const OrderManager = struct {
     halted: std.atomic.Value(bool),
     paused: std.atomic.Value(bool),
     should_stop: std.atomic.Value(bool),
-    lastFeeRateByToken: std.StringHashMap(u256),
-    defaultFeeRateBps: u256,
     reconciliation_complete: std.atomic.Value(bool),
+    domain_separator: [32]u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -109,6 +123,12 @@ pub const OrderManager = struct {
         risk_config: risk.RiskConfig,
         config: OrderManagerConfig,
     ) OrderManager {
+        const ds = hl_auth.buildDomainSeparator(
+            config.hl.domain_name,
+            config.hl.domain_version,
+            config.hl.chain_id,
+            config.hl.verifying_contract,
+        );
         return .{
             .allocator = allocator,
             .database = database,
@@ -117,9 +137,8 @@ pub const OrderManager = struct {
             .halted = std.atomic.Value(bool).init(false),
             .paused = std.atomic.Value(bool).init(false),
             .should_stop = std.atomic.Value(bool).init(false),
-            .lastFeeRateByToken = std.StringHashMap(u256).init(allocator),
-            .defaultFeeRateBps = 1000, // Set a sensible default, can be overridden
             .reconciliation_complete = std.atomic.Value(bool).init(false),
+            .domain_separator = ds,
         };
     }
 
@@ -210,11 +229,11 @@ pub const OrderManager = struct {
             client_order_id[0..@min(client_order_id.len, 32)],
         });
 
-        // Submit to CLOB with 429 retry
-        const submit_result = self.submitToCLOB(market_id, side, size, price, order_type);
+        // Submit to HL with 429 retry
+        const submit_result = self.submitToHL(market_id, side, size, price, order_type);
         if (!submit_result) {
             self.database.updateOrderStatus(client_order_id, "rejected") catch {};
-            return .{ .failed = .{ .reason = "clob_submission_failed" } };
+            return .{ .failed = .{ .reason = "hl_submission_failed" } };
         }
 
         // Update status to placed
@@ -280,8 +299,8 @@ pub const OrderManager = struct {
             }
         }
 
-        if (should_cancel_remote and !self.cancelOnCLOB(order_id)) {
-            log.err("order_mgr", "failed to cancel order on CLOB: {s}", .{order_id});
+        if (should_cancel_remote and !self.cancelOnHL(order_id)) {
+            log.err("order_mgr", "failed to cancel order on HL: {s}", .{order_id});
             return false;
         }
 
@@ -292,7 +311,6 @@ pub const OrderManager = struct {
         };
 
         log.info("order_mgr", "order cancelled: {s}", .{order_id});
-        // Publish order cancelled event
         var cancel_evt_buf: [256]u8 = undefined;
         const cancel_evt_payload = std.fmt.bufPrint(
             &cancel_evt_buf,
@@ -368,8 +386,8 @@ pub const OrderManager = struct {
         defer _ = c.sqlite3_finalize(upd_stmt);
 
         for (candidates.items) |candidate| {
-            if (candidate.should_cancel_remote and !self.cancelOnCLOB(candidate.id)) {
-                log.err("order_mgr", "cancelAll failed CLOB cancel for order {s}", .{candidate.id});
+            if (candidate.should_cancel_remote and !self.cancelOnHL(candidate.id)) {
+                log.err("order_mgr", "cancelAll failed HL cancel for order {s}", .{candidate.id});
                 continue;
             }
 
@@ -378,7 +396,7 @@ pub const OrderManager = struct {
                 continue;
             }
 
-            log.info("order_mgr", "cancelAll: cancelled order {s} on CLOB", .{candidate.id});
+            log.info("order_mgr", "cancelAll: cancelled order {s} on HL", .{candidate.id});
             cancelled_count += 1;
         }
 
@@ -423,11 +441,9 @@ pub const OrderManager = struct {
             const status_str = if (status_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
             const is_pending = std.mem.eql(u8, status_str, "pending");
 
-            // Pending orders were never submitted to CLOB — just mark cancelled locally.
-            // Placed orders need CLOB cancellation first.
             if (!is_pending) {
-                if (!self.cancelOnCLOB(order_id)) {
-                    log.err("order_mgr", "failed stale-order cancel on CLOB: {s}", .{order_id});
+                if (!self.cancelOnHL(order_id)) {
+                    log.err("order_mgr", "failed stale-order cancel on HL: {s}", .{order_id});
                     continue;
                 }
             }
@@ -448,7 +464,6 @@ pub const OrderManager = struct {
         self.halted.store(true, .seq_cst);
         const cancelled = self.cancelAll();
         log.info("order_mgr", "HALT: engine halted, all orders cancelled", .{});
-        // Publish engine halted event
         var halt_evt_buf: [128]u8 = undefined;
         const halt_evt_payload = std.fmt.bufPrint(
             &halt_evt_buf,
@@ -464,11 +479,9 @@ pub const OrderManager = struct {
         self.halted.store(false, .seq_cst);
         self.paused.store(false, .seq_cst);
         log.info("order_mgr", "RESUME: engine resumed", .{});
-        // Publish engine resumed event
         ipc.publishEvent(ipc_types.T.event_engine_resumed, "{\"status\":\"resumed\"}");
     }
 
-    /// Pause strategy evaluation without cancelling orders.
     pub fn setPaused(self: *OrderManager, value: bool) void {
         self.paused.store(value, .seq_cst);
         if (value) {
@@ -478,20 +491,119 @@ pub const OrderManager = struct {
         }
     }
 
-    /// Check if the engine is paused.
     pub fn isPaused(self: *OrderManager) bool {
         return self.paused.load(.seq_cst);
     }
 
-    /// Check if the engine is halted.
     pub fn isHalted(self: *OrderManager) bool {
         return self.halted.load(.seq_cst);
     }
 
-    /// Submit a signed CTF Exchange order to the CLOB REST API with L2 HMAC auth.
-    /// Backoff schedule: 1s, 2s, 4s, 8s, 16s, 32s, 60s (capped).
+    /// Build the action JSON for an HL order (Phase 2 minimal shape).
+    /// Returns an arena-allocated `std.json.Value`. Caller must keep the
+    /// arena alive until the value is fully consumed.
+    fn buildOrderAction(
+        arena: std.mem.Allocator,
+        market_id: []const u8,
+        side: []const u8,
+        size: []const u8,
+        price: []const u8,
+        order_type: []const u8,
+    ) !std.json.Value {
+        // Phase 2 stub: asset index defaults to 0; resolution will land in
+        // Phase 3 via hl_market_meta. Strings are encoded as msgpack strings
+        // for size/price so the operator can pass HL's expected decimal text.
+        _ = market_id;
+        var orders = std.json.Array.init(arena);
+        var ord = std.json.ObjectMap.init(arena);
+        try ord.put("a", .{ .integer = 0 }); // asset index (stub)
+        try ord.put("b", .{ .bool = std.mem.eql(u8, side, "buy") });
+        try ord.put("p", .{ .string = price });
+        try ord.put("s", .{ .string = size });
+        try ord.put("r", .{ .bool = false }); // reduce_only
+        var t = std.json.ObjectMap.init(arena);
+        var lim = std.json.ObjectMap.init(arena);
+        const tif: []const u8 = if (std.mem.eql(u8, order_type, "limit") or std.mem.eql(u8, order_type, "GTC"))
+            "Gtc"
+        else
+            "Ioc";
+        try lim.put("tif", .{ .string = tif });
+        try t.put("limit", .{ .object = lim });
+        try ord.put("t", .{ .object = t });
+        try orders.append(.{ .object = ord });
+
+        var action = std.json.ObjectMap.init(arena);
+        try action.put("type", .{ .string = "order" });
+        try action.put("orders", .{ .array = orders });
+        try action.put("grouping", .{ .string = "na" });
+        return .{ .object = action };
+    }
+
+    /// Build the cancel action JSON for a single order id.
+    fn buildCancelAction(
+        arena: std.mem.Allocator,
+        order_id: []const u8,
+    ) !std.json.Value {
+        var cancels = std.json.Array.init(arena);
+        var item = std.json.ObjectMap.init(arena);
+        try item.put("a", .{ .integer = 0 });
+        try item.put("o", .{ .string = order_id });
+        try cancels.append(.{ .object = item });
+
+        var action = std.json.ObjectMap.init(arena);
+        try action.put("type", .{ .string = "cancel" });
+        try action.put("cancels", .{ .array = cancels });
+        return .{ .object = action };
+    }
+
+    /// Build the signed-envelope JSON {action, nonce, signature}. Returned
+    /// slice is owned by the caller (allocator-allocated).
+    pub fn buildHlEnvelope(
+        self: *OrderManager,
+        action: std.json.Value,
+        nonce: u64,
+    ) ![]u8 {
+        const action_msgpack = try msgpack.encodeActionForSigning(self.allocator, action);
+        defer self.allocator.free(action_msgpack);
+
+        const source = hl_auth.resolveSource(self.config.hl.network);
+        const digest = hl_auth.buildActionDigest(action_msgpack, nonce, null, source, self.domain_separator);
+
+        var key_copy: [32]u8 = self.config.hl.private_key;
+        defer std.crypto.secureZero(u8, key_copy[0..]);
+
+        const signed = try hl_auth.signDigest(digest, key_copy);
+
+        // Hand-build the JSON envelope — std.json.Value can't carry the
+        // r/s hex prefix as integers.
+        const action_json = try std.json.Stringify.valueAlloc(self.allocator, action, .{});
+        defer self.allocator.free(action_json);
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+
+        try buf.appendSlice(self.allocator, "{\"action\":");
+        try buf.appendSlice(self.allocator, action_json);
+        try buf.appendSlice(self.allocator, ",\"nonce\":");
+        var nonce_buf: [24]u8 = undefined;
+        const nonce_str = try std.fmt.bufPrint(&nonce_buf, "{d}", .{nonce});
+        try buf.appendSlice(self.allocator, nonce_str);
+        try buf.appendSlice(self.allocator, ",\"signature\":{\"r\":\"");
+        try buf.appendSlice(self.allocator, signed.r_hex[0..]);
+        try buf.appendSlice(self.allocator, "\",\"s\":\"");
+        try buf.appendSlice(self.allocator, signed.s_hex[0..]);
+        try buf.appendSlice(self.allocator, "\",\"v\":");
+        var v_buf: [4]u8 = undefined;
+        const v_str = try std.fmt.bufPrint(&v_buf, "{d}", .{signed.v});
+        try buf.appendSlice(self.allocator, v_str);
+        try buf.appendSlice(self.allocator, "}}");
+
+        return buf.toOwnedSlice(self.allocator);
+    }
+
+    /// Submit a signed HL order to `${api_base}/exchange` with retries.
     /// Returns true on success, false on failure after exhausting retries.
-    fn submitToCLOB(
+    fn submitToHL(
         self: *OrderManager,
         market_id: []const u8,
         side: []const u8,
@@ -499,231 +611,76 @@ pub const OrderManager = struct {
         price: []const u8,
         order_type: []const u8,
     ) bool {
-        crash_trace.breadcrumb("order_mgr", "submit enter market={s} side={s} size={s} price={s}", .{
+        crash_trace.breadcrumb("order_mgr", "hl submit enter market={s} side={s} size={s} price={s}", .{
             market_id[0..@min(market_id.len, 24)],
             side,
             size,
             price,
         });
-        const creds = self.config.api_creds orelse {
-            log.err("order_mgr", "no API credentials — cannot submit order", .{});
+
+        if (!self.config.hl.enabled) {
+            log.warn("order_mgr", "HL submission skipped: hl.enabled=false (Phase 2 stub)", .{});
+            return false;
+        }
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
+        const action = buildOrderAction(arena.allocator(), market_id, side, size, price, order_type) catch |e| {
+            log.err("order_mgr", "failed to build HL order action: {s}", .{@errorName(e)});
             return false;
         };
 
-        // Resolve token_id from market/condition_id
-        var token_id_buf: [128]u8 = undefined;
-        const token_id = self.resolveTokenId(market_id, side, &token_id_buf) orelse {
-            log.err("order_mgr", "failed to resolve token_id for market={s} side={s}", .{ market_id, side });
+        const nonce: u64 = @intCast(@max(std.time.milliTimestamp(), 1));
+        const envelope = self.buildHlEnvelope(action, nonce) catch |e| {
+            log.err("order_mgr", "failed to build HL signed envelope: {s}", .{@errorName(e)});
             return false;
         };
-        crash_trace.breadcrumb("order_mgr", "token resolved market={s} token={s}", .{
-            market_id[0..@min(market_id.len, 24)],
-            token_id[0..@min(token_id.len, 24)],
+        defer self.allocator.free(envelope);
+
+        log.debug("order_mgr", "HL payload: action=order nonce={d} market={s} side={s} size={s} price={s} order_type={s} signature=redacted", .{
+            nonce,
+            market_id,
+            side,
+            size,
+            price,
+            order_type,
         });
 
-        // Parse price/size as f64
-        const price_f = std.fmt.parseFloat(f64, price) catch {
-            log.err("order_mgr", "invalid price: {s}", .{price});
+        var url_buf: [256]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, "{s}/exchange", .{self.config.hl.api_base}) catch {
+            log.err("order_mgr", "failed to format HL url", .{});
             return false;
         };
-        const size_f = std.fmt.parseFloat(f64, size) catch {
-            log.err("order_mgr", "invalid size: {s}", .{size});
-            return false;
-        };
-
-        const side_u8: u8 = if (std.mem.eql(u8, side, "buy")) 0 else 1;
-        const amounts = poly_auth.computeOrderAmounts(side_u8, price_f, size_f) catch {
-            log.err("order_mgr", "invalid order amounts: side={d} price={d} size={d}", .{ side_u8, price_f, size_f });
-            return false;
-        };
-
-        // Parse token_id string to u256
-        const token_id_u256: u256 = std.fmt.parseInt(u256, token_id, 10) catch {
-            log.err("order_mgr", "invalid token_id: {s}", .{token_id});
-            return false;
-        };
-
-        const maker = self.config.funder_address orelse self.config.signer_address;
-        const order_signer = if (self.config.signature_type == 3)
-            maker
-        else
-            self.config.signer_address;
-
-        // Build CTF Order struct
-        // Match the official client: salt is a random integer bounded by Date.now().
-        const ts_ms_i64 = std.time.milliTimestamp();
-        const ts_ms: u64 = @intCast(@max(ts_ms_i64, 1));
-        var rand_bytes: [8]u8 = undefined;
-        std.crypto.random.bytes(&rand_bytes);
-        const rand_val = std.mem.readInt(u64, &rand_bytes, .big);
-        const salt: u256 = @as(u256, rand_val % ts_ms + 1);
-
-        const order = poly_auth.CtfOrder{
-            .salt = salt,
-            .maker = maker,
-            .signer = order_signer,
-            .taker = [_]u8{0} ** 20,
-            .token_id = token_id_u256,
-            .maker_amount = amounts.maker_amount,
-            .taker_amount = amounts.taker_amount,
-            .expiration = 0,
-            .nonce = 0,
-            .fee_rate_bps = 0,
-            .side = side_u8,
-            .signature_type = self.config.signature_type,
-            .timestamp = ts_ms,
-            .metadata = [_]u8{0} ** 32,
-            .builder = [_]u8{0} ** 32,
-        };
-
-        // EIP-712 sign the order (use neg-risk exchange for neg-risk markets)
-        const is_neg_risk = self.isNegRiskMarket(market_id);
-        const exchange = if (is_neg_risk) poly_auth.NEG_RISK_CTF_EXCHANGE else poly_auth.CTF_EXCHANGE;
-        const order_digest = poly_auth.buildOrderDigest(order, poly_auth.CHAIN_ID, exchange);
-        var key_copy: [32]u8 = self.config.private_key;
-        defer std.crypto.secureZero(u8, key_copy[0..]);
-
-        const order_sig_hex_dyn = if (self.config.signature_type == 3)
-            poly_auth.buildPoly1271OrderSignature(order, poly_auth.CHAIN_ID, exchange, key_copy) catch |e| {
-                log.err("order_mgr", "failed to build POLY_1271 order signature: {s}", .{@errorName(e)});
-                return false;
-            }
-        else
-            null;
-        defer if (order_sig_hex_dyn) |sig_hex| std.heap.page_allocator.free(sig_hex);
-        crash_trace.breadcrumb("order_mgr", "order signed market={s}", .{
-            market_id[0..@min(market_id.len, 24)],
-        });
-        var order_sig_hex_buf: [132]u8 = undefined;
-        const order_sig_hex = if (order_sig_hex_dyn) |sig_hex|
-            sig_hex
-        else blk: {
-            const order_sig = crypto.signEip712(order_digest, key_copy) catch |e| {
-                log.err("order_mgr", "failed to sign order: {s}", .{@errorName(e)});
-                return false;
-            };
-            order_sig_hex_buf = poly_auth.formatSignature(order_sig);
-            break :blk order_sig_hex_buf[0..];
-        };
-
-        // L2 authenticated requests always identify the signer EOA associated
-        // with the API key. The funded Safe/proxy is inferred server-side from
-        // signatureType and is not sent in POLY_ADDRESS.
-        const auth_address = self.config.signer_address;
-        const addr_hex = poly_auth.formatAddressEip55(auth_address);
-
-        // Format maker address
-        const maker_hex = poly_auth.formatAddressEip55(maker);
-
-        // Format order signer address
-        const order_signer_hex = poly_auth.formatAddressEip55(order_signer);
-
-        // Format taker address
-        const taker_hex = poly_auth.formatAddressEip55(order.taker);
-
-        // Build the SendOrder JSON body
-        var salt_buf: [80]u8 = undefined;
-        const salt_str = std.fmt.bufPrint(&salt_buf, "{d}", .{order.salt}) catch "0";
-        var maker_amt_buf: [32]u8 = undefined;
-        const maker_amt_str = std.fmt.bufPrint(&maker_amt_buf, "{d}", .{amounts.maker_amount}) catch "0";
-        var taker_amt_buf: [32]u8 = undefined;
-        const taker_amt_str = std.fmt.bufPrint(&taker_amt_buf, "{d}", .{amounts.taker_amount}) catch "0";
-        var timestamp_buf: [32]u8 = undefined;
-        const timestamp_str = std.fmt.bufPrint(&timestamp_buf, "{d}", .{order.timestamp}) catch "0";
-        const zero_bytes32 = "0x0000000000000000000000000000000000000000000000000000000000000000";
-        var body_buf: [2048]u8 = undefined;
-        // Map internal order types to CLOB-compatible types
-        const clob_order_type: []const u8 = if (std.mem.eql(u8, order_type, "limit") or std.mem.eql(u8, order_type, "GTC"))
-            "GTC"
-        else if (std.mem.eql(u8, order_type, "market") or std.mem.eql(u8, order_type, "FOK"))
-            "FOK"
-        else
-            order_type;
-        // owner = API key (UUID), not the signer address
-        const api_key = creds.api_key[0..creds.api_key_len];
-        const json_body = std.fmt.bufPrint(&body_buf,
-            \\{{"deferExec":false,"postOnly":false,"order":{{"salt":{s},"maker":"{s}","signer":"{s}","taker":"{s}","tokenId":"{s}","makerAmount":"{s}","takerAmount":"{s}","side":"{s}","signatureType":{d},"timestamp":"{s}","expiration":"0","metadata":"{s}","builder":"{s}","signature":"{s}"}},"owner":"{s}","orderType":"{s}"}}
-        , .{
-            salt_str,
-            &maker_hex,
-            &order_signer_hex,
-            &taker_hex,
-            token_id,
-            maker_amt_str,
-            taker_amt_str,
-            if (side_u8 == 0) "BUY" else "SELL",
-            self.config.signature_type,
-            timestamp_str,
-            zero_bytes32,
-            zero_bytes32,
-            order_sig_hex,
-            api_key,
-            clob_order_type,
-        }) catch {
-            log.err("order_mgr", "failed to format order JSON", .{});
-            return false;
-        };
-        crash_trace.breadcrumb("order_mgr", "json ready market={s} order_type={s}", .{
-            market_id[0..@min(market_id.len, 24)],
-            clob_order_type,
-        });
-
-        log.debug("order_mgr", "CLOB payload: {s}", .{json_body});
 
         var client = http.HttpClient.init(self.allocator);
         defer client.deinit();
-
-        const url = CLOB_API_BASE ++ "/order";
 
         var delay_ms: u64 = 1000;
         const max_delay_ms: u64 = 60_000;
 
         var attempt: u32 = 0;
         while (attempt < self.config.max_retry_attempts) : (attempt += 1) {
-            crash_trace.breadcrumb("order_mgr", "submit attempt={d} market={s}", .{
-                attempt + 1,
-                market_id[0..@min(market_id.len, 24)],
-            });
-            // Build L2 HMAC headers per attempt
-            var ts_buf: [32]u8 = undefined;
-            const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch {
-                log.err("order_mgr", "failed to format timestamp", .{});
-                return false;
-            };
+            crash_trace.breadcrumb("order_mgr", "hl submit attempt={d}", .{attempt + 1});
 
-            const hmac_result = poly_auth.buildHmacSignature(
-                creds.secret[0..creds.secret_len],
-                ts,
-                "POST",
-                "/order",
-                json_body,
-            ) catch |e| {
-                log.err("order_mgr", "failed to compute HMAC: {s}", .{@errorName(e)});
-                return false;
-            };
-
-            var response = client.postJsonWithHeaders(url, json_body, &.{
-                .{ .name = "POLY_ADDRESS", .value = &addr_hex },
-                .{ .name = "POLY_SIGNATURE", .value = hmac_result.slice() },
-                .{ .name = "POLY_TIMESTAMP", .value = ts },
-                .{ .name = "POLY_API_KEY", .value = creds.api_key[0..creds.api_key_len] },
-                .{ .name = "POLY_PASSPHRASE", .value = creds.passphrase[0..creds.passphrase_len] },
+            var response = client.postJsonWithHeaders(url, envelope, &.{
+                .{ .name = "Content-Type", .value = "application/json" },
             }) catch |e| {
                 if (e == error.ClientError) {
-                    log.warn("order_mgr", "CLOB submission 429/client error, backoff {d}ms (attempt {d}/{d})", .{
+                    log.warn("order_mgr", "HL submission 429/client error, backoff {d}ms (attempt {d}/{d})", .{
                         delay_ms, attempt + 1, self.config.max_retry_attempts,
                     });
                     std.Thread.sleep(delay_ms * std.time.ns_per_ms);
                     delay_ms = @min(delay_ms * 2, max_delay_ms);
                     continue;
                 }
-                log.err("order_mgr", "CLOB submission failed: {s}", .{@errorName(e)});
+                log.err("order_mgr", "HL submission failed: {s}", .{@errorName(e)});
                 return false;
             };
             defer response.deinit();
 
             if (response.status == .too_many_requests) {
-                log.warn("order_mgr", "CLOB 429, backoff {d}ms (attempt {d}/{d})", .{
+                log.warn("order_mgr", "HL 429, backoff {d}ms (attempt {d}/{d})", .{
                     delay_ms, attempt + 1, self.config.max_retry_attempts,
                 });
                 std.Thread.sleep(delay_ms * std.time.ns_per_ms);
@@ -732,189 +689,77 @@ pub const OrderManager = struct {
             }
 
             if (response.status.class() == .success) {
-                crash_trace.breadcrumb("order_mgr", "submit success market={s}", .{
-                    market_id[0..@min(market_id.len, 24)],
-                });
-                log.info("order_mgr", "CLOB order submitted: market={s} side={s} price={s} size={s}", .{
+                crash_trace.breadcrumb("order_mgr", "hl submit success", .{});
+                log.info("order_mgr", "HL order submitted: market={s} side={s} price={s} size={s}", .{
                     market_id, side, price, size,
                 });
                 return true;
             }
 
-            crash_trace.breadcrumb("order_mgr", "submit rejected status={d} market={s}", .{
-                @intFromEnum(response.status),
-                market_id[0..@min(market_id.len, 24)],
-            });
-            log.err("order_mgr", "CLOB rejected: status={d} body={s}", .{
+            log.err("order_mgr", "HL rejected: status={d} body={s}", .{
                 @intFromEnum(response.status), response.body,
             });
             return false;
         }
 
-        log.err("order_mgr", "CLOB submission failed after {d} retries", .{self.config.max_retry_attempts});
+        log.err("order_mgr", "HL submission failed after {d} retries", .{self.config.max_retry_attempts});
         return false;
     }
 
-    /// Check if a market is neg-risk by querying the DB (by Gamma market id).
-    fn isNegRiskMarket(self: *OrderManager, market_id: []const u8) bool {
-        const sql = "SELECT neg_risk FROM markets WHERE id=? LIMIT 1;" ++ &[_:0]u8{};
-        var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return false;
-        defer _ = c.sqlite3_finalize(stmt);
-        if (c.sqlite3_bind_text(stmt, 1, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK) return false;
-        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return false;
-        return c.sqlite3_column_int(stmt, 0) != 0;
-    }
-
-    /// Resolve token_id from market_id (Gamma id) by looking up clob_token_ids in DB.
-    fn resolveTokenId(self: *OrderManager, market_id: []const u8, _: []const u8, buf: *[128]u8) ?[]const u8 {
-        const sql = "SELECT clob_token_ids FROM markets WHERE id=? LIMIT 1;" ++ &[_:0]u8{};
-        var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return null;
-        defer _ = c.sqlite3_finalize(stmt);
-        if (c.sqlite3_bind_text(stmt, 1, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK) return null;
-        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) {
-            log.warn("order_mgr", "resolveTokenId: no market found for id={s}", .{market_id});
-            return null;
+    /// Cancel an order on HL via the `/exchange` endpoint.
+    fn cancelOnHL(self: *OrderManager, order_id: []const u8) bool {
+        if (!self.config.hl.enabled) {
+            log.warn("order_mgr", "HL cancel skipped: hl.enabled=false (Phase 2 stub)", .{});
+            return false;
         }
 
-        const raw_ptr = c.sqlite3_column_text(stmt, 0);
-        const raw = if (raw_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else return null;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
 
-        // Always use token [0] (Yes token). The order side (BUY/SELL) determines direction
-        // on the same token, not which token to pick.
-        return extractJsonArrayElement(raw, 0, buf);
-    }
+        const action = buildCancelAction(arena.allocator(), order_id) catch |e| {
+            log.err("order_mgr", "failed to build HL cancel action: {s}", .{@errorName(e)});
+            return false;
+        };
 
-    /// Extract element at `idx` from a JSON string array like '["a","b"]'.
-    fn extractJsonArrayElement(raw: []const u8, idx: usize, buf: *[128]u8) ?[]const u8 {
-        if (raw.len < 2) return null;
-        var count: usize = 0;
-        var i: usize = 0;
-        while (i < raw.len) : (i += 1) {
-            if (raw[i] == '"') {
-                const start = i + 1;
-                i += 1;
-                while (i < raw.len and raw[i] != '"') : (i += 1) {}
-                if (count == idx) {
-                    const token = raw[start..i];
-                    if (token.len > buf.len) return null;
-                    @memcpy(buf[0..token.len], token);
-                    return buf[0..token.len];
-                }
-                count += 1;
-            }
-        }
-        return null;
-    }
+        const nonce: u64 = @intCast(@max(std.time.milliTimestamp(), 1));
+        const envelope = self.buildHlEnvelope(action, nonce) catch |e| {
+            log.err("order_mgr", "failed to build HL cancel envelope: {s}", .{@errorName(e)});
+            return false;
+        };
+        defer self.allocator.free(envelope);
 
-    /// Fetch the per-market fee rate from GET /fee-rate?token_id=TOKEN_ID.
-    /// Returns the base_fee value (e.g. 0 or 1000), or error on failure.
-    fn fetchFeeRate(self: *OrderManager, token_id: []const u8) !u256 {
         var url_buf: [256]u8 = undefined;
-        const url = try std.fmt.bufPrint(&url_buf, "{s}/fee-rate?token_id={s}", .{
-            CLOB_API_BASE,
-            token_id,
-        });
-
-        var client = http.HttpClient.init(self.allocator);
-        defer client.deinit();
-
-        var response = client.get(url) catch {
-            return error.FetchFailed;
-        };
-        defer response.deinit();
-
-        // Parse {"base_fee": 1000}
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{}) catch {
-            return error.ParseFailed;
-        };
-        defer parsed.deinit();
-
-        const obj = switch (parsed.value) {
-            .object => |o| o,
-            else => return error.InvalidResponse,
-        };
-
-        const base_fee = obj.get("base_fee") orelse return error.MissingBaseFee;
-        return switch (base_fee) {
-            .integer => |v| if (v >= 0) @intCast(v) else error.NegativeFee,
-            .float => |v| {
-                if (std.math.isNan(v) or std.math.isInf(v)) return 0;
-                if (v < 0) return 0;
-                if (v > std.math.floatMax(f64)) return 0;
-                return @intFromFloat(v);
-            },
-            else => error.InvalidBaseFeeType,
-        };
-    }
-
-    /// Cancel order on CLOB API before mutating local state.
-    fn cancelOnCLOB(self: *OrderManager, order_id: []const u8) bool {
-        var client = http.HttpClient.init(self.allocator);
-        defer client.deinit();
-
-        const creds = self.config.api_creds orelse {
-            log.err("order_mgr", "no API credentials — cannot cancel order", .{});
+        const url = std.fmt.bufPrint(&url_buf, "{s}/exchange", .{self.config.hl.api_base}) catch {
+            log.err("order_mgr", "failed to format HL cancel url", .{});
             return false;
         };
 
-        const url = CLOB_API_BASE ++ "/order";
-
-        var payload_buf: [256]u8 = undefined;
-        const payload = std.fmt.bufPrint(&payload_buf, "{{\"orderID\":\"{s}\"}}", .{order_id}) catch {
-            log.err("order_mgr", "failed to format cancel payload", .{});
-            return false;
-        };
-
-        const auth_address = self.config.signer_address;
-        const addr_hex = poly_auth.formatAddressEip55(auth_address);
+        var client = http.HttpClient.init(self.allocator);
+        defer client.deinit();
 
         var delay_ms: u64 = 1000;
         const max_delay_ms: u64 = 60_000;
 
         var attempt: u32 = 0;
         while (attempt < self.config.max_retry_attempts) : (attempt += 1) {
-            // Build L2 HMAC signature and timestamp per attempt
-            var ts_buf: [32]u8 = undefined;
-            const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch {
-                log.err("order_mgr", "failed to format cancel timestamp", .{});
-                return false;
-            };
-
-            const hmac_result = poly_auth.buildHmacSignature(
-                creds.secret[0..creds.secret_len],
-                ts,
-                "DELETE",
-                "/order",
-                payload,
-            ) catch |e| {
-                log.err("order_mgr", "failed to compute cancel HMAC: {s}", .{@errorName(e)});
-                return false;
-            };
-
-            var response = client.deleteJsonWithHeaders(url, payload, &.{
-                .{ .name = "POLY_ADDRESS", .value = &addr_hex },
-                .{ .name = "POLY_SIGNATURE", .value = hmac_result.slice() },
-                .{ .name = "POLY_TIMESTAMP", .value = ts },
-                .{ .name = "POLY_API_KEY", .value = creds.api_key[0..creds.api_key_len] },
-                .{ .name = "POLY_PASSPHRASE", .value = creds.passphrase[0..creds.passphrase_len] },
+            var response = client.postJsonWithHeaders(url, envelope, &.{
+                .{ .name = "Content-Type", .value = "application/json" },
             }) catch |e| {
                 if (e == error.ClientError) {
-                    log.warn("order_mgr", "CLOB cancel 429/client error, backoff {d}ms (attempt {d}/{d})", .{
+                    log.warn("order_mgr", "HL cancel 429/client error, backoff {d}ms (attempt {d}/{d})", .{
                         delay_ms, attempt + 1, self.config.max_retry_attempts,
                     });
                     std.Thread.sleep(delay_ms * std.time.ns_per_ms);
                     delay_ms = @min(delay_ms * 2, max_delay_ms);
                     continue;
                 }
-                log.err("order_mgr", "CLOB cancel request failed: {s}", .{@errorName(e)});
+                log.err("order_mgr", "HL cancel request failed: {s}", .{@errorName(e)});
                 return false;
             };
             defer response.deinit();
 
             if (response.status == .too_many_requests) {
-                log.warn("order_mgr", "CLOB cancel 429, backoff {d}ms (attempt {d}/{d})", .{
+                log.warn("order_mgr", "HL cancel 429, backoff {d}ms (attempt {d}/{d})", .{
                     delay_ms, attempt + 1, self.config.max_retry_attempts,
                 });
                 std.Thread.sleep(delay_ms * std.time.ns_per_ms);
@@ -922,37 +767,18 @@ pub const OrderManager = struct {
                 continue;
             }
 
-            if (response.status.class() != .success) {
-                log.err("order_mgr", "CLOB cancel unexpected status: {d}", .{@intFromEnum(response.status)});
-                return false;
+            if (response.status.class() == .success) {
+                log.info("order_mgr", "HL order cancelled: {s}", .{order_id});
+                return true;
             }
 
-            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{}) catch {
-                log.err("order_mgr", "failed to parse CLOB cancel response", .{});
-                return false;
-            };
-            defer parsed.deinit();
-
-            if (parsed.value == .object) {
-                if (parsed.value.object.get("success")) |v| {
-                    if (v == .bool and !v.bool) {
-                        log.err("order_mgr", "CLOB cancel rejected order={s}", .{order_id});
-                        return false;
-                    }
-                }
-                if (parsed.value.object.get("error")) |v| {
-                    if (v == .string and v.string.len > 0) {
-                        log.err("order_mgr", "CLOB cancel returned error for order={s}: {s}", .{ order_id, v.string });
-                        return false;
-                    }
-                }
-            }
-
-            log.info("order_mgr", "CLOB order cancelled: {s}", .{order_id});
-            return true;
+            log.err("order_mgr", "HL cancel rejected: status={d} body={s}", .{
+                @intFromEnum(response.status), response.body,
+            });
+            return false;
         }
 
-        log.err("order_mgr", "CLOB cancel failed after {d} retries", .{self.config.max_retry_attempts});
+        log.err("order_mgr", "HL cancel failed after {d} retries", .{self.config.max_retry_attempts});
         return false;
     }
 
@@ -964,16 +790,6 @@ pub const OrderManager = struct {
         return @min(base << shift, max);
     }
 };
-
-fn bytesToHex(bytes: []const u8, buf: []u8) []const u8 {
-    std.debug.assert(bytes.len <= buf.len / 2);
-    const charset = "0123456789abcdef";
-    for (bytes, 0..) |b, i| {
-        buf[i * 2] = charset[b >> 4];
-        buf[i * 2 + 1] = charset[b & 0x0f];
-    }
-    return buf[0 .. bytes.len * 2];
-}
 
 test "order_manager: applyCancelledUpdate handles quoted and escaped ids" {
     var database = try db_mod.DB.open(":memory:");

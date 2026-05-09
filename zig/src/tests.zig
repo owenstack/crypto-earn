@@ -23,6 +23,11 @@ const ipc = @import("ipc.zig");
 // Phase 2 PRD modules (fill detection)
 const fill_poller = @import("fill_poller.zig");
 
+// Hyperliquid Phase 2 modules
+const msgpack = @import("msgpack.zig");
+const hl_auth = @import("hl_auth.zig");
+const order_manager_mod = @import("order_manager.zig");
+
 // ─── Logger tests ───────────────────────────────────────────────────────────
 
 test "logger: init sets start time and uptimeMs returns non-negative" {
@@ -546,7 +551,7 @@ test "risk_gate: rejects when max open orders reached" {
     try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m2','SYM','B','Q');");
     try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m3','SYM','B','Q');");
 
-    // Insert max_open_orders pending orders, one per market.
+    // Insert max_open_orders exchange-acknowledged orders, one per market.
     const config = risk_gate.RiskConfig{
         .max_position_usd_fallback = 500.0,
         .max_portfolio_exposure_usd_fallback = 5000.0,
@@ -555,6 +560,8 @@ test "risk_gate: rejects when max open orders reached" {
 
     try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50", null);
     try database.insertOrder("o2", "m2", "co2", "limit", "sell", "10", "0.50", null);
+    try database.updateOrderStatus("o1", "placed");
+    try database.updateOrderStatus("o2", "placed");
 
     const request = risk_gate.OrderRequest{
         .market_id = "m3",
@@ -581,6 +588,7 @@ test "risk_gate: pair preflight rejects when only one open-order slot remains" {
 
     try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
     try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50", null);
+    try database.updateOrderStatus("o1", "placed");
 
     const config = risk_gate.RiskConfig{
         .max_position_usd_fallback = 500.0,
@@ -703,6 +711,7 @@ test "risk_gate: falls back when latest balance snapshot is non-positive" {
     try database.insertBalanceSnapshot(0.0, 0.0, 0.0, 0.0);
 
     const config = risk_gate.RiskConfig{
+        .max_position_pct = 0.50,
         .max_position_usd_fallback = 50.0,
         .max_portfolio_exposure_usd_fallback = 100.0,
         .max_daily_drawdown_usd_fallback = 25.0,
@@ -822,6 +831,10 @@ test "db: insertOrder and queryOpenOrderCount" {
     try testing.expectEqual(@as(u32, 0), count_before);
 
     try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50", null);
+    const pending_count = try database.queryOpenOrderCount();
+    try testing.expectEqual(@as(u32, 0), pending_count);
+
+    try database.updateOrderStatus("o1", "placed");
     const count_after = try database.queryOpenOrderCount();
     try testing.expectEqual(@as(u32, 1), count_after);
 }
@@ -1238,8 +1251,14 @@ test "db: insertOrder with strategy_origin" {
     try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
     try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50", "news_repricing");
 
-    const count = try database.queryOpenOrderCount();
-    try testing.expectEqual(@as(u32, 1), count);
+    const sql = "SELECT count(*) FROM orders WHERE id='o1' AND strategy_origin='news_repricing';" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expectEqual(@as(c_int, db.c.SQLITE_OK), db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null));
+    defer _ = db.c.sqlite3_finalize(stmt);
+
+    try testing.expectEqual(@as(c_int, db.c.SQLITE_ROW), db.c.sqlite3_step(stmt));
+    const count = db.c.sqlite3_column_int(stmt, 0);
+    try testing.expectEqual(@as(c_int, 1), count);
 }
 
 test "portfolio_tracker: writeOrdersJson reports truncation metadata" {
@@ -1849,27 +1868,85 @@ test "fill_poller: parseOrderResponse handles open status" {
     try testing.expect(!result.?.has_new_fill);
 }
 
-// -- TASK-4.5: probability_provider test coverage
+// -- Phase 2 HL signing test coverage
 
-test "probability_provider: normalizeProbability clamps correctly" {
-    // Inline tests already cover this via the module import — just verify the module compiles
-    // and estimate struct can be constructed
-    var est = probability_provider.ExternalEstimate{
-        .market_id = [_]u8{0} ** 64,
-        .market_id_len = 0,
-        .condition_id = [_]u8{0} ** 128,
-        .condition_id_len = 0,
-        .probability = 0.65,
-        .confidence = 0.8,
-        .source = [_]u8{0} ** 32,
-        .source_len = 0,
-        .fetched_at = 0,
-        .yes_token_id = [_]u8{0} ** 80,
-        .yes_token_id_len = 0,
-    };
-    try testing.expect(est.probability > 0.0 and est.probability < 1.0);
-    est.probability = 0.5;
-    try testing.expectEqual(@as(f64, 0.5), est.probability);
+test "hl_auth: chain id resolution honours network" {
+    try testing.expectEqual(@as(u64, 998), hl_auth.resolveChainId(.testnet, null));
+    try testing.expectEqual(@as(u64, 999), hl_auth.resolveChainId(.mainnet, null));
+    try testing.expectEqual(@as(u64, 12345), hl_auth.resolveChainId(.mainnet, 12345));
+}
+
+test "hl_auth: derivePublicAddress vector matches" {
+    const priv = try hl_auth.parsePrivateKeyHex(
+        "c85ef7d79691fe79573b1a7064c19c1a9819ebdbd1faaab1a8ec92344438aaf4",
+    );
+    const addr = try hl_auth.derivePublicAddress(priv);
+    var expected: [20]u8 = undefined;
+    _ = std.fmt.hexToBytes(&expected, "cd2a3d9f938e13cd947ec05abc7fe734df8dd826") catch unreachable;
+    try testing.expectEqualSlices(u8, &expected, &addr);
+}
+
+test "msgpack: empty map round-trips to canonical bytes" {
+    var w = msgpack.Writer.init(testing.allocator);
+    defer w.deinit();
+    try w.encodeMapHeader(0);
+    try testing.expectEqualSlices(u8, &[_]u8{0x80}, w.bytes());
+}
+
+test "order_manager: HL envelope contains action/nonce/signature fields" {
+    var database = try db.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    const priv = try hl_auth.parsePrivateKeyHex(
+        "c85ef7d79691fe79573b1a7064c19c1a9819ebdbd1faaab1a8ec92344438aaf4",
+    );
+    const signer = try hl_auth.derivePublicAddress(priv);
+
+    var om = order_manager_mod.OrderManager.init(testing.allocator, &database, .{}, .{
+        .hl = .{
+            .enabled = true,
+            .network = .testnet,
+            .private_key = priv,
+            .signer_address = signer,
+            .chain_id = 998,
+            .api_base = order_manager_mod.HL_API_BASE_TESTNET,
+        },
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var orders = std.json.Array.init(a);
+    var ord = std.json.ObjectMap.init(a);
+    try ord.put("a", .{ .integer = 0 });
+    try ord.put("b", .{ .bool = true });
+    try ord.put("p", .{ .string = "1.00" });
+    try ord.put("s", .{ .string = "1" });
+    try ord.put("r", .{ .bool = false });
+    var t = std.json.ObjectMap.init(a);
+    var lim = std.json.ObjectMap.init(a);
+    try lim.put("tif", .{ .string = "Gtc" });
+    try t.put("limit", .{ .object = lim });
+    try ord.put("t", .{ .object = t });
+    try orders.append(.{ .object = ord });
+
+    var action = std.json.ObjectMap.init(a);
+    try action.put("type", .{ .string = "order" });
+    try action.put("orders", .{ .array = orders });
+    try action.put("grouping", .{ .string = "na" });
+    const action_value: std.json.Value = .{ .object = action };
+
+    const envelope = try om.buildHlEnvelope(action_value, 1234567890);
+    defer testing.allocator.free(envelope);
+
+    try testing.expect(std.mem.indexOf(u8, envelope, "\"action\":") != null);
+    try testing.expect(std.mem.indexOf(u8, envelope, "\"nonce\":1234567890") != null);
+    try testing.expect(std.mem.indexOf(u8, envelope, "\"signature\":{\"r\":\"0x") != null);
+    try testing.expect(std.mem.indexOf(u8, envelope, "\"s\":\"0x") != null);
+    try testing.expect(std.mem.indexOf(u8, envelope, "\"v\":") != null);
+    try testing.expect(std.mem.indexOf(u8, envelope, "\"type\":\"order\"") != null);
 }
 
 // -- TASK-4.5: migration 008 test coverage
