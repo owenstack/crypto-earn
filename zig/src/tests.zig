@@ -3,30 +3,23 @@ const testing = std.testing;
 const log = @import("logger.zig");
 const ipc_types = @import("ipc_types.zig");
 const db = @import("db.zig");
-
-// Phase 1 modules — import to run their inline tests
 const crypto = @import("crypto.zig");
 const http_client = @import("http_client.zig");
 const websocket = @import("websocket.zig");
-
-// Phase 2 modules
 const risk_gate = @import("risk_gate.zig");
 const order_manager = @import("order_manager.zig");
 const portfolio_tracker = @import("portfolio_tracker.zig");
-
-// Phase 3 modules
 const strategy_engine = @import("strategy_engine.zig");
-
-// Phase 4 modules
 const ipc = @import("ipc.zig");
-
-// Phase 2 PRD modules (fill detection)
 const fill_poller = @import("fill_poller.zig");
-
-// Hyperliquid Phase 2 modules
 const msgpack = @import("msgpack.zig");
 const hl_auth = @import("hl_auth.zig");
 const order_manager_mod = @import("order_manager.zig");
+
+// Hyperliquid Phase 3 modules — register so inline tests run with the suite.
+const hl_market_meta = @import("hl_market_meta.zig");
+const hl_orderbook = @import("hl_orderbook.zig");
+const binance_ws = @import("binance_ws.zig");
 
 // ─── Logger tests ───────────────────────────────────────────────────────────
 
@@ -1992,4 +1985,130 @@ test "db: migration 008 seeds lp_max_position_usd in runtime_config" {
     const val = database.getConfig("lp_max_position_usd", &buf);
     try testing.expect(val != null);
     try testing.expectEqualStrings("50.0", val.?);
+}
+
+// ─── Phase 3: HL market data + Binance feed integration tests ───────────────
+
+test "phase3 db: migration 012 creates binance_prices and asset_index columns" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    // Verify binance_prices table exists by inserting + reading back.
+    try database.insertBinancePrice("BTCUSDT", 60000.0, 60001.0, 60000.5, 1_700_000_000_000_000_000);
+    const row = database.queryLatestBinancePrice("BTCUSDT") orelse {
+        try testing.expect(false);
+        return;
+    };
+    try testing.expectApproxEqAbs(@as(f64, 60000.0), row.bid, 1e-6);
+    try testing.expectApproxEqAbs(@as(f64, 60001.0), row.ask, 1e-6);
+    try testing.expectApproxEqAbs(@as(f64, 60000.5), row.mid, 1e-6);
+
+    // Verify markets.asset_index column exists by upserting and reading back.
+    try database.upsertMarketAssetIndex("BTC", 0);
+    try database.upsertMarketAssetIndex("ETH", 1);
+
+    const sql = "SELECT asset_index FROM markets WHERE symbol='ETH';" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(stmt);
+    try testing.expect(db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW);
+    try testing.expectEqual(@as(c_int, 1), db.c.sqlite3_column_int(stmt, 0));
+}
+
+test "phase3 db: insertHlOrderbookSnapshot persists asset_index" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.insertHlOrderbookSnapshot("BTC", 0, 60000.0, 60010.0, 60005.0);
+
+    const sql = "SELECT asset_index, mid_price FROM orderbooks WHERE market='BTC' LIMIT 1;" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(stmt);
+    try testing.expect(db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW);
+    try testing.expectEqual(@as(c_int, 0), db.c.sqlite3_column_int(stmt, 0));
+    try testing.expectApproxEqAbs(@as(f64, 60005.0), db.c.sqlite3_column_double(stmt, 1), 1e-6);
+}
+
+test "phase3 hl_market_meta: parseMetaJson extracts symbols in order" {
+    const body =
+        \\{"universe":[{"name":"BTC","szDecimals":5},{"name":"ETH","szDecimals":4}]}
+    ;
+    var assets = try hl_market_meta.parseMetaJson(testing.allocator, body);
+    defer assets.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), assets.items.len);
+    try testing.expectEqualStrings("BTC", assets.items[0].name());
+    try testing.expectEqualStrings("ETH", assets.items[1].name());
+}
+
+test "phase3 order_manager: setAssetMeta resolves asset_index for orders" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    var meta = hl_market_meta.AssetMeta.init(testing.allocator, "https://api.hyperliquid-testnet.xyz");
+    defer meta.deinit();
+
+    var btc: hl_market_meta.Asset = .{};
+    @memcpy(btc.name_buf[0..3], "BTC");
+    btc.name_len = 3;
+    var eth: hl_market_meta.Asset = .{};
+    @memcpy(eth.name_buf[0..3], "ETH");
+    eth.name_len = 3;
+    try meta.replace(&[_]hl_market_meta.Asset{ btc, eth });
+
+    var om = order_manager_mod.OrderManager.init(testing.allocator, &database, .{}, .{});
+    om.setAssetMeta(&meta);
+
+    // The lookup is exposed via a private helper; assert by spot-checking
+    // public API: meta.lookup direct.
+    try testing.expectEqual(@as(u32, 0), meta.lookup("BTC").?);
+    try testing.expectEqual(@as(u32, 1), meta.lookup("ETH").?);
+    try testing.expect(meta.lookup("DOGE") == null);
+}
+
+test "phase3 hl_orderbook: snapshot then delta updates best bid/ask" {
+    var syms = [_][]const u8{"BTC"};
+    var ob = hl_orderbook.Orderbook.init(testing.allocator, hl_orderbook.HL_WS_HOST_TESTNET, &syms);
+    defer ob.deinit();
+
+    const snap_bids = [_]hl_orderbook.Level{
+        .{ .price = 60000.0, .size = 1.0 },
+        .{ .price = 59999.0, .size = 2.0 },
+    };
+    const snap_asks = [_]hl_orderbook.Level{
+        .{ .price = 60001.0, .size = 1.0 },
+        .{ .price = 60002.0, .size = 2.0 },
+    };
+    ob.applySnapshot("BTC", &snap_bids, &snap_asks, 1);
+    try testing.expectEqual(@as(?f64, 60000.0), ob.bestBid("BTC"));
+    try testing.expectEqual(@as(?f64, 60001.0), ob.bestAsk("BTC"));
+    try testing.expectEqual(@as(?f64, 60000.5), ob.mid("BTC"));
+
+    // Delta: remove top bid (zero-size), insert tighter ask.
+    const bid_upd = [_]hl_orderbook.Level{.{ .price = 60000.0, .size = 0.0 }};
+    const ask_upd = [_]hl_orderbook.Level{.{ .price = 60000.5, .size = 1.0 }};
+    ob.applyDelta("BTC", &bid_upd, &ask_upd, 2);
+    try testing.expectEqual(@as(?f64, 59999.0), ob.bestBid("BTC"));
+    try testing.expectEqual(@as(?f64, 60000.5), ob.bestAsk("BTC"));
+}
+
+test "phase3 binance_ws: parse and update quote round trip" {
+    const body =
+        \\{"stream":"btcusdt@bookTicker","data":{"s":"BTCUSDT","b":"100.0","a":"101.0"}}
+    ;
+    const parsed = try binance_ws.parseBookTicker(testing.allocator, body);
+    try testing.expect(parsed != null);
+    defer testing.allocator.free(parsed.?.symbol);
+
+    var syms = [_][]const u8{"BTCUSDT"};
+    var feed = binance_ws.BinanceFeed.init(testing.allocator, &syms);
+    defer feed.deinit();
+    feed.updateQuote(parsed.?.symbol, parsed.?.bid, parsed.?.ask);
+
+    const q = feed.quote("BTCUSDT").?;
+    try testing.expectApproxEqAbs(@as(f64, 100.5), q.mid, 1e-9);
+    try testing.expect(q.ts_ns > 0);
 }

@@ -130,6 +130,39 @@ const MIGRATION_011 =
     \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(11);
 ;
 
+/// Embedded Phase-3 migration: HL market metadata + Binance feed persistence.
+/// ALTER TABLE on markets/orderbooks runs separately (column-exists checks).
+/// orderbooks is created here when missing (legacy code constructed it at
+/// runtime); Phase 3 owns the canonical schema for this table going forward.
+const MIGRATION_012 =
+    \\CREATE TABLE IF NOT EXISTS orderbooks(
+    \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+    \\  market TEXT NOT NULL,
+    \\  asset_id TEXT NOT NULL,
+    \\  best_bid TEXT,
+    \\  best_ask TEXT,
+    \\  mid_price REAL,
+    \\  bids_json TEXT,
+    \\  asks_json TEXT,
+    \\  last_trade_price TEXT,
+    \\  tick_size TEXT,
+    \\  timestamp TEXT,
+    \\  created_at INTEGER NOT NULL DEFAULT(unixepoch()),
+    \\  gamma_id TEXT DEFAULT NULL
+    \\);
+    \\CREATE TABLE IF NOT EXISTS binance_prices(
+    \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+    \\  symbol TEXT NOT NULL,
+    \\  bid REAL NOT NULL,
+    \\  ask REAL NOT NULL,
+    \\  mid REAL NOT NULL,
+    \\  ts_ns INTEGER NOT NULL,
+    \\  recorded_at INTEGER NOT NULL DEFAULT(unixepoch())
+    \\);
+    \\CREATE INDEX IF NOT EXISTS idx_binance_prices_symbol_ts ON binance_prices(symbol, ts_ns DESC);
+    \\CREATE INDEX IF NOT EXISTS idx_binance_prices_recorded ON binance_prices(recorded_at DESC);
+;
+
 pub const DB = struct {
     handle: *c.sqlite3,
 
@@ -185,6 +218,12 @@ pub const DB = struct {
             // This bounds the steady-state row count to N (number of subscribed
             // assets), regardless of WS update frequency.
             .{ .sql = "DELETE FROM orderbooks WHERE id NOT IN (SELECT MAX(id) FROM orderbooks GROUP BY asset_id);", .label = "orderbooks_dedup" },
+            // Binance price feed: keep last 10 minutes; only recent ticks are
+            // used. Time-based cleanup prevents unbounded growth at high tick rates.
+            .{ .sql = "DELETE FROM binance_prices WHERE recorded_at < unixepoch() - 600;", .label = "binance_prices" },
+            // Per-symbol Binance dedup: keep only the most recent row per symbol.
+            // This bounds steady-state row count to N (number of tracked symbols).
+            .{ .sql = "DELETE FROM binance_prices WHERE id NOT IN (SELECT MAX(id) FROM binance_prices GROUP BY symbol);", .label = "binance_prices_dedup" },
             // Risk events: keep 2 days for audit/debugging.
             .{ .sql = "DELETE FROM risk_events WHERE created_at < unixepoch() - 2*86400;", .label = "risk_events" },
             // Balance snapshots: keep 2 days. Worker writes ~1/5min so this
@@ -391,6 +430,37 @@ pub const DB = struct {
         if (!self.migrationApplied(11)) {
             log.info("db", "applying migration 011", .{});
             try self.execZ(MIGRATION_011 ++ &[_:0]u8{});
+        }
+        // Migration 012 — Phase 3 HL market metadata + Binance feed
+        // persistence. ALTER TABLE adds asset_index columns to markets and
+        // orderbooks (orderbooks may not exist yet on a fresh DB; skip
+        // gracefully if so).
+        if (!self.migrationApplied(12)) {
+            log.info("db", "applying migration 012", .{});
+            // Create base tables first (orderbooks if missing, binance_prices),
+            // then apply ALTER TABLE for additive columns.
+            try self.execZ(MIGRATION_012 ++ &[_:0]u8{});
+            const m012_alters = [_][:0]const u8{
+                "ALTER TABLE markets ADD COLUMN asset_index INTEGER DEFAULT NULL;",
+                "ALTER TABLE orderbooks ADD COLUMN asset_index INTEGER DEFAULT NULL;",
+                "CREATE INDEX IF NOT EXISTS idx_orderbooks_asset_index ON orderbooks(asset_index);",
+            };
+            for (m012_alters) |sql| {
+                self.execZ(sql) catch |err| {
+                    const sqlite_err = std.mem.span(c.sqlite3_errmsg(self.handle));
+                    const duplicate_col = std.mem.indexOf(u8, sqlite_err, "duplicate column name") != null;
+                    const no_table = std.mem.indexOf(u8, sqlite_err, "no such table") != null;
+                    if (err == error.DBExecFailed and (duplicate_col or no_table)) {
+                        log.info("db", "migration 012: skipping alter (column exists or table missing): {s}", .{sql});
+                        continue;
+                    } else {
+                        log.err("db", "migration 012 ALTER TABLE failed: zig_err={s} sqlite_err={s} sql={s}", .{ @errorName(err), sqlite_err, sql });
+                        return err;
+                    }
+                };
+            }
+            // Mark migration as applied only after all ALTERs succeed.
+            try self.execZ("INSERT OR IGNORE INTO schema_migrations(version)VALUES(12);" ++ &[_:0]u8{});
         }
         log.info("db", "migrations complete", .{});
     }
@@ -1076,6 +1146,147 @@ pub const DB = struct {
     }
 
     /// Insert a dry-run signal record for later analysis.
+    // -------------------------------------------------------------------
+    // Phase 3 HL/Binance market data helpers (migration 012)
+    // -------------------------------------------------------------------
+
+    /// Insert a Binance bookTicker snapshot. ts_ns is the wall-clock
+    /// nanosecond timestamp captured when the message arrived.
+    pub fn insertBinancePrice(
+        self: DB,
+        symbol: []const u8,
+        bid: f64,
+        ask: f64,
+        mid: f64,
+        ts_ns: i64,
+    ) !void {
+        const sql = "INSERT INTO binance_prices(symbol,bid,ask,mid,ts_ns) VALUES(?,?,?,?,?);" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare insertBinancePrice", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, symbol.ptr, @intCast(symbol.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 2, bid) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 3, ask) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 4, mid) != c.SQLITE_OK or
+            c.sqlite3_bind_int64(stmt, 5, ts_ns) != c.SQLITE_OK)
+        {
+            log.err("db", "failed to bind insertBinancePrice parameters", .{});
+            return error.DBExecFailed;
+        }
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
+            log.err("db", "failed to execute insertBinancePrice", .{});
+            return error.DBExecFailed;
+        }
+    }
+
+    pub const BinancePriceRow = struct {
+        bid: f64,
+        ask: f64,
+        mid: f64,
+        ts_ns: i64,
+    };
+
+    pub fn queryLatestBinancePrice(self: DB, symbol: []const u8) ?BinancePriceRow {
+        const sql = "SELECT bid,ask,mid,ts_ns FROM binance_prices WHERE symbol=? ORDER BY ts_ns DESC LIMIT 1;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return null;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_text(stmt, 1, symbol.ptr, @intCast(symbol.len), null) != c.SQLITE_OK) return null;
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return BinancePriceRow{
+            .bid = c.sqlite3_column_double(stmt, 0),
+            .ask = c.sqlite3_column_double(stmt, 1),
+            .mid = c.sqlite3_column_double(stmt, 2),
+            .ts_ns = c.sqlite3_column_int64(stmt, 3),
+        };
+    }
+
+    /// Persist (or update) the asset_index for a market row keyed by symbol.
+    /// Used during HL meta refresh to keep markets.asset_index aligned with
+    /// the universe array. INSERT OR IGNORE creates a stub row when the
+    /// market is not already known so feed persistence has somewhere to
+    /// reference.
+    pub fn upsertMarketAssetIndex(self: DB, symbol: []const u8, asset_index: i64) !void {
+        // Stub-create the markets row if missing; symbol acts as the
+        // identity key for HL coins (BTC, ETH, ...) until full market
+        // registry overhaul lands in Phase 7.
+        var id_buf: [96]u8 = undefined;
+        const id_z = std.fmt.bufPrint(&id_buf, "hl-{s}", .{symbol}) catch return error.DBExecFailed;
+
+        const ins_sql = "INSERT OR IGNORE INTO markets(id,symbol,base,quote,asset_index) VALUES(?,?,?,?,?);" ++ &[_:0]u8{};
+        var ins_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, ins_sql.ptr, -1, &ins_stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+        defer _ = c.sqlite3_finalize(ins_stmt);
+        if (c.sqlite3_bind_text(ins_stmt, 1, id_z.ptr, @intCast(id_z.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(ins_stmt, 2, symbol.ptr, @intCast(symbol.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(ins_stmt, 3, symbol.ptr, @intCast(symbol.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(ins_stmt, 4, "USD", 3, null) != c.SQLITE_OK or
+            c.sqlite3_bind_int64(ins_stmt, 5, asset_index) != c.SQLITE_OK)
+        {
+            return error.DBExecFailed;
+        }
+        if (c.sqlite3_step(ins_stmt) != c.SQLITE_DONE) return error.DBExecFailed;
+
+        const upd_sql = "UPDATE markets SET asset_index=? WHERE symbol=?;" ++ &[_:0]u8{};
+        var upd_stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, upd_sql.ptr, -1, &upd_stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+        defer _ = c.sqlite3_finalize(upd_stmt);
+        if (c.sqlite3_bind_int64(upd_stmt, 1, asset_index) != c.SQLITE_OK or
+            c.sqlite3_bind_text(upd_stmt, 2, symbol.ptr, @intCast(symbol.len), null) != c.SQLITE_OK)
+        {
+            return error.DBExecFailed;
+        }
+        if (c.sqlite3_step(upd_stmt) != c.SQLITE_DONE) return error.DBExecFailed;
+    }
+
+    /// Insert an HL orderbook snapshot row tagged with asset_index for
+    /// strategy queries. `symbol` is the HL coin (BTC, ETH...).
+    pub fn insertHlOrderbookSnapshot(
+        self: DB,
+        symbol: []const u8,
+        asset_index: ?i64,
+        best_bid: f64,
+        best_ask: f64,
+        mid: f64,
+    ) !void {
+        const sql = "INSERT INTO orderbooks(market,asset_id,best_bid,best_ask,mid_price,asset_index) VALUES(?,?,?,?,?,?);" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare insertHlOrderbookSnapshot", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        var bid_buf: [32]u8 = undefined;
+        const bid_str = std.fmt.bufPrint(&bid_buf, "{d}", .{best_bid}) catch return error.DBExecFailed;
+        var ask_buf: [32]u8 = undefined;
+        const ask_str = std.fmt.bufPrint(&ask_buf, "{d}", .{best_ask}) catch return error.DBExecFailed;
+
+        if (c.sqlite3_bind_text(stmt, 1, symbol.ptr, @intCast(symbol.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 2, symbol.ptr, @intCast(symbol.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 3, bid_str.ptr, @intCast(bid_str.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 4, ask_str.ptr, @intCast(ask_str.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 5, mid) != c.SQLITE_OK)
+        {
+            return error.DBExecFailed;
+        }
+        if (asset_index) |ai| {
+            if (c.sqlite3_bind_int64(stmt, 6, ai) != c.SQLITE_OK) return error.DBExecFailed;
+        } else {
+            if (c.sqlite3_bind_null(stmt, 6) != c.SQLITE_OK) return error.DBExecFailed;
+        }
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
+            log.err("db", "failed to execute insertHlOrderbookSnapshot", .{});
+            return error.DBExecFailed;
+        }
+    }
+
     pub fn insertDryRunSignal(
         self: DB,
         market_id: []const u8,

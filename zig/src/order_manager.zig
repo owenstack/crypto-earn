@@ -9,6 +9,7 @@ const db_mod = @import("db.zig");
 const http = @import("http_client.zig");
 const crypto = @import("crypto.zig");
 const hl_auth = @import("hl_auth.zig");
+const hl_market_meta = @import("hl_market_meta.zig");
 const msgpack = @import("msgpack.zig");
 const risk = @import("risk_gate.zig");
 const ipc = @import("ipc.zig");
@@ -116,6 +117,9 @@ pub const OrderManager = struct {
     should_stop: std.atomic.Value(bool),
     reconciliation_complete: std.atomic.Value(bool),
     domain_separator: [32]u8,
+    /// Phase 3: shared asset metadata (symbol → asset_index). May be null
+    /// for tests / legacy paths; falls back to asset_index 0 when absent.
+    asset_meta: ?*hl_market_meta.AssetMeta = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -139,7 +143,40 @@ pub const OrderManager = struct {
             .should_stop = std.atomic.Value(bool).init(false),
             .reconciliation_complete = std.atomic.Value(bool).init(false),
             .domain_separator = ds,
+            .asset_meta = null,
         };
+    }
+
+    /// Phase 3: bind the shared HL asset metadata cache after construction.
+    /// Lookups for `buildOrderAction` / `buildCancelAction` will use
+    /// `asset_meta.lookup(market_id)` to resolve the asset index.
+    pub fn setAssetMeta(self: *OrderManager, meta: *hl_market_meta.AssetMeta) void {
+        self.asset_meta = meta;
+    }
+
+    /// Resolve the asset index for an order. Returns 0 when no metadata is
+    /// bound (legacy/test path) or the symbol is unknown — the latter is
+    /// also logged so misconfigured strategies are visible.
+    fn resolveAssetIndex(self: *OrderManager, market_id: []const u8) i64 {
+        if (self.asset_meta) |meta| {
+            if (meta.lookup(market_id)) |idx| return @intCast(idx);
+            log.warn("order_mgr", "asset_meta lookup miss for symbol {s}; using 0", .{market_id});
+        }
+        return 0;
+    }
+
+    /// Resolve the asset index for a cancel by joining orders → market_id →
+    /// hl_market_meta. Falls back to 0 if any link is missing.
+    fn resolveCancelAssetIndex(self: *OrderManager, order_id: []const u8) i64 {
+        const sql = "SELECT market_id FROM orders WHERE id=? LIMIT 1;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return 0;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_text(stmt, 1, order_id.ptr, @intCast(order_id.len), null) != c.SQLITE_OK) return 0;
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+        const raw = c.sqlite3_column_text(stmt, 0);
+        const market_id = if (raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else return 0;
+        return self.resolveAssetIndex(market_id);
     }
 
     /// Place an order after passing through the risk gate.
@@ -504,19 +541,20 @@ pub const OrderManager = struct {
     /// arena alive until the value is fully consumed.
     fn buildOrderAction(
         arena: std.mem.Allocator,
+        asset_index: i64,
         market_id: []const u8,
         side: []const u8,
         size: []const u8,
         price: []const u8,
         order_type: []const u8,
     ) !std.json.Value {
-        // Phase 2 stub: asset index defaults to 0; resolution will land in
-        // Phase 3 via hl_market_meta. Strings are encoded as msgpack strings
-        // for size/price so the operator can pass HL's expected decimal text.
+        // Phase 3: asset_index is resolved by the caller via the shared
+        // hl_market_meta cache. Strings are encoded as msgpack strings for
+        // size/price so the operator can pass HL's expected decimal text.
         _ = market_id;
         var orders = std.json.Array.init(arena);
         var ord = std.json.ObjectMap.init(arena);
-        try ord.put("a", .{ .integer = 0 }); // asset index (stub)
+        try ord.put("a", .{ .integer = asset_index });
         try ord.put("b", .{ .bool = std.mem.eql(u8, side, "buy") });
         try ord.put("p", .{ .string = price });
         try ord.put("s", .{ .string = size });
@@ -542,11 +580,12 @@ pub const OrderManager = struct {
     /// Build the cancel action JSON for a single order id.
     fn buildCancelAction(
         arena: std.mem.Allocator,
+        asset_index: i64,
         order_id: []const u8,
     ) !std.json.Value {
         var cancels = std.json.Array.init(arena);
         var item = std.json.ObjectMap.init(arena);
-        try item.put("a", .{ .integer = 0 });
+        try item.put("a", .{ .integer = asset_index });
         try item.put("o", .{ .string = order_id });
         try cancels.append(.{ .object = item });
 
@@ -626,7 +665,8 @@ pub const OrderManager = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
 
-        const action = buildOrderAction(arena.allocator(), market_id, side, size, price, order_type) catch |e| {
+        const asset_index = self.resolveAssetIndex(market_id);
+        const action = buildOrderAction(arena.allocator(), asset_index, market_id, side, size, price, order_type) catch |e| {
             log.err("order_mgr", "failed to build HL order action: {s}", .{@errorName(e)});
             return false;
         };
@@ -716,7 +756,8 @@ pub const OrderManager = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
 
-        const action = buildCancelAction(arena.allocator(), order_id) catch |e| {
+        const asset_index = self.resolveCancelAssetIndex(order_id);
+        const action = buildCancelAction(arena.allocator(), asset_index, order_id) catch |e| {
             log.err("order_mgr", "failed to build HL cancel action: {s}", .{@errorName(e)});
             return false;
         };

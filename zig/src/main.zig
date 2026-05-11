@@ -11,6 +11,9 @@ const ws = @import("websocket.zig");
 const fill_poller = @import("fill_poller.zig");
 const crash_trace = @import("crash_trace.zig");
 const hl_auth = @import("hl_auth.zig");
+const hl_market_meta = @import("hl_market_meta.zig");
+const hl_orderbook = @import("hl_orderbook.zig");
+const binance_ws = @import("binance_ws.zig");
 
 fn roundUpToCents(value: f64) f64 {
     const step = 100.0;
@@ -164,20 +167,106 @@ pub fn main() !void {
     var pt = portfolio.PortfolioTracker.init(allocator, &database, .{});
     log.info("engine", "portfolio tracker ready", .{});
 
-    // Initialize WebSocket client for real-time CLOB updates
-    var ws_client = ws.WebSocketClient.init(allocator);
-    ws_client.setCallback(&wsPriceCallback);
+    // ─── Phase 3: HL asset metadata preload ─────────────────────────────
+    // Pull the HL universe before strategy/feed threads so the orderbook
+    // module and order manager can resolve asset_index lookups against a
+    // populated cache. Failure is fatal in live mode (no asset_index =
+    // bad orders); a warning suffices in dry-run.
+    var asset_meta = hl_market_meta.AssetMeta.init(allocator, hl_config.api_base);
+    defer asset_meta.deinit();
     g_database = &database;
-    log.info("engine", "websocket client ready", .{});
 
-    // Spawn WebSocket thread for real-time orderbook feeds
-    const ws_thread = try std.Thread.spawn(.{}, ws.WebSocketClient.connectAndRun, .{&ws_client});
-    defer {
-        ws_client.stop();
-        ws_thread.join();
-        ws_client.deinit();
+    {
+        const loaded = asset_meta.fetchAndLoad() catch |e| blk: {
+            if (dry_run_env) {
+                log.warn("engine", "HL meta preload failed in dry-run, continuing: {s}", .{@errorName(e)});
+                break :blk @as(usize, 0);
+            } else {
+                log.err("engine", "HL meta preload failed: {s}", .{@errorName(e)});
+                return e;
+            }
+        };
+        log.info("engine", "HL asset metadata loaded: {d} assets (network={s})", .{
+            loaded, @tagName(hl_config.network),
+        });
+        // Persist the universe → markets.asset_index so DB joins (Phase 7
+        // reports, dashboards) can lift the index without a roundtrip.
+        var i: usize = 0;
+        while (i < loaded) : (i += 1) {
+            const sym = asset_meta.assets.items[i].name();
+            database.upsertMarketAssetIndex(sym, @intCast(i)) catch |e| {
+                log.warn("engine", "upsertMarketAssetIndex failed for {s}: {s}", .{ sym, @errorName(e) });
+            };
+        }
     }
-    log.info("engine", "websocket feed started", .{});
+    om.setAssetMeta(&asset_meta);
+
+    // Spawn the metadata refresh loop (24h cadence).
+    const meta_thread = try std.Thread.spawn(.{}, hl_market_meta.AssetMeta.refreshLoop, .{&asset_meta});
+    defer {
+        asset_meta.stop();
+        meta_thread.join();
+    }
+    log.info("engine", "HL asset metadata refresh loop started", .{});
+
+    // ─── Phase 3: HL l2Book orderbook feed ──────────────────────────────
+    // Configurable symbol list via HL_SYMBOLS=BTC,ETH,SOL.
+    var hl_symbols_buf: [4096]u8 = undefined;
+    const hl_symbols = parseSymbolList(
+        std.posix.getenv("HL_SYMBOLS") orelse "BTC,ETH,SOL",
+        &hl_symbols_buf,
+        allocator,
+    ) catch |e| {
+        log.err("engine", "failed to parse HL_SYMBOLS: {s}", .{@errorName(e)});
+        return e;
+    };
+    defer allocator.free(hl_symbols);
+
+    const hl_ws_host = switch (hl_config.network) {
+        .mainnet => hl_orderbook.HL_WS_HOST_MAINNET,
+        .testnet => hl_orderbook.HL_WS_HOST_TESTNET,
+    };
+    var hl_ob = hl_orderbook.Orderbook.init(allocator, hl_ws_host, hl_symbols);
+    defer hl_ob.deinit();
+
+    var hl_persist_ctx = HlPersistCtx{ .database = &database, .meta = &asset_meta };
+    hl_ob.setPersistCallback(&hlOrderbookPersistCallback, &hl_persist_ctx);
+
+    const hl_ob_thread = try std.Thread.spawn(.{}, hl_orderbook.Orderbook.run, .{&hl_ob});
+    defer {
+        hl_ob.stop();
+        hl_ob_thread.join();
+    }
+    log.info("engine", "HL l2Book feed started ({d} symbols, host={s})", .{
+        hl_symbols.len, hl_ws_host,
+    });
+
+    // ─── Phase 3: Binance bookTicker feed ───────────────────────────────
+    var binance_symbols_buf: [4096]u8 = undefined;
+    const binance_symbols = parseSymbolList(
+        std.posix.getenv("BINANCE_SYMBOLS") orelse "BTCUSDT,ETHUSDT,SOLUSDT",
+        &binance_symbols_buf,
+        allocator,
+    ) catch |e| {
+        log.err("engine", "failed to parse BINANCE_SYMBOLS: {s}", .{@errorName(e)});
+        return e;
+    };
+    defer allocator.free(binance_symbols);
+
+    var binance_feed = binance_ws.BinanceFeed.init(allocator, binance_symbols);
+    defer binance_feed.deinit();
+
+    var binance_persist_ctx = BinancePersistCtx{ .database = &database };
+    binance_feed.setPersistCallback(&binancePersistCallback, &binance_persist_ctx);
+
+    const binance_thread = try std.Thread.spawn(.{}, binance_ws.BinanceFeed.run, .{&binance_feed});
+    const binance_watchdog_thread = try std.Thread.spawn(.{}, binance_ws.BinanceFeed.watchdogLoop, .{&binance_feed});
+    defer {
+        binance_feed.stop();
+        binance_thread.join();
+        binance_watchdog_thread.join();
+    }
+    log.info("engine", "Binance bookTicker feed started ({d} symbols)", .{binance_symbols.len});
 
     // Spawn stale order scan ticker
     om.should_stop.store(false, .seq_cst);
@@ -1139,6 +1228,77 @@ fn queryLastBookByAsset(database: *db.DB, asset_id: []const u8) ?BookTop {
 
 /// Global database handle for the WS callback (set before spawning WS thread).
 var g_database: ?*db.DB = null;
+
+/// Parse a comma-separated symbol list ("BTC,ETH,SOL") into a heap-owned
+/// slice of slices. Caller frees the outer slice via `allocator.free`.
+/// Each inner slice references `scratch` (storage).
+fn parseSymbolList(
+    raw: []const u8,
+    scratch: []u8,
+    allocator: std.mem.Allocator,
+) ![][]const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return try allocator.alloc([]const u8, 0);
+
+    if (trimmed.len > scratch.len) return error.SymbolListTooLong;
+    @memcpy(scratch[0..trimmed.len], trimmed);
+    const buf = scratch[0..trimmed.len];
+
+    // Count separators to size the slice up front.
+    var n: usize = 1;
+    for (buf) |ch| if (ch == ',') {
+        n += 1;
+    };
+
+    var out = try allocator.alloc([]const u8, n);
+    errdefer allocator.free(out);
+
+    var idx: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= buf.len) : (i += 1) {
+        if (i == buf.len or buf[i] == ',') {
+            const sym = std.mem.trim(u8, buf[start..i], " \t");
+            if (sym.len > 0) {
+                out[idx] = sym;
+                idx += 1;
+            }
+            start = i + 1;
+        }
+    }
+    return out[0..idx];
+}
+
+/// Phase 3 persistence callback context for HL orderbook updates.
+const HlPersistCtx = struct {
+    database: *db.DB,
+    meta: *hl_market_meta.AssetMeta,
+};
+
+fn hlOrderbookPersistCallback(ctx_opt: ?*anyopaque, symbol: []const u8, book: *const hl_orderbook.Book) void {
+    const ctx_raw = ctx_opt orelse return;
+    const ctx: *HlPersistCtx = @ptrCast(@alignCast(ctx_raw));
+    const bid = book.bestBid() orelse return;
+    const ask = book.bestAsk() orelse return;
+    const mid = book.mid() orelse return;
+    const asset_idx: ?i64 = if (ctx.meta.lookup(symbol)) |i| @intCast(i) else null;
+    ctx.database.insertHlOrderbookSnapshot(symbol, asset_idx, bid, ask, mid) catch |e| {
+        log.warn("hl_ob", "persist failed for {s}: {s}", .{ symbol, @errorName(e) });
+    };
+}
+
+/// Phase 3 persistence callback context for Binance bookTicker updates.
+const BinancePersistCtx = struct {
+    database: *db.DB,
+};
+
+fn binancePersistCallback(ctx_opt: ?*anyopaque, symbol: []const u8, q: binance_ws.Quote) void {
+    const ctx_raw = ctx_opt orelse return;
+    const ctx: *BinancePersistCtx = @ptrCast(@alignCast(ctx_raw));
+    ctx.database.insertBinancePrice(symbol, q.bid, q.ask, q.mid, q.ts_ns) catch |e| {
+        log.warn("binance", "persist failed for {s}: {s}", .{ symbol, @errorName(e) });
+    };
+}
 
 /// Callback for real-time WebSocket price updates.
 /// Persists price snapshots so the strategy worker can query mid prices.
