@@ -2112,3 +2112,188 @@ test "phase3 binance_ws: parse and update quote round trip" {
     try testing.expectApproxEqAbs(@as(f64, 100.5), q.mid, 1e-9);
     try testing.expect(q.ts_ns > 0);
 }
+
+// ─── Phase 4: Dry-run interception tests ────────────────────────────────────
+
+/// Minimal fixture: open DB, run migrations, seed a market and balance
+/// snapshot so the risk gate has a non-fallback ceiling, and flip
+/// reconciliation_complete on the caller's OrderManager.
+fn dryRunFixture(om: *order_manager.OrderManager, database: *db.DB) !void {
+    try database.execZ("INSERT OR IGNORE INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
+    try database.insertBalanceSnapshot(100.0, 0.0, 0.0, 0.0);
+    om.reconciliation_complete.store(true, .seq_cst);
+}
+
+test "phase4: OrderManagerConfig has dry-run defaults" {
+    const cfg = order_manager.OrderManagerConfig{};
+    try testing.expect(!cfg.dry_run_enabled);
+    try testing.expectApproxEqAbs(@as(f64, 10.0), cfg.dry_run_initial_balance, 1e-9);
+    try testing.expectEqual(@as(u64, 8), cfg.dry_run_latency_min_ms);
+    try testing.expectEqual(@as(u64, 25), cfg.dry_run_latency_max_ms);
+}
+
+test "phase4: dry-run placement writes to dry_run_orders, not orders" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    const om_cfg = order_manager.OrderManagerConfig{ .dry_run_enabled = true };
+    var om = order_manager.OrderManager.init(testing.allocator, &database, .{}, om_cfg);
+    try dryRunFixture(&om, &database);
+
+    const result = om.placeOrder("m1", "buy", "1", "0.50", "limit", "market_making");
+    switch (result) {
+        .success => |s| {
+            try testing.expect(s.order_id.len > 0);
+            try testing.expect(std.mem.startsWith(u8, s.order_id, "dry-"));
+            om.allocator.free(s.order_id);
+        },
+        .rejected => |r| {
+            std.debug.print("rejected: {s}\n", .{r.reason});
+            try testing.expect(false);
+        },
+        .failed => |f| {
+            std.debug.print("failed: {s}\n", .{f.reason});
+            try testing.expect(false);
+        },
+    }
+
+    // Verify a row was inserted into dry_run_orders.
+    const dry_count_sql = "SELECT COUNT(*) FROM dry_run_orders;" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, dry_count_sql.ptr, -1, &stmt, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(stmt);
+    try testing.expect(db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW);
+    try testing.expectEqual(@as(c_int, 1), db.c.sqlite3_column_int(stmt, 0));
+
+    // And NO row in the live `orders` table.
+    const live_count_sql = "SELECT COUNT(*) FROM orders;" ++ &[_:0]u8{};
+    var live_stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, live_count_sql.ptr, -1, &live_stmt, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(live_stmt);
+    try testing.expect(db.c.sqlite3_step(live_stmt) == db.c.SQLITE_ROW);
+    try testing.expectEqual(@as(c_int, 0), db.c.sqlite3_column_int(live_stmt, 0));
+}
+
+test "phase4: dry-run latency falls within configured range" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    // Use a short, deterministic window so the test stays fast.
+    const om_cfg = order_manager.OrderManagerConfig{
+        .dry_run_enabled = true,
+        .dry_run_latency_min_ms = 2,
+        .dry_run_latency_max_ms = 6,
+    };
+    var om = order_manager.OrderManager.init(testing.allocator, &database, .{}, om_cfg);
+    try dryRunFixture(&om, &database);
+
+    const start = std.time.milliTimestamp();
+    const result = om.placeOrder("m1", "buy", "1", "0.50", "limit", null);
+    const elapsed_ms = std.time.milliTimestamp() - start;
+
+    switch (result) {
+        .success => |s| om.allocator.free(s.order_id),
+        else => try testing.expect(false),
+    }
+
+    // Allow generous upper slack for scheduler jitter, but enforce the
+    // configured lower bound (the simulated sleep is the dominant cost
+    // since the rest of placeOrder is a few SQLite inserts).
+    try testing.expect(elapsed_ms >= 2);
+    try testing.expect(elapsed_ms < 200);
+}
+
+test "phase4: dry-run shares the live risk gate (oversized order rejected)" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    const om_cfg = order_manager.OrderManagerConfig{ .dry_run_enabled = true };
+    var om = order_manager.OrderManager.init(testing.allocator, &database, .{}, om_cfg);
+    try dryRunFixture(&om, &database);
+
+    // 100 @ 0.50 = $50 notional. With a $100 balance and default 15%
+    // max_position_pct the cap is $15, so this MUST be rejected by the
+    // shared risk gate before ever hitting the dry-run interception.
+    const result = om.placeOrder("m1", "buy", "100", "0.50", "limit", null);
+    switch (result) {
+        .rejected => |r| {
+            try testing.expectEqualStrings("MaxPositionExceeded", r.reason);
+        },
+        .success => |s| {
+            om.allocator.free(s.order_id);
+            try testing.expect(false);
+        },
+        .failed => try testing.expect(false),
+    }
+
+    // The rejection short-circuits BEFORE the dry-run insert.
+    const sql = "SELECT COUNT(*) FROM dry_run_orders;" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(stmt);
+    try testing.expect(db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW);
+    try testing.expectEqual(@as(c_int, 0), db.c.sqlite3_column_int(stmt, 0));
+}
+
+test "phase4: dry-run cancellation flips status to 'cancelled'" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    const om_cfg = order_manager.OrderManagerConfig{ .dry_run_enabled = true };
+    var om = order_manager.OrderManager.init(testing.allocator, &database, .{}, om_cfg);
+    try dryRunFixture(&om, &database);
+
+    const placed = om.placeOrder("m1", "buy", "1", "0.50", "limit", "market_making");
+    const order_id = switch (placed) {
+        .success => |s| s.order_id,
+        else => return error.TestUnexpectedResult,
+    };
+    defer om.allocator.free(order_id);
+
+    try testing.expect(om.cancelOrder(order_id));
+
+    // Verify the row's status is now 'cancelled'.
+    const sql = "SELECT status FROM dry_run_orders WHERE id=?;" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(stmt);
+    try testing.expect(db.c.sqlite3_bind_text(stmt, 1, order_id.ptr, @intCast(order_id.len), null) == db.c.SQLITE_OK);
+    try testing.expect(db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW);
+    const status_raw = db.c.sqlite3_column_text(stmt, 0);
+    try testing.expect(status_raw != null);
+    const status = std.mem.span(@as([*c]const u8, @ptrCast(status_raw.?)));
+    try testing.expectEqualStrings("cancelled", status);
+}
+
+test "phase4: dry-run cancellation of unknown id returns false" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    const om_cfg = order_manager.OrderManagerConfig{ .dry_run_enabled = true };
+    var om = order_manager.OrderManager.init(testing.allocator, &database, .{}, om_cfg);
+
+    try testing.expect(!om.cancelOrder("dry-does-not-exist"));
+}
+
+test "phase4: db.updateDryRunOrderStatus updates row" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.insertDryRunOrder("dr-1", "m1", "market_making", "buy", 0.50, 1.0);
+    try database.updateDryRunOrderStatus("dr-1", "cancelled");
+
+    const sql = "SELECT status FROM dry_run_orders WHERE id='dr-1';" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(stmt);
+    try testing.expect(db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW);
+    const status_raw = db.c.sqlite3_column_text(stmt, 0);
+    const status = std.mem.span(@as([*c]const u8, @ptrCast(status_raw.?)));
+    try testing.expectEqualStrings("cancelled", status);
+}

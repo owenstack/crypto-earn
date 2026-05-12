@@ -97,7 +97,7 @@ pub const Orderbook = struct {
                 break;
             }
             if (sym.len > MAX_SYMBOL_LEN) {
-                log.warn("hl_ob", "symbol dropped: reason=max_len name={s} len={d}", .{sym, sym.len});
+                log.warn("hl_ob", "symbol dropped: reason=max_len name={s} len={d}", .{ sym, sym.len });
                 continue;
             }
             var e: SymbolEntry = .{};

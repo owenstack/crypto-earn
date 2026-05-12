@@ -1,4 +1,5 @@
-# CEX-ZIG — Hyperliquid Trading Engine Migration PRD,
+# CEX-ZIG — Hyperliquid Trading Engine Migration PRD
+
 ## Context
 
 ### Project description
@@ -233,6 +234,7 @@ The gate must reject orders that would push `current_notional + new_notional > a
 ### Inventory skew (LP strategy)
 
 After a long fill, the engine must:
+
 1. Immediately cancel any remaining bid orders on that asset.
 2. Shift the ask price down toward the mid to accelerate position exit.
 3. Resume symmetric quoting only after the inventory returns below `inventory_exit_threshold_shares`.
@@ -242,6 +244,7 @@ This prevents the engine from doubling a long position during adverse price move
 ### CEX-DEX arb timing
 
 From AWS EC2 us-east-1:
+
 - Binance Futures WebSocket RTT: ~4–8 ms
 - Hyperliquid API RTT: ~10–20 ms (HL is also us-east-1 infrastructure)
 - Expected usable lag window: 15–40 ms
@@ -251,6 +254,7 @@ The arb strategy must track `binance_update_ns` and `hl_submit_ns` per trade to 
 ### Dry-run vs live parity
 
 The dry-run layer must simulate:
+
 - Order placement latency (sampled from a configurable distribution, default: `uniform(8ms, 25ms)`)
 - Slippage: fills simulated at the best ask (buys) or best bid (sells) from the live l2Book snapshot at fill time
 - Fees: taker 0.035% (3.5 bps), maker 0.0% (rebate not modelled in dry-run to be conservative)

@@ -1844,6 +1844,28 @@ pub const DB = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DBExecFailed;
     }
 
+    /// Phase 4: flip the status column of a dry_run_orders row. Used by
+    /// `OrderManager.cancelDryRunOrder` to mark a paper order as
+    /// 'cancelled' without touching `fill_price`/`pnl`/`fees`.
+    pub fn updateDryRunOrderStatus(
+        self: DB,
+        id: []const u8,
+        new_status: []const u8,
+    ) !void {
+        const sql = "UPDATE dry_run_orders SET status=?,updated_at=unixepoch() WHERE id=?;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, new_status.ptr, @intCast(new_status.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 2, id.ptr, @intCast(id.len), null) != c.SQLITE_OK)
+        {
+            return error.DBExecFailed;
+        }
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DBExecFailed;
+    }
+
     pub fn settleDryRunOrder(
         self: DB,
         id: []const u8,

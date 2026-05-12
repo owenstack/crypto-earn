@@ -105,6 +105,19 @@ pub const OrderManagerConfig = struct {
     stale_scan_interval_min: u32 = 5,
     max_retry_attempts: u32 = 7,
     hl: HlConfig = .{},
+
+    /// Phase 4: Dry-run interception. When enabled, `placeOrder()` writes
+    /// to `dry_run_orders` and skips the HL `/exchange` POST; `cancelOrder()`
+    /// updates the dry-run row instead of cancelling on HL. Set by engine
+    /// startup when loading the DRY_RUN env var.
+    dry_run_enabled: bool = false,
+    /// Initial simulated USDC balance (used by main.zig to seed
+    /// balance_snapshots; recorded here for telemetry).
+    dry_run_initial_balance: f64 = 10.0,
+    /// Inclusive lower bound on the simulated submit→ack latency (ms).
+    dry_run_latency_min_ms: u64 = 8,
+    /// Inclusive upper bound on the simulated submit→ack latency (ms).
+    dry_run_latency_max_ms: u64 = 25,
 };
 
 pub const OrderManager = struct {
@@ -248,6 +261,15 @@ pub const OrderManager = struct {
             log.info("order_mgr", "order from strategy: {s}", .{so});
         }
 
+        // Phase 4: Dry-run interception. The risk gate has already passed
+        // above, so dry-run and live paths share the same validation. Here
+        // we intercept the side effects: write to `dry_run_orders`, sleep
+        // for a uniform-random simulated latency, publish the same
+        // `event.order.placed` event, and return a synthetic id (no HL POST).
+        if (self.config.dry_run_enabled) {
+            return self.placeDryRunOrder(market_id, side, size, price, order_type, strategy_origin);
+        }
+
         // Persist order as pending
         self.database.insertOrder(
             client_order_id,
@@ -313,6 +335,13 @@ pub const OrderManager = struct {
 
     /// Cancel a specific order by ID.
     pub fn cancelOrder(self: *OrderManager, order_id: []const u8) bool {
+        // Phase 4: Dry-run interception. The dry-run path keeps order state
+        // in `dry_run_orders` (not `orders`), so cancellation flips the row
+        // there and never touches the HL `/exchange` endpoint.
+        if (self.config.dry_run_enabled) {
+            return self.cancelDryRunOrder(order_id);
+        }
+
         var should_cancel_remote = true;
         const status_sql = "SELECT status FROM orders WHERE id=? LIMIT 1;" ++ &[_:0]u8{};
         var status_stmt: ?*c.sqlite3_stmt = null;
@@ -638,6 +667,170 @@ pub const OrderManager = struct {
         try buf.appendSlice(self.allocator, "}}");
 
         return buf.toOwnedSlice(self.allocator);
+    }
+
+    /// Phase 4: simulate a uniform-random submit→ack latency in the
+    /// configured `[min, max]` ms window (inclusive). Returns the chosen
+    /// delay in ms (so callers can persist/log it).
+    fn simulateDryRunLatency(self: *OrderManager) u64 {
+        const lo = self.config.dry_run_latency_min_ms;
+        const hi_raw = self.config.dry_run_latency_max_ms;
+        const hi = if (hi_raw < lo) lo else hi_raw;
+        const span = hi - lo + 1;
+        const delay_ms = lo + std.crypto.random.uintLessThan(u64, span);
+        std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+        return delay_ms;
+    }
+
+    /// Phase 4: dry-run placement. Generates a synthetic order id with a
+    /// `dry-` prefix, sleeps for the simulated latency, persists the row to
+    /// `dry_run_orders`, and publishes the standard `event.order.placed`
+    /// event. Risk-gate validation has already run in `placeOrder()`.
+    fn placeDryRunOrder(
+        self: *OrderManager,
+        market_id: []const u8,
+        side: []const u8,
+        size: []const u8,
+        price: []const u8,
+        order_type: []const u8,
+        strategy_origin: ?[]const u8,
+    ) OrderResult {
+        const submit_ts_ns = std.time.nanoTimestamp();
+
+        // Synthetic order id: `dry-<ms>-<rand>`. The `dry-` prefix is the
+        // signal used by tests and downstream code to distinguish simulated
+        // ids from live HL `cex-` ids.
+        var id_buf: [64]u8 = undefined;
+        const dry_id = std.fmt.bufPrint(&id_buf, "dry-{d}-{x}", .{
+            std.time.milliTimestamp(),
+            std.crypto.random.int(u32),
+        }) catch "dry-unknown";
+
+        // Simulate API latency before recording the placement so that the
+        // ack timestamp / `simulated_latency_ms` reflect the real wait.
+        const latency_ms = self.simulateDryRunLatency();
+        const ack_ts_ns = std.time.nanoTimestamp();
+
+        // Parse string price/size into the f64 columns the dry_run_orders
+        // schema expects. Failures fall back to 0 — the row still records
+        // intent so the operator can see what happened.
+        const price_f64: f64 = std.fmt.parseFloat(f64, price) catch 0.0;
+        const size_f64: f64 = std.fmt.parseFloat(f64, size) catch 0.0;
+
+        const strategy_name: []const u8 = strategy_origin orelse "manual";
+
+        self.database.insertDryRunOrder(
+            dry_id,
+            market_id,
+            strategy_name,
+            side,
+            price_f64,
+            size_f64,
+        ) catch |e| {
+            log.err("order_mgr", "dry-run insert failed for {s}: {s}", .{ dry_id, @errorName(e) });
+            return .{ .failed = .{ .reason = "db_error" } };
+        };
+
+        log.info("order_mgr", "dry-run order placed: {s} {s} {s} {s}@{s} latency={d}ms submit_ts_ns={d} ack_ts_ns={d}", .{
+            dry_id, market_id, side, size, price, latency_ms, submit_ts_ns, ack_ts_ns,
+        });
+
+        // Mirror the live event so dashboards / IPC consumers see no
+        // difference between dry-run and live placements.
+        const evt_payload = blk: {
+            const payload = std.json.Stringify.valueAlloc(self.allocator, .{
+                .order_id = dry_id,
+                .market_id = market_id,
+                .side = side,
+                .size = size,
+                .price = price,
+                .order_type = order_type,
+                .dry_run = true,
+                .simulated_latency_ms = latency_ms,
+            }, .{}) catch |e| {
+                log.err("order_mgr", "failed to stringify event_order_placed: {s}", .{@errorName(e)});
+                break :blk null;
+            };
+            break :blk payload;
+        };
+        if (evt_payload) |payload| {
+            defer self.allocator.free(payload);
+            ipc.publishEvent(ipc_types.T.event_order_placed, payload);
+        }
+
+        const id_owned = self.allocator.dupe(u8, dry_id) catch {
+            log.err("order_mgr", "failed to allocate dry-run order_id result", .{});
+            return .{ .failed = .{ .reason = "oom" } };
+        };
+        return .{ .success = .{ .order_id = id_owned } };
+    }
+
+    /// Phase 4: dry-run cancellation. Looks up the row in `dry_run_orders`,
+    /// updates `status='cancelled'` if it is still open, and publishes the
+    /// usual `event.order.cancelled`. Idempotent for already-cancelled rows.
+    fn cancelDryRunOrder(self: *OrderManager, order_id: []const u8) bool {
+        // Read current status so we can short-circuit on filled/cancelled.
+        var current_status_buf: [32]u8 = undefined;
+        var current_status_len: usize = 0;
+        {
+            const sql = "SELECT status FROM dry_run_orders WHERE id=? LIMIT 1;" ++ &[_:0]u8{};
+            var stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+                log.err("order_mgr", "dry-run cancel: prepare status query failed for {s}", .{order_id});
+                return false;
+            }
+            defer _ = c.sqlite3_finalize(stmt);
+
+            if (c.sqlite3_bind_text(stmt, 1, order_id.ptr, @intCast(order_id.len), null) != c.SQLITE_OK) {
+                log.err("order_mgr", "dry-run cancel: bind id failed for {s}", .{order_id});
+                return false;
+            }
+
+            switch (c.sqlite3_step(stmt)) {
+                c.SQLITE_ROW => {
+                    if (c.sqlite3_column_text(stmt, 0)) |p| {
+                        const s = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+                        const n = @min(s.len, current_status_buf.len);
+                        @memcpy(current_status_buf[0..n], s[0..n]);
+                        current_status_len = n;
+                    }
+                },
+                else => {
+                    log.warn("order_mgr", "dry-run cancel: order {s} not found", .{order_id});
+                    return false;
+                },
+            }
+        }
+
+        const current_status = current_status_buf[0..current_status_len];
+
+        // Already-filled rows mirror live HL behaviour: returning true
+        // matches AC-009-2 ("If already filled, no error").
+        if (std.mem.eql(u8, current_status, "filled")) {
+            log.info("order_mgr", "dry-run cancel ignored, order already filled: {s}", .{order_id});
+            return true;
+        }
+        // Idempotent: cancelling an already-cancelled row is a no-op.
+        if (std.mem.eql(u8, current_status, "cancelled") or std.mem.eql(u8, current_status, "expired")) {
+            log.info("order_mgr", "dry-run cancel ignored, order status={s}: {s}", .{ current_status, order_id });
+            return false;
+        }
+
+        self.database.updateDryRunOrderStatus(order_id, "cancelled") catch |e| {
+            log.err("order_mgr", "dry-run cancel: status update failed for {s}: {s}", .{ order_id, @errorName(e) });
+            return false;
+        };
+
+        log.info("order_mgr", "dry-run order cancelled: {s}", .{order_id});
+
+        var cancel_evt_buf: [256]u8 = undefined;
+        const cancel_evt_payload = std.fmt.bufPrint(
+            &cancel_evt_buf,
+            "{{\"order_id\":\"{s}\",\"dry_run\":true}}",
+            .{order_id},
+        ) catch "{}";
+        ipc.publishEvent(ipc_types.T.event_order_cancelled, cancel_evt_payload);
+        return true;
     }
 
     /// Submit a signed HL order to `${api_base}/exchange` with retries.

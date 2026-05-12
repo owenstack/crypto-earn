@@ -156,8 +156,27 @@ pub fn main() !void {
         log.warn("engine", "HL signing disabled (dry_run={any}); orders will not be submitted to /exchange", .{dry_run_env});
     }
 
-    // Order manager config (Phase 2 wires HL signing into the submit path).
-    const om_config = order_mgr.OrderManagerConfig{ .hl = hl_config };
+    // Phase 4: read the dry-run initial balance early so we can plumb it
+    // into the OrderManager config (used by simulated balance / telemetry).
+    const dry_run_initial_balance_env: f64 = if (std.posix.getenv("DRY_RUN_INITIAL_BALANCE")) |v|
+        std.fmt.parseFloat(f64, v) catch 10.0
+    else
+        10.0;
+
+    if (dry_run_env) {
+        log.info("engine", "DRY_RUN mode: enabled, initial balance: ${d:.2}", .{dry_run_initial_balance_env});
+    } else {
+        log.info("engine", "DRY_RUN mode: disabled (live order submission)", .{});
+    }
+
+    // Order manager config. Phase 2 wired HL signing into the submit path;
+    // Phase 4 wires DRY_RUN here so dry-run interception happens centrally
+    // in placeOrder/cancelOrder (not bypassing the shared risk gate).
+    const om_config = order_mgr.OrderManagerConfig{
+        .hl = hl_config,
+        .dry_run_enabled = dry_run_env,
+        .dry_run_initial_balance = dry_run_initial_balance_env,
+    };
 
     // Initialize order manager
     var om = order_mgr.OrderManager.init(allocator, &database, risk_config, om_config);
@@ -691,33 +710,18 @@ fn updateDryRunBalance(ctx: *StrategyWorkerCtx) void {
 }
 
 fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
+    // Phase 4: dry-run signal analytics. Persist every emitted signal to
+    // `dry_run_signals` so analyzeDryRunSignals (paper P&L) keeps working.
+    // The actual order persistence happens inside `OrderManager.placeOrder`
+    // via the shared risk-gate path (AC-016-4).
     if (ctx.dry_run) {
         const dr_market_id = signal.market_id[0..signal.market_id_len];
         const dr_side: []const u8 = if (signal.direction == .buy) "buy" else "sell";
-
-        // Use bid/ask from the signal to avoid re-querying (values may drift between reads)
         const dr_bid: ?f64 = if (signal.best_bid > 0) signal.best_bid else null;
         const dr_ask: ?f64 = if (signal.best_ask > 0) signal.best_ask else null;
-
         const dr_mid = if (dr_bid != null and dr_ask != null) (dr_bid.? + dr_ask.?) / 2.0 else signal.price;
         const dr_delta = @abs(signal.price - dr_mid);
 
-        // Generate a deterministic-ish fake order ID
-        var id_buf: [64]u8 = undefined;
-        const id_market_slice = dr_market_id[0..@min(dr_market_id.len, 8)];
-        const dr_order_id = std.fmt.bufPrint(&id_buf, "dry-{s}-{d}", .{ id_market_slice, std.time.milliTimestamp() }) catch "dry-unknown";
-
-        log.info("dry_run", "[{s}] {s} {s} x{d:.2} @ {d:.4} | conf={d:.2} delta={d:.4}", .{
-            dr_order_id[0..@min(dr_order_id.len, 24)],
-            dr_side,
-            id_market_slice,
-            signal.size,
-            signal.price,
-            signal.confidence,
-            dr_delta,
-        });
-
-        // Existing analytics table (keeps backwards-compat for analyzeDryRunSignals).
         ctx.database.insertDryRunSignal(
             dr_market_id,
             @tagName(signal.strategy),
@@ -732,20 +736,6 @@ fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
         ) catch |e| {
             log.err("dry_run", "failed to persist dry-run signal: {s}", .{@errorName(e)});
         };
-
-        // New: lifecycle order tracking. simulateDryRunFills will settle these
-        // against live orderbook prices in the strategy worker loop.
-        ctx.database.insertDryRunOrder(
-            dr_order_id,
-            dr_market_id,
-            @tagName(signal.strategy),
-            dr_side,
-            signal.price,
-            signal.size,
-        ) catch |e| {
-            log.err("dry_run", "failed to insert dry_run_order: {s}", .{@errorName(e)});
-        };
-        return;
     }
 
     // Saturation gate: if we're at max open orders or have already committed
@@ -865,10 +855,52 @@ fn shouldSkipForMaxPosition(ctx: *StrategyWorkerCtx, market_id: []const u8, side
 /// so a fill on one cancels the other (handled in fill_poller). Falls back
 /// to dispatchSignal individually for dry-run.
 fn dispatchLpPair(ctx: *StrategyWorkerCtx, buy_signal: strategy.Signal, sell_signal: strategy.Signal) void {
+    // Phase 4: dry-run takes the same pair preflight + per-leg placeOrder
+    // path as live so the shared risk gate (AC-016-4) and pair-atomicity
+    // semantics apply. Per-leg dry-run interception happens inside
+    // OrderManager.placeOrder. Analytics signals are recorded by
+    // dispatchSignal — call it through the buy/sell legs below as needed.
     if (ctx.dry_run) {
-        dispatchSignal(ctx, buy_signal);
-        dispatchSignal(ctx, sell_signal);
-        return;
+        // Persist analytics for both legs (dispatchSignal would do this if
+        // called directly; we keep paired semantics through placeOrder so
+        // mark each leg here without dispatching).
+        const dr_buy_market_id = buy_signal.market_id[0..buy_signal.market_id_len];
+        const dr_sell_market_id = sell_signal.market_id[0..sell_signal.market_id_len];
+        const buy_bid: ?f64 = if (buy_signal.best_bid > 0) buy_signal.best_bid else null;
+        const buy_ask: ?f64 = if (buy_signal.best_ask > 0) buy_signal.best_ask else null;
+        const sell_bid: ?f64 = if (sell_signal.best_bid > 0) sell_signal.best_bid else null;
+        const sell_ask: ?f64 = if (sell_signal.best_ask > 0) sell_signal.best_ask else null;
+        const buy_mid = if (buy_bid != null and buy_ask != null) (buy_bid.? + buy_ask.?) / 2.0 else buy_signal.price;
+        const sell_mid = if (sell_bid != null and sell_ask != null) (sell_bid.? + sell_ask.?) / 2.0 else sell_signal.price;
+        ctx.database.insertDryRunSignal(
+            dr_buy_market_id,
+            @tagName(buy_signal.strategy),
+            "buy",
+            buy_signal.price,
+            buy_signal.size,
+            @abs(buy_signal.price - buy_mid),
+            buy_signal.confidence,
+            buy_signal.timestamp,
+            buy_bid,
+            buy_ask,
+        ) catch |e| {
+            log.err("dry_run", "failed to persist dry-run signal (lp_pair buy): {s}", .{@errorName(e)});
+        };
+        ctx.database.insertDryRunSignal(
+            dr_sell_market_id,
+            @tagName(sell_signal.strategy),
+            "sell",
+            sell_signal.price,
+            sell_signal.size,
+            @abs(sell_signal.price - sell_mid),
+            sell_signal.confidence,
+            sell_signal.timestamp,
+            sell_bid,
+            sell_ask,
+        ) catch |e| {
+            log.err("dry_run", "failed to persist dry-run signal (lp_pair sell): {s}", .{@errorName(e)});
+        };
+        // Fall through to the shared pair preflight + placeOrder path.
     }
 
     if (ctx.om.isHalted()) return;
