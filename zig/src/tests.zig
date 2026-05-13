@@ -21,6 +21,102 @@ const hl_market_meta = @import("hl_market_meta.zig");
 const hl_orderbook = @import("hl_orderbook.zig");
 const binance_ws = @import("binance_ws.zig");
 
+// Hyperliquid Phase 5 modules — register so inline tests run with the suite.
+const hl_fill_poller = @import("hl_fill_poller.zig");
+const hl_portfolio_tracker = @import("hl_portfolio_tracker.zig");
+
+// ─── Phase 5: migration 013 schema verification ─────────────────────────────
+
+fn migration013HasColumn(database: *db.DB, table: [:0]const u8, column: []const u8) bool {
+    var sql_buf: [256]u8 = undefined;
+    const sql = std.fmt.bufPrintZ(&sql_buf, "PRAGMA table_info({s});", .{table}) catch return false;
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    if (db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) != db.c.SQLITE_OK) return false;
+    defer _ = db.c.sqlite3_finalize(stmt);
+    while (db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW) {
+        const name_raw = db.c.sqlite3_column_text(stmt, 1);
+        if (name_raw) |p| {
+            const name = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+            if (std.mem.eql(u8, name, column)) return true;
+        }
+    }
+    return false;
+}
+
+fn migration013TableExists(database: *db.DB, table: []const u8) bool {
+    const sql = "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1;" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    if (db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) != db.c.SQLITE_OK) return false;
+    defer _ = db.c.sqlite3_finalize(stmt);
+    _ = db.c.sqlite3_bind_text(stmt, 1, table.ptr, @intCast(table.len), null);
+    return db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW;
+}
+
+test "migration 013: positions table has HL columns" {
+    var database = try db.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    try testing.expect(migration013HasColumn(&database, "positions", "mark_price"));
+    try testing.expect(migration013HasColumn(&database, "positions", "funding_accrued"));
+    try testing.expect(migration013HasColumn(&database, "positions", "leverage"));
+    try testing.expect(migration013HasColumn(&database, "positions", "funding_index"));
+}
+
+test "migration 013: orders table has asset_index + reduce_only" {
+    var database = try db.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    try testing.expect(migration013HasColumn(&database, "orders", "asset_index"));
+    try testing.expect(migration013HasColumn(&database, "orders", "reduce_only"));
+}
+
+test "migration 013: dry_run_orders has funding_charge + simulated_slippage" {
+    var database = try db.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    try testing.expect(migration013HasColumn(&database, "dry_run_orders", "funding_charge"));
+    try testing.expect(migration013HasColumn(&database, "dry_run_orders", "simulated_slippage"));
+}
+
+test "migration 013: funding_snapshots and arb_events tables exist" {
+    var database = try db.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    try testing.expect(migration013TableExists(&database, "funding_snapshots"));
+    try testing.expect(migration013TableExists(&database, "arb_events"));
+}
+
+test "migration 013: schema_migrations records version 13" {
+    var database = try db.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expectEqual(db.c.SQLITE_OK, db.c.sqlite3_prepare_v2(
+        database.handle,
+        "SELECT 1 FROM schema_migrations WHERE version=13;",
+        -1,
+        &stmt,
+        null,
+    ));
+    defer _ = db.c.sqlite3_finalize(stmt);
+    try testing.expectEqual(db.c.SQLITE_ROW, db.c.sqlite3_step(stmt));
+}
+
+test "ipc_types: Phase 5 message type strings are correct" {
+    try testing.expectEqualStrings("funding.snapshot", ipc_types.T.funding_snapshot);
+    try testing.expectEqualStrings("funding.snapshot.response", ipc_types.T.funding_snapshot_response);
+    try testing.expectEqualStrings("arb.events", ipc_types.T.arb_events);
+    try testing.expectEqualStrings("arb.events.response", ipc_types.T.arb_events_response);
+    try testing.expectEqualStrings("event.portfolio.updated", ipc_types.T.event_portfolio_updated);
+    try testing.expectEqualStrings("event.portfolio.stale", ipc_types.T.event_portfolio_stale);
+    try testing.expectEqualStrings("event.arb.triggered", ipc_types.T.event_arb_triggered);
+}
+
 // ─── Logger tests ───────────────────────────────────────────────────────────
 
 test "logger: init sets start time and uptimeMs returns non-negative" {

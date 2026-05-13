@@ -130,6 +130,35 @@ const MIGRATION_011 =
     \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(11);
 ;
 
+/// Embedded Phase-5 migration: HL portfolio + fill detection schema.
+/// Adds HL margin/funding columns to positions, asset_index/reduce_only to
+/// orders, dry-run telemetry columns, and creates funding_snapshots and
+/// arb_events tables. ALTER TABLE statements are run separately in
+/// runMigrations so duplicate-column errors are tolerated.
+const MIGRATION_013 =
+    \\CREATE TABLE IF NOT EXISTS funding_snapshots(
+    \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+    \\  asset TEXT NOT NULL,
+    \\  rate REAL NOT NULL,
+    \\  next_payment_ts INTEGER NOT NULL,
+    \\  recorded_at INTEGER NOT NULL DEFAULT(unixepoch())
+    \\);
+    \\CREATE INDEX IF NOT EXISTS idx_funding_snapshots_asset_ts ON funding_snapshots(asset, recorded_at DESC);
+    \\CREATE TABLE IF NOT EXISTS arb_events(
+    \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+    \\  asset TEXT NOT NULL,
+    \\  binance_mid REAL NOT NULL,
+    \\  hl_mid REAL NOT NULL,
+    \\  delta_bps REAL NOT NULL,
+    \\  order_id TEXT,
+    \\  realised_pnl REAL,
+    \\  submit_ns INTEGER,
+    \\  fill_ns INTEGER,
+    \\  created_at INTEGER NOT NULL DEFAULT(unixepoch())
+    \\);
+    \\CREATE INDEX IF NOT EXISTS idx_arb_events_asset_ts ON arb_events(asset, created_at DESC);
+;
+
 /// Embedded Phase-3 migration: HL market metadata + Binance feed persistence.
 /// ALTER TABLE on markets/orderbooks runs separately (column-exists checks).
 /// orderbooks is created here when missing (legacy code constructed it at
@@ -238,6 +267,9 @@ pub const DB = struct {
             .{ .sql = "DELETE FROM logs WHERE created_at < unixepoch() - 86400;", .label = "logs" },
             // Dry-run signals: keep 3 days.
             .{ .sql = "DELETE FROM dry_run_signals WHERE created_at < unixepoch() - 3*86400;", .label = "dry_run_signals" },
+            // HL funding rate snapshots + arb telemetry: keep 7 days.
+            .{ .sql = "DELETE FROM funding_snapshots WHERE recorded_at < unixepoch() - 7*86400;", .label = "funding_snapshots" },
+            .{ .sql = "DELETE FROM arb_events WHERE created_at < unixepoch() - 7*86400;", .label = "arb_events" },
             // Closed orders > 30 days: archive by deletion. Open orders are
             // never deleted regardless of age.
             .{ .sql = "DELETE FROM orders WHERE status IN ('cancelled','rejected','filled') AND updated_at < unixepoch() - 30*86400;", .label = "orders_closed" },
@@ -461,6 +493,39 @@ pub const DB = struct {
             }
             // Mark migration as applied only after all ALTERs succeed.
             try self.execZ("INSERT OR IGNORE INTO schema_migrations(version)VALUES(12);" ++ &[_:0]u8{});
+        }
+        // Migration 013 — Phase 5 HL portfolio + fill detection schema.
+        // Creates funding_snapshots + arb_events; adds HL margin/funding
+        // columns to positions, asset_index/reduce_only to orders, and
+        // funding_charge/simulated_slippage to dry_run_orders.
+        if (!self.migrationApplied(13)) {
+            log.info("db", "applying migration 013", .{});
+            try self.execZ(MIGRATION_013 ++ &[_:0]u8{});
+            const m013_alters = [_][:0]const u8{
+                "ALTER TABLE positions ADD COLUMN mark_price REAL DEFAULT 0.0;",
+                "ALTER TABLE positions ADD COLUMN funding_accrued REAL DEFAULT 0.0;",
+                "ALTER TABLE positions ADD COLUMN leverage INTEGER DEFAULT 1;",
+                "ALTER TABLE positions ADD COLUMN funding_index REAL DEFAULT 0.0;",
+                "ALTER TABLE orders ADD COLUMN asset_index INTEGER DEFAULT -1;",
+                "ALTER TABLE orders ADD COLUMN reduce_only INTEGER DEFAULT 0;",
+                "ALTER TABLE dry_run_orders ADD COLUMN funding_charge REAL DEFAULT 0.0;",
+                "ALTER TABLE dry_run_orders ADD COLUMN simulated_slippage REAL DEFAULT 0.0;",
+            };
+            for (m013_alters) |sql| {
+                self.execZ(sql) catch |err| {
+                    const sqlite_err = std.mem.span(c.sqlite3_errmsg(self.handle));
+                    const duplicate_col = std.mem.indexOf(u8, sqlite_err, "duplicate column name") != null;
+                    const no_table = std.mem.indexOf(u8, sqlite_err, "no such table") != null;
+                    if (err == error.DBExecFailed and (duplicate_col or no_table)) {
+                        log.info("db", "migration 013: skipping alter (column exists or table missing): {s}", .{sql});
+                        continue;
+                    } else {
+                        log.err("db", "migration 013 ALTER TABLE failed: zig_err={s} sqlite_err={s} sql={s}", .{ @errorName(err), sqlite_err, sql });
+                        return err;
+                    }
+                };
+            }
+            try self.execZ("INSERT OR IGNORE INTO schema_migrations(version)VALUES(13);" ++ &[_:0]u8{});
         }
         log.info("db", "migrations complete", .{});
     }

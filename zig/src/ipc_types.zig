@@ -100,6 +100,15 @@ pub const T = struct {
     // Dry-run analysis
     pub const dry_run_analysis = "dry_run.analysis";
     pub const dry_run_analysis_response = "dry_run.analysis.response";
+
+    // Phase 5: HL portfolio + funding + arb telemetry.
+    pub const funding_snapshot = "funding.snapshot";
+    pub const funding_snapshot_response = "funding.snapshot.response";
+    pub const event_portfolio_updated = "event.portfolio.updated";
+    pub const event_portfolio_stale = "event.portfolio.stale";
+    pub const arb_events = "arb.events";
+    pub const arb_events_response = "arb.events.response";
+    pub const event_arb_triggered = "event.arb.triggered";
 };
 
 /// Write a complete JSON-lines response envelope to `writer`.

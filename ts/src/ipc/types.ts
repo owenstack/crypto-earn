@@ -27,7 +27,9 @@ export type RequestMessageType =
   | "dry_run.analysis"
   | "reconcile.status"
   | "config.validate"
-  | "kalshi.mappings";
+  | "kalshi.mappings"
+  | "funding.snapshot"
+  | "arb.events";
 
 export type ResponseMessageType =
   | "heartbeat.response"
@@ -61,7 +63,9 @@ export type ResponseMessageType =
   | "dry_run.analysis.response"
   | "reconcile.status.response"
   | "config.validate.response"
-  | "kalshi.mappings.response";
+  | "kalshi.mappings.response"
+  | "funding.snapshot.response"
+  | "arb.events.response";
 
 export type EventMessageType =
   | "event.order.placed"
@@ -71,6 +75,9 @@ export type EventMessageType =
   | "event.order.rejected"
   | "event.risk.rejection"
   | "event.engine.halted" | "event.engine.resumed" | "event.engine.saturated" | "event.engine.capacity_restored"
+  | "event.portfolio.updated"
+  | "event.portfolio.stale"
+  | "event.arb.triggered";
 export interface EngineStateEventPayload {
   status: "halted" | "resumed" | "saturated" | "capacity_restored";
   cancelled_orders?: number;
@@ -97,10 +104,76 @@ export interface PortfolioPayload  {
   open_orders_exposure_usd?: string;
   /** total_exposure_usd + open_orders_exposure_usd. */
   committed_capital_usd?: string;
-  unrealized_pnl?: string;
+  unrealized_pnl?: string | number;
   realized_pnl_today?: string;
+  /**
+   * @deprecated Phase 5 replaced this with `equity` for HL parity. The
+   * Polymarket-era field is retained on the type for backwards compatibility
+   * with older snapshots only; new payloads will not populate it.
+   */
   usdc_balance?: string;
+  /** Phase 5: HL account value from `clearinghouseState.marginSummary.accountValue`. */
+  equity?: number;
+  /** Phase 5: HL margin used in absolute units. */
+  margin_used?: number;
+  /** Phase 5: percentage of equity currently in use as margin. */
+  margin_used_pct?: number;
+  /** Phase 5: cumulative funding charged across all open positions. */
+  funding_accrued?: number;
+  /** Phase 5: unix epoch (s) when the snapshot was last refreshed. */
+  snapshot_ts?: number;
   error?: string;
+}
+
+/** Phase 5: per-position payload used inside PortfolioPayload.positions. */
+export interface HlPositionPayload {
+  asset: string;
+  side: "long" | "short";
+  size: number;
+  entry_price: number;
+  mark_price: number;
+  unrealized_pnl: number;
+  funding_accrued: number;
+  leverage: number;
+}
+
+/** Phase 5: response payload for `funding.snapshot`. */
+export interface FundingSnapshotPayload {
+  funding: Array<{
+    asset: string;
+    rate: number;
+    next_payment_ts: number;
+    recorded_at: number;
+  }>;
+}
+
+/** Phase 5: response payload for `arb.events`. */
+export interface ArbEventPayload {
+  events: Array<{
+    asset: string;
+    binance_mid: number;
+    hl_mid: number;
+    delta_bps: number;
+    order_id: string;
+    realised_pnl: number;
+    submit_ns: number;
+    fill_ns: number;
+    created_at: number;
+  }>;
+}
+
+/** Phase 5: pushed when the portfolio tracker refreshes its snapshot. */
+export interface PortfolioUpdatedEventPayload {
+  equity: number;
+  margin_used_pct: number;
+  position_count: number;
+  snapshot_ts: number;
+}
+
+/** Phase 5: pushed when the portfolio poll has failed N times in a row. */
+export interface PortfolioStaleEventPayload {
+  reason: string;
+  last_success_ts: number;
 }
 export interface OrdersPayload     {
   orders: unknown[];

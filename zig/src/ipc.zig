@@ -171,6 +171,8 @@ const DispatchKind = enum {
     reconcile_status,
     inventory_snapshot,
     dry_run_analysis,
+    funding_snapshot,
+    arb_events,
 };
 
 const DispatchEntry = struct {
@@ -203,6 +205,8 @@ const DISPATCH_TABLE = [_]DispatchEntry{
     .{ .msg_type = types.T.kalshi_mappings, .kind = .kalshi_mappings },
     .{ .msg_type = types.T.inventory_snapshot, .kind = .inventory_snapshot },
     .{ .msg_type = types.T.dry_run_analysis, .kind = .dry_run_analysis },
+    .{ .msg_type = types.T.funding_snapshot, .kind = .funding_snapshot },
+    .{ .msg_type = types.T.arb_events, .kind = .arb_events },
 };
 
 fn resolveDispatchKind(msg_type: []const u8) ?DispatchKind {
@@ -292,6 +296,8 @@ fn dispatch(ctx: *Context, line: []const u8, writer: anytype, stream: std.net.St
         .kalshi_mappings => try handleKalshiMappings(ctx, req_id, writer),
         .inventory_snapshot => try handleInventorySnapshot(ctx, req_id, writer),
         .dry_run_analysis => try handleDryRunAnalysis(ctx, req_id, writer),
+        .funding_snapshot => try handleFundingSnapshot(ctx, req_id, writer),
+        .arb_events => try handleArbEvents(ctx, req_id, writer),
     }
 }
 
@@ -704,4 +710,108 @@ fn handleDryRunAnalysis(ctx: *Context, req_id: []const u8, writer: anytype) !voi
         return;
     };
     try types.writeResponse(writer, req_id, types.T.dry_run_analysis_response, result);
+}
+
+/// Phase 5: query the last 24h of funding rate snapshots, grouped per asset
+/// (latest row per asset). Returns `{"funding":[...]}`.
+fn handleFundingSnapshot(ctx: *Context, req_id: []const u8, writer: anytype) !void {
+    var buf: [8192]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const w = fbs.writer();
+    w.writeAll("{\"funding\":[") catch {
+        try types.writeError(writer, req_id, "funding payload write failed");
+        return;
+    };
+
+    const sql =
+        "SELECT asset, rate, next_payment_ts, recorded_at FROM funding_snapshots " ++
+        "WHERE recorded_at >= unixepoch() - 86400 " ++
+        "AND id IN (SELECT MAX(id) FROM funding_snapshots GROUP BY asset) " ++
+        "ORDER BY asset ASC;" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    const rc = db.c.sqlite3_prepare_v2(ctx.database.handle, sql.ptr, -1, &stmt, null);
+    if (rc != db.c.SQLITE_OK) {
+        // Table may not exist on a freshly-migrated dry-run DB; return empty.
+        log.warn("ipc", "funding query prepare failed: rc={d}", .{rc});
+        w.writeAll("]}") catch {};
+        try types.writeResponse(writer, req_id, types.T.funding_snapshot_response, fbs.getWritten());
+        return;
+    }
+    defer _ = db.c.sqlite3_finalize(stmt);
+
+    var first = true;
+    while (db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW) {
+        const asset_raw = db.c.sqlite3_column_text(stmt, 0);
+        const asset_ptr: [*c]const u8 = @ptrCast(asset_raw orelse @as([*c]const u8, ""));
+        const asset = std.mem.span(asset_ptr);
+        const rate = db.c.sqlite3_column_double(stmt, 1);
+        const next_ts = db.c.sqlite3_column_int64(stmt, 2);
+        const rec_at = db.c.sqlite3_column_int64(stmt, 3);
+
+        if (!first) w.writeByte(',') catch break;
+        first = false;
+        w.print(
+            "{{\"asset\":\"{s}\",\"rate\":{d:.10},\"next_payment_ts\":{d},\"recorded_at\":{d}}}",
+            .{ asset, rate, next_ts, rec_at },
+        ) catch break;
+    }
+    w.writeAll("]}") catch {};
+    try types.writeResponse(writer, req_id, types.T.funding_snapshot_response, fbs.getWritten());
+}
+
+/// Phase 5: return up to 100 recent arb events from the last 7 days.
+/// Phase 6 will populate this table; for now it may be empty.
+fn handleArbEvents(ctx: *Context, req_id: []const u8, writer: anytype) !void {
+    const sql =
+        "SELECT asset, binance_mid, hl_mid, delta_bps, " ++
+        "COALESCE(order_id,''), COALESCE(realised_pnl,0.0), " ++
+        "COALESCE(submit_ns,0), COALESCE(fill_ns,0), created_at " ++
+        "FROM arb_events WHERE created_at >= unixepoch() - 7*86400 " ++
+        "ORDER BY created_at DESC LIMIT 100;" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    const rc = db.c.sqlite3_prepare_v2(ctx.database.handle, sql.ptr, -1, &stmt, null);
+    if (rc != db.c.SQLITE_OK) {
+        log.warn("ipc", "arb query prepare failed: rc={d}", .{rc});
+        try types.writeResponse(writer, req_id, types.T.arb_events_response, "{\"events\":[]}");
+        return;
+    }
+    defer _ = db.c.sqlite3_finalize(stmt);
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(ctx.allocator);
+
+    const build_ok = blk: {
+        payload.appendSlice(ctx.allocator, "{\"events\":[") catch break :blk false;
+        const w = payload.writer(ctx.allocator);
+        var first = true;
+        while (db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW) {
+            const asset_ptr: [*c]const u8 = @ptrCast(db.c.sqlite3_column_text(stmt, 0) orelse @as([*c]const u8, ""));
+            const asset = std.mem.span(asset_ptr);
+            const binance_mid = db.c.sqlite3_column_double(stmt, 1);
+            const hl_mid = db.c.sqlite3_column_double(stmt, 2);
+            const delta_bps = db.c.sqlite3_column_double(stmt, 3);
+            const order_ptr: [*c]const u8 = @ptrCast(db.c.sqlite3_column_text(stmt, 4) orelse @as([*c]const u8, ""));
+            const order_id = std.mem.span(order_ptr);
+            const realised = db.c.sqlite3_column_double(stmt, 5);
+            const submit_ns = db.c.sqlite3_column_int64(stmt, 6);
+            const fill_ns = db.c.sqlite3_column_int64(stmt, 7);
+            const created_at = db.c.sqlite3_column_int64(stmt, 8);
+
+            if (!first) {
+                w.writeByte(',') catch break :blk false;
+            }
+            first = false;
+            w.print(
+                "{{\"asset\":\"{s}\",\"binance_mid\":{d:.6},\"hl_mid\":{d:.6},\"delta_bps\":{d:.4},\"order_id\":\"{s}\",\"realised_pnl\":{d:.6},\"submit_ns\":{d},\"fill_ns\":{d},\"created_at\":{d}}}",
+                .{ asset, binance_mid, hl_mid, delta_bps, order_id, realised, submit_ns, fill_ns, created_at },
+            ) catch break :blk false;
+        }
+        w.writeAll("]}") catch break :blk false;
+        break :blk true;
+    };
+    if (!build_ok) {
+        try types.writeError(writer, req_id, "arb payload write failed");
+        return;
+    }
+    try types.writeResponse(writer, req_id, types.T.arb_events_response, payload.items);
 }
