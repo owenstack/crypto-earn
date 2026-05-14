@@ -159,6 +159,41 @@ const MIGRATION_013 =
     \\CREATE INDEX IF NOT EXISTS idx_arb_events_asset_ts ON arb_events(asset, created_at DESC);
 ;
 
+/// Embedded Phase-7 migration: Hyperliquid schema overhaul on the markets
+/// table. Recreates the table without the Polymarket-specific columns
+/// (`condition_id`, `clob_token_ids`, `neg_risk`) and adds HL-specific
+/// columns (`asset_index INTEGER DEFAULT -1`, `base_asset TEXT DEFAULT ''`,
+/// `max_leverage INTEGER DEFAULT 20`). The shadow-table copy preserves
+/// existing rows and asset_index values from migration 012.
+const MIGRATION_014 =
+    \\BEGIN TRANSACTION;
+    \\CREATE TABLE IF NOT EXISTS markets_p7_new(
+    \\  id TEXT PRIMARY KEY,
+    \\  symbol TEXT NOT NULL,
+    \\  base TEXT NOT NULL,
+    \\  quote TEXT NOT NULL,
+    \\  status TEXT NOT NULL DEFAULT 'active',
+    \\  created_at INTEGER NOT NULL DEFAULT(unixepoch()),
+    \\  outcomes TEXT DEFAULT '[]',
+    \\  min_tick_size TEXT DEFAULT '0.01',
+    \\  asset_index INTEGER DEFAULT -1,
+    \\  base_asset TEXT DEFAULT '',
+    \\  max_leverage INTEGER DEFAULT 20
+    \\);
+    \\INSERT OR IGNORE INTO markets_p7_new(id,symbol,base,quote,status,created_at,outcomes,min_tick_size,asset_index,base_asset,max_leverage)
+    \\SELECT id,symbol,base,quote,status,created_at,
+    \\  COALESCE(outcomes,'[]'),
+    \\  COALESCE(min_tick_size,'0.01'),
+    \\  COALESCE(asset_index,-1),
+    \\  COALESCE(base,''),
+    \\  20
+    \\FROM markets;
+    \\DROP TABLE markets;
+    \\ALTER TABLE markets_p7_new RENAME TO markets;
+    \\COMMIT;
+    \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(14);
+;
+
 /// Embedded Phase-3 migration: HL market metadata + Binance feed persistence.
 /// ALTER TABLE on markets/orderbooks runs separately (column-exists checks).
 /// orderbooks is created here when missing (legacy code constructed it at
@@ -526,6 +561,19 @@ pub const DB = struct {
                 };
             }
             try self.execZ("INSERT OR IGNORE INTO schema_migrations(version)VALUES(13);" ++ &[_:0]u8{});
+        }
+        // Migration 014 — Phase 7 HL schema overhaul: recreate markets
+        // without Polymarket-specific columns; add HL-specific columns
+        // (asset_index DEFAULT -1, base_asset, max_leverage). The
+        // table-recreate transaction is run as a single execZ batch to
+        // preserve the BEGIN/COMMIT atomicity around the DROP/RENAME.
+        if (!self.migrationApplied(14)) {
+            log.info("db", "applying migration 014", .{});
+            self.execZ(MIGRATION_014 ++ &[_:0]u8{}) catch |err| {
+                const sqlite_err = std.mem.span(c.sqlite3_errmsg(self.handle));
+                log.err("db", "migration 014 markets recreate failed: zig_err={s} sqlite_err={s}", .{ @errorName(err), sqlite_err });
+                return err;
+            };
         }
         log.info("db", "migrations complete", .{});
     }
@@ -1977,6 +2025,111 @@ pub const DB = struct {
         }
 
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DBExecFailed;
+    }
+
+    /// Phase 7: persist a Hyperliquid funding-rate snapshot. `next_payment_ts`
+    /// is the unix-epoch second of the next funding settlement.
+    pub fn insertFundingSnapshot(
+        self: DB,
+        asset: []const u8,
+        rate: f64,
+        next_payment_ts: i64,
+    ) !void {
+        const sql = "INSERT INTO funding_snapshots(asset,rate,next_payment_ts) VALUES(?,?,?);" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare insertFundingSnapshot", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, asset.ptr, @intCast(asset.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 2, rate) != c.SQLITE_OK or
+            c.sqlite3_bind_int64(stmt, 3, next_payment_ts) != c.SQLITE_OK)
+        {
+            log.err("db", "failed to bind insertFundingSnapshot parameters", .{});
+            return error.DBExecFailed;
+        }
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
+            log.err("db", "failed to execute insertFundingSnapshot", .{});
+            return error.DBExecFailed;
+        }
+    }
+
+    /// Phase 7: in-memory representation of an arb_events row used by the
+    /// `queryArbEvents` helper. Strings are stored in fixed-size buffers so
+    /// callers can hold the result without arena/allocator bookkeeping.
+    pub const ArbEvent = struct {
+        asset_buf: [32]u8 = [_]u8{0} ** 32,
+        asset_len: usize = 0,
+        binance_mid: f64 = 0.0,
+        hl_mid: f64 = 0.0,
+        delta_bps: f64 = 0.0,
+        order_id_buf: [64]u8 = [_]u8{0} ** 64,
+        order_id_len: usize = 0,
+        realised_pnl: f64 = 0.0,
+        submit_ns: i64 = 0,
+        fill_ns: i64 = 0,
+        created_at: i64 = 0,
+
+        pub fn asset(self: *const ArbEvent) []const u8 {
+            return self.asset_buf[0..self.asset_len];
+        }
+        pub fn orderId(self: *const ArbEvent) []const u8 {
+            return self.order_id_buf[0..self.order_id_len];
+        }
+    };
+
+    /// Phase 7: read the most recent `limit` arb events ordered by
+    /// `created_at DESC`. Caller owns the returned slice and must free it
+    /// with the same allocator. Returned strings live in-row (no separate
+    /// allocations) so the slice is the only thing to free.
+    pub fn queryArbEvents(self: DB, alloc: std.mem.Allocator, limit: i32) ![]ArbEvent {
+        const sql =
+            "SELECT asset,binance_mid,hl_mid,delta_bps," ++
+            "COALESCE(order_id,''),COALESCE(realised_pnl,0.0)," ++
+            "COALESCE(submit_ns,0),COALESCE(fill_ns,0),created_at " ++
+            "FROM arb_events ORDER BY created_at DESC LIMIT ?;" ++ &[_:0]u8{};
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare queryArbEvents", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_int(stmt, 1, limit) != c.SQLITE_OK) return error.DBExecFailed;
+
+        var list: std.ArrayList(ArbEvent) = .empty;
+        errdefer list.deinit(alloc);
+
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            var row: ArbEvent = .{};
+            if (c.sqlite3_column_text(stmt, 0)) |p| {
+                const s = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+                const n = @min(s.len, row.asset_buf.len);
+                @memcpy(row.asset_buf[0..n], s[0..n]);
+                row.asset_len = n;
+            }
+            row.binance_mid = c.sqlite3_column_double(stmt, 1);
+            row.hl_mid = c.sqlite3_column_double(stmt, 2);
+            row.delta_bps = c.sqlite3_column_double(stmt, 3);
+            if (c.sqlite3_column_text(stmt, 4)) |p| {
+                const s = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+                const n = @min(s.len, row.order_id_buf.len);
+                @memcpy(row.order_id_buf[0..n], s[0..n]);
+                row.order_id_len = n;
+            }
+            row.realised_pnl = c.sqlite3_column_double(stmt, 5);
+            row.submit_ns = c.sqlite3_column_int64(stmt, 6);
+            row.fill_ns = c.sqlite3_column_int64(stmt, 7);
+            row.created_at = c.sqlite3_column_int64(stmt, 8);
+
+            try list.append(alloc, row);
+        }
+
+        return list.toOwnedSlice(alloc);
     }
 
     /// Phase 6: persist a CEX↔DEX arbitrage telemetry row to `arb_events`.

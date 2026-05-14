@@ -110,6 +110,121 @@ test "migration 013: schema_migrations records version 13" {
     try testing.expectEqual(db.c.SQLITE_ROW, db.c.sqlite3_step(stmt));
 }
 
+// ─── Phase 7: migration 014 schema verification ─────────────────────────────
+
+test "migration 014: markets table dropped Polymarket columns" {
+    var database = try db.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    // Polymarket columns must be gone after the table-recreate.
+    try testing.expect(!migration013HasColumn(&database, "markets", "condition_id"));
+    try testing.expect(!migration013HasColumn(&database, "markets", "clob_token_ids"));
+    try testing.expect(!migration013HasColumn(&database, "markets", "neg_risk"));
+}
+
+test "migration 014: markets table has HL columns with correct defaults" {
+    var database = try db.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    try testing.expect(migration013HasColumn(&database, "markets", "asset_index"));
+    try testing.expect(migration013HasColumn(&database, "markets", "base_asset"));
+    try testing.expect(migration013HasColumn(&database, "markets", "max_leverage"));
+
+    // Insert a row that omits the HL columns so we can verify their defaults.
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','BTC','BTC','USD');");
+
+    const sql = "SELECT asset_index,base_asset,max_leverage FROM markets WHERE id='m1';" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expectEqual(@as(c_int, db.c.SQLITE_OK), db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null));
+    defer _ = db.c.sqlite3_finalize(stmt);
+    try testing.expectEqual(@as(c_int, db.c.SQLITE_ROW), db.c.sqlite3_step(stmt));
+    try testing.expectEqual(@as(i64, -1), db.c.sqlite3_column_int64(stmt, 0));
+    const base_ptr = db.c.sqlite3_column_text(stmt, 1);
+    const base_asset = if (base_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+    try testing.expectEqualStrings("", base_asset);
+    try testing.expectEqual(@as(i64, 20), db.c.sqlite3_column_int64(stmt, 2));
+}
+
+test "migration 014: schema_migrations records version 14" {
+    var database = try db.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expectEqual(@as(c_int, db.c.SQLITE_OK), db.c.sqlite3_prepare_v2(
+        database.handle,
+        "SELECT 1 FROM schema_migrations WHERE version=14;",
+        -1,
+        &stmt,
+        null,
+    ));
+    defer _ = db.c.sqlite3_finalize(stmt);
+    try testing.expectEqual(@as(c_int, db.c.SQLITE_ROW), db.c.sqlite3_step(stmt));
+}
+
+test "db: insertFundingSnapshot writes funding_snapshots row" {
+    var database = try db.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    try database.insertFundingSnapshot("BTC", 0.000125, 1715000000);
+    try database.insertFundingSnapshot("ETH", -0.000050, 1715003600);
+
+    const sql = "SELECT asset,rate,next_payment_ts FROM funding_snapshots ORDER BY id ASC;" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expectEqual(@as(c_int, db.c.SQLITE_OK), db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null));
+    defer _ = db.c.sqlite3_finalize(stmt);
+
+    try testing.expectEqual(@as(c_int, db.c.SQLITE_ROW), db.c.sqlite3_step(stmt));
+    const a1_ptr = db.c.sqlite3_column_text(stmt, 0);
+    const a1 = if (a1_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+    try testing.expectEqualStrings("BTC", a1);
+    try testing.expectApproxEqAbs(@as(f64, 0.000125), db.c.sqlite3_column_double(stmt, 1), 1e-9);
+    try testing.expectEqual(@as(i64, 1715000000), db.c.sqlite3_column_int64(stmt, 2));
+
+    try testing.expectEqual(@as(c_int, db.c.SQLITE_ROW), db.c.sqlite3_step(stmt));
+    const a2_ptr = db.c.sqlite3_column_text(stmt, 0);
+    const a2 = if (a2_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+    try testing.expectEqualStrings("ETH", a2);
+}
+
+test "db: insertArbEvent + queryArbEvents round-trip" {
+    var database = try db.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    try database.insertArbEvent("BTC", 65000.10, 65000.45, 5.4, "ord-1");
+    try database.insertArbEvent("ETH", 3200.00, 3199.50, -1.6, null);
+
+    const events = try database.queryArbEvents(testing.allocator, 10);
+    defer testing.allocator.free(events);
+
+    try testing.expectEqual(@as(usize, 2), events.len);
+    // Most recent first (created_at DESC). Both inserts share the same
+    // unixepoch() second in tests, but rowid order resolves the tie:
+    // SQLite returns the higher rowid first only when created_at differs,
+    // so we just verify both assets are present and the strings round-trip
+    // correctly through the fixed-size buffers.
+    var saw_btc = false;
+    var saw_eth = false;
+    for (events) |ev| {
+        if (std.mem.eql(u8, ev.asset(), "BTC")) {
+            saw_btc = true;
+            try testing.expectApproxEqAbs(@as(f64, 65000.10), ev.binance_mid, 1e-6);
+            try testing.expectApproxEqAbs(@as(f64, 65000.45), ev.hl_mid, 1e-6);
+            try testing.expectApproxEqAbs(@as(f64, 5.4), ev.delta_bps, 1e-6);
+            try testing.expectEqualStrings("ord-1", ev.orderId());
+        } else if (std.mem.eql(u8, ev.asset(), "ETH")) {
+            saw_eth = true;
+            try testing.expectEqualStrings("", ev.orderId());
+        }
+    }
+    try testing.expect(saw_btc);
+    try testing.expect(saw_eth);
+}
+
 test "ipc_types: Phase 5 message type strings are correct" {
     try testing.expectEqualStrings("funding.snapshot", ipc_types.T.funding_snapshot);
     try testing.expectEqualStrings("funding.snapshot.response", ipc_types.T.funding_snapshot_response);
@@ -1640,20 +1755,20 @@ test "strategy_engine: paused state blocks signal generation" {
 }
 
 // ─── Phase 1B: Market registry slug-collision tests ─────────────────────────
+//
+// NOTE: The original slug-collision tests inserted Polymarket-specific
+// `condition_id` / `clob_token_ids` columns. Migration 014 (Phase 7)
+// recreated `markets` without those columns, so the tests below now assert
+// the same behaviour using only HL-friendly columns.
 
 test "market_registry: two markets with same slug but different IDs both survive" {
     var database = try openTempDb();
     defer database.close();
     try database.runMigrations();
 
-    // Ensure orderbooks table exists (needed for migration 006 index)
-    try database.execZ("CREATE TABLE IF NOT EXISTS orderbooks(id INTEGER PRIMARY KEY AUTOINCREMENT,market TEXT NOT NULL,asset_id TEXT NOT NULL,best_bid TEXT,best_ask TEXT,mid_price REAL,bids_json TEXT,asks_json TEXT,last_trade_price TEXT,tick_size TEXT,timestamp TEXT,created_at INTEGER NOT NULL DEFAULT(unixepoch()),gamma_id TEXT DEFAULT NULL);");
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote,status) VALUES('market-1','same-slug','Q1','USDC','active');");
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote,status) VALUES('market-2','same-slug','Q2','USDC','active');");
 
-    // Insert two markets with the same slug but different IDs
-    try database.execZ("INSERT INTO markets(id,symbol,base,quote,status,condition_id,clob_token_ids) VALUES('market-1','same-slug','Q1','USDC','active','cond-1','[\"tok1\"]');");
-    try database.execZ("INSERT INTO markets(id,symbol,base,quote,status,condition_id,clob_token_ids) VALUES('market-2','same-slug','Q2','USDC','active','cond-2','[\"tok2\"]');");
-
-    // Assert both rows survive
     const count_sql = "SELECT COUNT(*) FROM markets WHERE symbol='same-slug';" ++ &[_:0]u8{};
     var stmt: ?*db.c.sqlite3_stmt = null;
     try testing.expect(db.c.sqlite3_prepare_v2(database.handle, count_sql.ptr, -1, &stmt, null) == db.c.SQLITE_OK);
@@ -1667,18 +1782,14 @@ test "market_registry: re-insert existing market ID updates mutable fields witho
     defer database.close();
     try database.runMigrations();
 
-    try database.execZ("CREATE TABLE IF NOT EXISTS orderbooks(id INTEGER PRIMARY KEY AUTOINCREMENT,market TEXT NOT NULL,asset_id TEXT NOT NULL,best_bid TEXT,best_ask TEXT,mid_price REAL,bids_json TEXT,asks_json TEXT,last_trade_price TEXT,tick_size TEXT,timestamp TEXT,created_at INTEGER NOT NULL DEFAULT(unixepoch()),gamma_id TEXT DEFAULT NULL);");
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote,status) VALUES('m1','slug1','Q1','USDC','active');");
 
-    // Insert a market
-    try database.execZ("INSERT INTO markets(id,symbol,base,quote,status,condition_id,clob_token_ids) VALUES('m1','slug1','Q1','USDC','active','cond-1','[\"tok1\"]');");
+    // INSERT OR IGNORE should not create a duplicate.
+    try database.execZ("INSERT OR IGNORE INTO markets(id,symbol,base,quote,status) VALUES('m1','slug1','Q1','USDC','inactive');");
 
-    // INSERT OR IGNORE should not create a duplicate
-    try database.execZ("INSERT OR IGNORE INTO markets(id,symbol,base,quote,status,condition_id,clob_token_ids) VALUES('m1','slug1','Q1','USDC','inactive','cond-1','[\"tok1\",\"tok2\"]');");
+    // UPDATE mutable fields.
+    try database.execZ("UPDATE markets SET status='inactive' WHERE id='m1';");
 
-    // UPDATE mutable fields
-    try database.execZ("UPDATE markets SET status='inactive',clob_token_ids='[\"tok1\",\"tok2\"]' WHERE id='m1';");
-
-    // Assert only one row and fields are updated
     const count_sql = "SELECT COUNT(*) FROM markets WHERE id='m1';" ++ &[_:0]u8{};
     var count_stmt: ?*db.c.sqlite3_stmt = null;
     try testing.expect(db.c.sqlite3_prepare_v2(database.handle, count_sql.ptr, -1, &count_stmt, null) == db.c.SQLITE_OK);
@@ -1686,8 +1797,7 @@ test "market_registry: re-insert existing market ID updates mutable fields witho
     try testing.expect(db.c.sqlite3_step(count_stmt) == db.c.SQLITE_ROW);
     try testing.expectEqual(@as(c_int, 1), db.c.sqlite3_column_int(count_stmt, 0));
 
-    // Verify mutable fields updated
-    const val_sql = "SELECT status,clob_token_ids FROM markets WHERE id='m1';" ++ &[_:0]u8{};
+    const val_sql = "SELECT status FROM markets WHERE id='m1';" ++ &[_:0]u8{};
     var val_stmt: ?*db.c.sqlite3_stmt = null;
     try testing.expect(db.c.sqlite3_prepare_v2(database.handle, val_sql.ptr, -1, &val_stmt, null) == db.c.SQLITE_OK);
     defer _ = db.c.sqlite3_finalize(val_stmt);
@@ -1696,41 +1806,6 @@ test "market_registry: re-insert existing market ID updates mutable fields witho
     const status_ptr = db.c.sqlite3_column_text(val_stmt, 0);
     const status = if (status_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
     try testing.expectEqualStrings("inactive", status);
-
-    const tokens_ptr = db.c.sqlite3_column_text(val_stmt, 1);
-    const tokens = if (tokens_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
-    try testing.expectEqualStrings("[\"tok1\",\"tok2\"]", tokens);
-}
-
-// ─── Phase 1C: Identifier standardization tests ─────────────────────────────
-
-test "identifier: markets lookup by id only (no condition_id fallback)" {
-    var database = try openTempDb();
-    defer database.close();
-    try database.runMigrations();
-
-    try database.execZ("CREATE TABLE IF NOT EXISTS orderbooks(id INTEGER PRIMARY KEY AUTOINCREMENT,market TEXT NOT NULL,asset_id TEXT NOT NULL,best_bid TEXT,best_ask TEXT,mid_price REAL,bids_json TEXT,asks_json TEXT,last_trade_price TEXT,tick_size TEXT,timestamp TEXT,created_at INTEGER NOT NULL DEFAULT(unixepoch()),gamma_id TEXT DEFAULT NULL);");
-
-    // Insert a market with known Gamma id and clob_token_ids
-    try database.execZ("INSERT INTO markets(id,symbol,base,quote,status,condition_id,clob_token_ids) VALUES('gamma-123','test-slug','Q','USDC','active','cond-abc','[\"12345678901234567890\"]');");
-
-    // The new resolveTokenId query (WHERE id=?) should find by Gamma id
-    const sql_by_id = "SELECT clob_token_ids FROM markets WHERE id=? LIMIT 1;" ++ &[_:0]u8{};
-    var stmt1: ?*db.c.sqlite3_stmt = null;
-    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, sql_by_id.ptr, -1, &stmt1, null) == db.c.SQLITE_OK);
-    defer _ = db.c.sqlite3_finalize(stmt1);
-    _ = db.c.sqlite3_bind_text(stmt1, 1, "gamma-123", 9, null);
-    try testing.expect(db.c.sqlite3_step(stmt1) == db.c.SQLITE_ROW);
-    const tokens_ptr = db.c.sqlite3_column_text(stmt1, 0);
-    const tokens = if (tokens_ptr) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
-    try testing.expectEqualStrings("[\"12345678901234567890\"]", tokens);
-
-    // Looking up by condition_id using the same query should NOT find anything
-    var stmt2: ?*db.c.sqlite3_stmt = null;
-    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, sql_by_id.ptr, -1, &stmt2, null) == db.c.SQLITE_OK);
-    defer _ = db.c.sqlite3_finalize(stmt2);
-    _ = db.c.sqlite3_bind_text(stmt2, 1, "cond-abc", 8, null);
-    try testing.expect(db.c.sqlite3_step(stmt2) != db.c.SQLITE_ROW);
 }
 
 test "identifier: orderbooks gamma_id column stores resolved market id" {
