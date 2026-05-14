@@ -41,6 +41,17 @@ pub const RiskConfig = struct {
     /// from balance. Intentionally small (matches default order sizes) so the
     /// dynamic cap scales sensibly with account size.
     nominal_order_notional_usd: f64 = 0.75,
+
+    // --- Phase 6: margin-aware account-leverage cap. ---
+    /// Maximum (open_position_notional + new_order_notional) / equity
+    /// permitted by the risk gate when the engine has a usable balance
+    /// snapshot. Replaces the Polymarket duplicate-position guard for HL
+    /// margin trading where stacking longs/shorts on the same instrument is
+    /// allowed as long as the aggregate leverage stays within bounds.
+    /// 3.0 = the bot may keep up to 3x equity in open notional. With the
+    /// existing `max_balance_commitment_ratio` of 0.70 also gating new
+    /// orders, this is a conservative ceiling for low-leverage HL perps.
+    max_account_leverage: f64 = 3.0,
 };
 
 /// Resolved (absolute USD) limits. Computed from the current balance snapshot.
@@ -114,6 +125,10 @@ pub const RejectionReason = enum {
     duplicate_position,
     duplicate_open_order,
     balance_commitment_exceeded,
+    /// Phase 6: aggregate margin notional would exceed the configured
+    /// account leverage cap (open_position_notional + new_order_notional
+    /// > equity * max_account_leverage).
+    max_account_leverage_exceeded,
 };
 
 pub const ValidationResult = union(enum) {
@@ -213,6 +228,35 @@ pub fn validateOrder(request: OrderRequest, database: *db.DB, config: RiskConfig
                     .check_name = "max_balance_commitment_ratio",
                     .limit_value = balance_limit,
                     .actual_value = current_exposure + notional,
+                };
+                persistRejection(database, request, rejection);
+                return .{ .reject = rejection };
+            }
+        }
+    }
+
+    // Check 2c (Phase 6): Margin-aware account leverage cap.
+    // (open_position_notional + new_order_notional) <= equity * max_account_leverage
+    // Replaces the Polymarket duplicate-position guard for HL margin trading.
+    if (balance_opt) |usdc_balance| {
+        if (usdc_balance > 0 and config.max_account_leverage > 0) {
+            const open_position_notional = database.queryOpenPositionNotional() catch {
+                const rejection = Rejection{
+                    .reason = .db_error,
+                    .check_name = "db_query_open_position_notional_failed",
+                    .limit_value = 0.0,
+                    .actual_value = 0.0,
+                };
+                persistRejection(database, request, rejection);
+                return .{ .reject = rejection };
+            };
+            const margin_limit = usdc_balance * config.max_account_leverage;
+            if (open_position_notional + notional > margin_limit) {
+                const rejection = Rejection{
+                    .reason = .max_account_leverage_exceeded,
+                    .check_name = "max_account_leverage",
+                    .limit_value = margin_limit,
+                    .actual_value = open_position_notional + notional,
                 };
                 persistRejection(database, request, rejection);
                 return .{ .reject = rejection };
@@ -419,6 +463,29 @@ pub fn validatePairPreflight(
         }
     }
 
+    // Phase 6: margin-aware account leverage cap on the combined pair.
+    if (balance_opt) |usdc_balance| {
+        if (usdc_balance > 0 and config.max_account_leverage > 0) {
+            const open_position_notional = database.queryOpenPositionNotional() catch {
+                return .{ .reject = .{
+                    .reason = .db_error,
+                    .check_name = "pair_preflight_open_position_notional_failed",
+                    .limit_value = 0.0,
+                    .actual_value = 0.0,
+                } };
+            };
+            const margin_limit = usdc_balance * config.max_account_leverage;
+            if (open_position_notional + total_notional > margin_limit) {
+                return .{ .reject = .{
+                    .reason = .max_account_leverage_exceeded,
+                    .check_name = "pair_preflight_max_account_leverage",
+                    .limit_value = margin_limit,
+                    .actual_value = open_position_notional + total_notional,
+                } };
+            }
+        }
+    }
+
     const open_orders = database.queryOpenOrderCount() catch {
         return .{ .reject = .{
             .reason = .db_error,
@@ -457,6 +524,7 @@ pub fn rejectionReasonName(reason: RejectionReason) []const u8 {
         .duplicate_position => "DuplicatePosition",
         .duplicate_open_order => "DuplicateOpenOrder",
         .balance_commitment_exceeded => "BalanceCommitmentExceeded",
+        .max_account_leverage_exceeded => "MaxAccountLeverageExceeded",
     };
 }
 

@@ -25,6 +25,9 @@ const binance_ws = @import("binance_ws.zig");
 const hl_fill_poller = @import("hl_fill_poller.zig");
 const hl_portfolio_tracker = @import("hl_portfolio_tracker.zig");
 
+// Phase 6: register the cex_dex_arb module so any inline tests run with the suite.
+const cex_dex_arb = @import("cex_dex_arb.zig");
+
 // ─── Phase 5: migration 013 schema verification ─────────────────────────────
 
 fn migration013HasColumn(database: *db.DB, table: [:0]const u8, column: []const u8) bool {
@@ -998,7 +1001,7 @@ test "ipc_types: Phase 2 type constants exist" {
 test "strategy_engine: init defaults" {
     var se = strategy_engine.StrategyEngine.init(.{});
     try testing.expect(!se.isEnabled(.news_repricing));
-    try testing.expect(!se.isEnabled(.liquidity_provision));
+    try testing.expect(!se.isEnabled(.market_making));
     try testing.expectEqual(@as(u64, 0), se.news_stats.signals_emitted);
     try testing.expectEqual(@as(u64, 0), se.lp_stats.signals_emitted);
     try testing.expectEqual(@as(usize, 0), se.active_order_count);
@@ -1010,14 +1013,14 @@ test "strategy_engine: enable and disable" {
 
     se.enableStrategy(.news_repricing);
     try testing.expect(se.isEnabled(.news_repricing));
-    try testing.expect(!se.isEnabled(.liquidity_provision));
+    try testing.expect(!se.isEnabled(.market_making));
 
-    se.enableStrategy(.liquidity_provision);
-    try testing.expect(se.isEnabled(.liquidity_provision));
+    se.enableStrategy(.market_making);
+    try testing.expect(se.isEnabled(.market_making));
 
     se.disableStrategy(.news_repricing);
     try testing.expect(!se.isEnabled(.news_repricing));
-    try testing.expect(se.isEnabled(.liquidity_provision));
+    try testing.expect(se.isEnabled(.market_making));
 }
 
 test "strategy_engine: news repricing triggers on sufficient delta" {
@@ -1178,7 +1181,7 @@ test "strategy_engine: order tracking and untracking" {
     try testing.expect(se.trackOrder("order-1", "market-1", .news_repricing, .buy, 0.65));
     try testing.expectEqual(@as(usize, 1), se.active_order_count);
 
-    try testing.expect(se.trackOrder("order-2", "market-1", .liquidity_provision, .sell, 0.55));
+    try testing.expect(se.trackOrder("order-2", "market-1", .market_making, .sell, 0.55));
     try testing.expectEqual(@as(usize, 2), se.active_order_count);
 
     se.untrackOrder("order-1");
@@ -1211,8 +1214,8 @@ test "strategy_engine: LP pair lifecycle" {
         .lp_exit_spread = 0.02,
     });
 
-    try testing.expect(se.trackOrder("bid-1", "m1", .liquidity_provision, .buy, 0.45));
-    try testing.expect(se.trackOrder("ask-1", "m1", .liquidity_provision, .sell, 0.55));
+    try testing.expect(se.trackOrder("bid-1", "m1", .market_making, .buy, 0.45));
+    try testing.expect(se.trackOrder("ask-1", "m1", .market_making, .sell, 0.55));
 
     // Find indices and link them
     var bid_idx: ?usize = null;
@@ -2392,4 +2395,330 @@ test "phase4: db.updateDryRunOrderStatus updates row" {
     const status_raw = db.c.sqlite3_column_text(stmt, 0);
     const status = std.mem.span(@as([*c]const u8, @ptrCast(status_raw.?)));
     try testing.expectEqualStrings("cancelled", status);
+}
+
+// ─── Phase 6: margin-aware risk gate tests ─────────────────────────────────
+
+test "risk_gate: margin check passes when leverage stays under cap" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    // balance=100, max_account_leverage=3.0 → margin_limit=300
+    // Existing position on m1 contributes 10 * 0.50 = 5 of notional.
+    // New order on m2 adds 5 more → 10 total ≪ 300.
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m2','SYM','B','Q');");
+    try database.execZ("INSERT INTO positions(id,market_id,side,size,entry_price,status) VALUES('p1','m1','long','10','0.50','open');");
+    try database.insertBalanceSnapshot(100.0, 0.0, 0.0, 0.0);
+
+    const config = risk_gate.RiskConfig{
+        .max_position_pct = 0.50,
+        .max_portfolio_exposure_pct = 0.95,
+        .max_balance_commitment_ratio = 0.95,
+        .max_account_leverage = 3.0,
+        .allow_duplicate_positions = false,
+    };
+
+    const request = risk_gate.OrderRequest{
+        .market_id = "m2",
+        .side = "buy",
+        .size = "10",
+        .price = "0.50",
+        .order_type = "limit",
+        .client_order_id = "test-margin-pass",
+    };
+
+    const result = risk_gate.validateOrder(request, &database, config);
+    try testing.expect(result == .pass);
+}
+
+test "risk_gate: margin check rejects when notional + position exceeds leverage cap" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    // balance=100, max_account_leverage=0.05 → margin_limit=5
+    // Existing position contributes 5; new 5 → total 10 > 5 → reject.
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m2','SYM','B','Q');");
+    try database.execZ("INSERT INTO positions(id,market_id,side,size,entry_price,status) VALUES('p1','m1','long','10','0.50','open');");
+    try database.insertBalanceSnapshot(100.0, 0.0, 0.0, 0.0);
+
+    const config = risk_gate.RiskConfig{
+        .max_position_pct = 0.50,
+        .max_portfolio_exposure_pct = 0.95,
+        .max_balance_commitment_ratio = 0.95,
+        .max_account_leverage = 0.05,
+        .allow_duplicate_positions = false,
+    };
+
+    const request = risk_gate.OrderRequest{
+        .market_id = "m2",
+        .side = "buy",
+        .size = "10",
+        .price = "0.50",
+        .order_type = "limit",
+        .client_order_id = "test-margin-reject",
+    };
+
+    const result = risk_gate.validateOrder(request, &database, config);
+    switch (result) {
+        .reject => |r| {
+            try testing.expectEqual(risk_gate.RejectionReason.max_account_leverage_exceeded, r.reason);
+            try testing.expectEqualStrings("max_account_leverage", r.check_name);
+        },
+        .pass => try testing.expect(false),
+    }
+}
+
+test "risk_gate: pair preflight margin check rejects above cap" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
+    try database.execZ("INSERT INTO positions(id,market_id,side,size,entry_price,status) VALUES('p1','m1','long','10','0.50','open');");
+    try database.insertBalanceSnapshot(100.0, 0.0, 0.0, 0.0);
+
+    const config = risk_gate.RiskConfig{
+        .max_position_pct = 0.50,
+        .max_portfolio_exposure_pct = 0.95,
+        .max_balance_commitment_ratio = 0.95,
+        .max_account_leverage = 0.05,
+    };
+
+    // position_notional=5, buy=5, sell=5, total=15 > margin_limit=5 → reject.
+    const result = risk_gate.validatePairPreflight(&database, config, 5.0, 5.0);
+    switch (result) {
+        .reject => |r| {
+            try testing.expectEqual(risk_gate.RejectionReason.max_account_leverage_exceeded, r.reason);
+            try testing.expectEqualStrings("pair_preflight_max_account_leverage", r.check_name);
+        },
+        .pass => try testing.expect(false),
+    }
+}
+
+test "risk_gate: pair preflight margin check passes under cap" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
+    try database.execZ("INSERT INTO positions(id,market_id,side,size,entry_price,status) VALUES('p1','m1','long','10','0.50','open');");
+    try database.insertBalanceSnapshot(100.0, 0.0, 0.0, 0.0);
+
+    const config = risk_gate.RiskConfig{
+        .max_position_pct = 0.50,
+        .max_portfolio_exposure_pct = 0.95,
+        .max_balance_commitment_ratio = 0.95,
+        .max_account_leverage = 3.0,
+    };
+
+    // position_notional=5, buy=5, sell=5, total=15 < margin_limit=300.
+    const result = risk_gate.validatePairPreflight(&database, config, 5.0, 5.0);
+    try testing.expect(result == .pass);
+}
+
+test "risk_gate: rejection reason names include MaxAccountLeverageExceeded" {
+    try testing.expectEqualStrings(
+        "MaxAccountLeverageExceeded",
+        risk_gate.rejectionReasonName(.max_account_leverage_exceeded),
+    );
+}
+
+// ─── Phase 6: market-making inventory-skew tests ───────────────────────────
+
+test "strategy_engine: MM long fill enters skewed regime and emits ask-only quote" {
+    var se = strategy_engine.StrategyEngine.init(.{
+        .lp_min_spread = 0.04,
+        .lp_order_fallback_usd = 5.0,
+    });
+
+    // lp_max_position_usd default 50; mm_skew_enter_pct default 0.50
+    // → enter_threshold = 25. Push exposure to 30 (size=30, mark=1.0).
+    se.recordMarketMakingFill("test-market", .buy, 30.0, 1.0);
+    try testing.expectEqual(strategy_engine.SkewState.long_skewed, se.skewStateFor("test-market"));
+
+    const result = se.evaluateLiquidityProvision("test-market", 0.40, 0.60, 0.0);
+    try testing.expectEqual(@as(usize, 1), result.count);
+    try testing.expectEqual(strategy_engine.SignalDirection.sell, result.signals[0].direction);
+    try testing.expectEqual(strategy_engine.StrategyName.market_making, result.signals[0].strategy);
+    try testing.expectEqual(@as(u64, 1), se.lp_stats.signals_emitted);
+}
+
+test "strategy_engine: MM resumes paired quotes after inventory drains below exit" {
+    var se = strategy_engine.StrategyEngine.init(.{
+        .lp_min_spread = 0.04,
+        .lp_order_fallback_usd = 5.0,
+    });
+
+    // Enter long_skewed via large buy fill (exposure=30 ≥ 25 enter).
+    se.recordMarketMakingFill("test-market", .buy, 30.0, 1.0);
+    try testing.expectEqual(strategy_engine.SkewState.long_skewed, se.skewStateFor("test-market"));
+
+    // Sell 21 → net_shares=9. Exit threshold = 50*0.20 = 10. 9 ≤ 10 →
+    // state machine flips back to .normal and the evaluator emits a paired
+    // bid+ask quote again.
+    se.recordMarketMakingFill("test-market", .sell, 21.0, 1.0);
+    try testing.expectEqual(strategy_engine.SkewState.normal, se.skewStateFor("test-market"));
+
+    const result = se.evaluateLiquidityProvision("test-market", 0.40, 0.60, 0.0);
+    try testing.expectEqual(@as(usize, 2), result.count);
+    try testing.expectEqual(strategy_engine.SignalDirection.buy, result.signals[0].direction);
+    try testing.expectEqual(strategy_engine.SignalDirection.sell, result.signals[1].direction);
+}
+
+test "strategy_engine: MM short fill enters short-skewed regime and emits bid-only quote" {
+    var se = strategy_engine.StrategyEngine.init(.{
+        .lp_min_spread = 0.04,
+        .lp_order_fallback_usd = 5.0,
+    });
+
+    se.recordMarketMakingFill("test-market", .sell, 30.0, 1.0);
+    try testing.expectEqual(strategy_engine.SkewState.short_skewed, se.skewStateFor("test-market"));
+
+    const result = se.evaluateLiquidityProvision("test-market", 0.40, 0.60, 0.0);
+    try testing.expectEqual(@as(usize, 1), result.count);
+    try testing.expectEqual(strategy_engine.SignalDirection.buy, result.signals[0].direction);
+}
+
+// ─── Phase 6: cex_dex_arb tests ────────────────────────────────────────────
+
+test "cex_dex_arb: computeDeltaBps positive negative zero" {
+    try testing.expectApproxEqAbs(
+        @as(f64, 50.0),
+        cex_dex_arb.computeDeltaBps(100.0, 100.5),
+        1e-9,
+    );
+    try testing.expectApproxEqAbs(
+        @as(f64, -50.0),
+        cex_dex_arb.computeDeltaBps(100.0, 99.5),
+        1e-9,
+    );
+    try testing.expectApproxEqAbs(
+        @as(f64, 0.0),
+        cex_dex_arb.computeDeltaBps(100.0, 100.0),
+        1e-9,
+    );
+    // Bad inputs are clamped to zero so the breaker isn't fooled by NaN.
+    try testing.expectApproxEqAbs(
+        @as(f64, 0.0),
+        cex_dex_arb.computeDeltaBps(0.0, 100.0),
+        1e-9,
+    );
+}
+
+test "cex_dex_arb: confirm window emits signal after N consecutive ticks" {
+    var s = cex_dex_arb.ArbState.init(.{
+        .delta_threshold_bps = 10.0,
+        .confirm_window_ticks = 3,
+    });
+
+    // 50 bps, HL rich → short_hl_long_cex.
+    try testing.expect(s.evaluate("BTC", 100.0, 100.5, 1000) == null);
+    try testing.expect(s.evaluate("BTC", 100.0, 100.5, 1001) == null);
+    const sig = s.evaluate("BTC", 100.0, 100.5, 1002);
+    try testing.expect(sig != null);
+    try testing.expectEqual(cex_dex_arb.ArbDirection.short_hl_long_cex, sig.?.direction);
+    try testing.expectApproxEqAbs(@as(f64, 50.0), sig.?.delta_bps, 1e-9);
+
+    // After firing, the streak resets so a single subsequent tick can't
+    // immediately re-fire.
+    try testing.expect(s.evaluate("BTC", 100.0, 100.5, 1003) == null);
+}
+
+test "cex_dex_arb: confirm window resets when direction flips" {
+    var s = cex_dex_arb.ArbState.init(.{
+        .delta_threshold_bps = 10.0,
+        .confirm_window_ticks = 3,
+    });
+
+    _ = s.evaluate("BTC", 100.0, 100.5, 1000); // short_hl streak=1
+    _ = s.evaluate("BTC", 100.0, 100.5, 1001); // short_hl streak=2
+    // Flip: HL cheap → long_hl_short_cex; streak resets to 1 → no signal.
+    try testing.expect(s.evaluate("BTC", 100.0, 99.5, 1002) == null);
+    try testing.expectEqual(@as(u32, 1), s.confirm_streak);
+    try testing.expect(s.confirm_direction != null);
+    try testing.expectEqual(cex_dex_arb.ArbDirection.long_hl_short_cex, s.confirm_direction.?);
+}
+
+test "cex_dex_arb: confirm streak cleared by in-band tick" {
+    var s = cex_dex_arb.ArbState.init(.{
+        .delta_threshold_bps = 10.0,
+        .confirm_window_ticks = 3,
+    });
+
+    _ = s.evaluate("BTC", 100.0, 100.5, 1000); // streak=1 (50bps)
+    // Flat tick — abs delta below threshold resets the streak.
+    try testing.expect(s.evaluate("BTC", 100.0, 100.0, 1001) == null);
+    try testing.expectEqual(@as(u32, 0), s.confirm_streak);
+    try testing.expect(s.confirm_direction == null);
+}
+
+test "cex_dex_arb: circuit breaker trips after 5 consecutive losses" {
+    var s = cex_dex_arb.ArbState.init(.{
+        .delta_threshold_bps = 10.0,
+        .confirm_window_ticks = 3,
+        .loss_streak_disable = 5,
+        .cooldown_seconds = 300,
+    });
+
+    // 4 losses → not yet disabled.
+    var i: usize = 0;
+    while (i < 4) : (i += 1) s.recordTradeResult(-1.0, 1000);
+    try testing.expect(!s.isDisabled(1000));
+    try testing.expectEqual(@as(u32, 4), s.loss_streak);
+
+    // 5th loss trips the breaker, resets the streak counter, and
+    // schedules re-enable for `now + cooldown_seconds`.
+    s.recordTradeResult(-1.0, 1000);
+    try testing.expect(s.isDisabled(1000));
+    try testing.expectEqual(@as(i64, 1300), s.disabled_until);
+    try testing.expectEqual(@as(u32, 0), s.loss_streak);
+
+    // While disabled, evaluate() returns null even on a clean signal.
+    try testing.expect(s.evaluate("BTC", 100.0, 200.0, 1100) == null);
+
+    // After the cooldown window passes, evaluate() resumes — but the
+    // stale confirm streak from before the trip must not pre-load a signal.
+    try testing.expect(s.evaluate("BTC", 100.0, 100.5, 1400) == null);
+    try testing.expect(s.evaluate("BTC", 100.0, 100.5, 1401) == null);
+    try testing.expect(s.evaluate("BTC", 100.0, 100.5, 1402) != null);
+}
+
+test "cex_dex_arb: manual reenable clears disabled state" {
+    var s = cex_dex_arb.ArbState.init(.{
+        .delta_threshold_bps = 10.0,
+        .confirm_window_ticks = 3,
+        .loss_streak_disable = 2,
+        .cooldown_seconds = 300,
+    });
+
+    s.recordTradeResult(-1.0, 1000);
+    s.recordTradeResult(-1.0, 1000);
+    try testing.expect(s.isDisabled(1000));
+
+    s.reenable();
+    try testing.expect(!s.isDisabled(1000));
+    try testing.expectEqual(@as(u32, 0), s.loss_streak);
+    try testing.expectEqual(@as(i64, 0), s.disabled_until);
+    try testing.expectEqual(@as(u32, 0), s.confirm_streak);
+}
+
+test "cex_dex_arb: positive pnl clears the loss streak" {
+    var s = cex_dex_arb.ArbState.init(.{
+        .delta_threshold_bps = 10.0,
+        .confirm_window_ticks = 3,
+        .loss_streak_disable = 5,
+        .cooldown_seconds = 300,
+    });
+
+    s.recordTradeResult(-1.0, 1000);
+    s.recordTradeResult(-1.0, 1000);
+    try testing.expectEqual(@as(u32, 2), s.loss_streak);
+
+    s.recordTradeResult(0.5, 1000);
+    try testing.expectEqual(@as(u32, 0), s.loss_streak);
+    try testing.expect(!s.isDisabled(1000));
 }

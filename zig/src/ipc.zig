@@ -245,7 +245,11 @@ fn getPayloadObject(root: std.json.ObjectMap) ?std.json.ObjectMap {
 
 fn parseStrategyName(name_str: []const u8) ?strategy.StrategyName {
     if (std.mem.eql(u8, name_str, "news_repricing")) return .news_repricing;
-    if (std.mem.eql(u8, name_str, "liquidity_provision")) return .liquidity_provision;
+    // Phase 6: accept both the legacy `liquidity_provision` wire string and
+    // the new `market_making` name so the dashboard/Telegram rename can
+    // land in a later phase without breaking control commands.
+    if (std.mem.eql(u8, name_str, "market_making")) return .market_making;
+    if (std.mem.eql(u8, name_str, "liquidity_provision")) return .market_making;
     return null;
 }
 
@@ -461,15 +465,15 @@ fn handleResume(ctx: *Context, req_id: []const u8, writer: anytype) !void {
 fn handleStrategyList(ctx: *Context, req_id: []const u8, writer: anytype) !void {
     if (ctx.strategy_engine) |se| {
         const news_enabled = se.isEnabled(.news_repricing);
-        const lp_enabled = se.isEnabled(.liquidity_provision);
+        const lp_enabled = se.isEnabled(.market_making);
         const ns = se.getStats(.news_repricing);
-        const ls = se.getStats(.liquidity_provision);
+        const ls = se.getStats(.market_making);
         var p: [1024]u8 = undefined;
         const payload = std.fmt.bufPrint(
             &p,
             "{{\"strategies\":[" ++
                 "{{\"name\":\"news_repricing\",\"enabled\":{},\"stats\":{{\"signals_emitted\":{d},\"orders_accepted\":{d},\"orders_rejected\":{d},\"cancels\":{d},\"active_order_overflow_count\":{d}}}}}," ++
-                "{{\"name\":\"liquidity_provision\",\"enabled\":{},\"stats\":{{\"signals_emitted\":{d},\"orders_accepted\":{d},\"orders_rejected\":{d},\"cancels\":{d},\"active_order_overflow_count\":{d}}}}}" ++
+                "{{\"name\":\"market_making\",\"enabled\":{},\"stats\":{{\"signals_emitted\":{d},\"orders_accepted\":{d},\"orders_rejected\":{d},\"cancels\":{d},\"active_order_overflow_count\":{d}}}}}" ++
                 "]}}",
             .{
                 news_enabled, ns.signals_emitted, ns.orders_accepted, ns.orders_rejected, ns.cancels, ns.active_order_overflow_count,

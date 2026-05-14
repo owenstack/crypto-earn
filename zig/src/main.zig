@@ -373,7 +373,7 @@ pub fn main() !void {
     }
     if (std.posix.getenv("ENABLE_LIQUIDITY_PROVISION")) |v| {
         if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true")) {
-            se.enableStrategy(.liquidity_provision);
+            se.enableStrategy(.market_making);
         }
     }
 
@@ -481,7 +481,7 @@ fn strategyWorker(ctx: *StrategyWorkerCtx) void {
         // provider on Hyperliquid). The arb strategy lands in Phase 6.
 
         // Evaluate liquidity provision using recent orderbook data
-        if (ctx.se.isEnabled(.liquidity_provision)) {
+        if (ctx.se.isEnabled(.market_making)) {
             evaluateLpSignals(ctx);
         }
 
@@ -552,13 +552,13 @@ fn cancelOrphanLpBuys(ctx: *StrategyWorkerCtx) void {
     const sql =
         "SELECT o.id, o.market_id FROM orders o " ++
         "WHERE o.status IN ('placed','partially_filled') " ++
-        "AND o.strategy_origin='liquidity_provision' " ++
+        "AND o.strategy_origin IN ('liquidity_provision','market_making') " ++
         "AND o.side='buy' " ++
         "AND NOT EXISTS (" ++
         "SELECT 1 FROM orders s " ++
         "WHERE s.market_id=o.market_id " ++
         "AND s.status IN ('placed','partially_filled') " ++
-        "AND s.strategy_origin='liquidity_provision' " ++
+        "AND s.strategy_origin IN ('liquidity_provision','market_making') " ++
         "AND s.side='sell'" ++
         ");" ++ &[_:0]u8{};
     var stmt: ?*db.c.sqlite3_stmt = null;
@@ -578,7 +578,7 @@ fn cancelOrphanLpBuys(ctx: *StrategyWorkerCtx) void {
 
         if (ctx.om.cancelOrder(order_id)) {
             ctx.se.untrackOrder(order_id);
-            ctx.se.incrementCancels(.liquidity_provision);
+            ctx.se.incrementCancels(.market_making);
             log.warn("strategy_worker", "cancelled orphan LP buy {s} on {s}", .{ order_id, mid_span });
         } else {
             log.err("strategy_worker", "failed to cancel orphan LP buy {s} on {s}", .{ order_id, mid_span });
@@ -948,7 +948,7 @@ fn dispatchLpPair(ctx: *StrategyWorkerCtx, buy_signal: strategy.Signal, sell_sig
     const buy_size_str = std.fmt.bufPrint(&buy_size_buf, "{d:.2}", .{buy_size}) catch "0";
     const sell_size_str = std.fmt.bufPrint(&sell_size_buf, "{d:.2}", .{sell_size}) catch "0";
 
-    const origin = "liquidity_provision";
+    const origin = "market_making";
 
     // PAIR PRE-FLIGHT: Validate the COMBINED notional of both legs against
     // the risk gate before placing either. The per-order gate would otherwise
@@ -964,8 +964,8 @@ fn dispatchLpPair(ctx: *StrategyWorkerCtx, buy_signal: strategy.Signal, sell_sig
         sell_notional,
     );
     if (preflight == .reject) {
-        ctx.se.incrementOrdersRejected(.liquidity_provision);
-        ctx.se.incrementOrdersRejected(.liquidity_provision);
+        ctx.se.incrementOrdersRejected(.market_making);
+        ctx.se.incrementOrdersRejected(.market_making);
         log.warn(
             "strategy_worker",
             "lp_pair: preflight rejected ({s}); skipping pair (buy_notional={d:.2} sell_notional={d:.2})",
@@ -986,7 +986,7 @@ fn dispatchLpPair(ctx: *StrategyWorkerCtx, buy_signal: strategy.Signal, sell_sig
     });
 
     if (buy_result != .success) {
-        ctx.se.incrementOrdersRejected(.liquidity_provision);
+        ctx.se.incrementOrdersRejected(.market_making);
         const reason: []const u8 = switch (buy_result) {
             .rejected => |r| r.reason,
             .failed => |f| f.reason,
@@ -997,15 +997,15 @@ fn dispatchLpPair(ctx: *StrategyWorkerCtx, buy_signal: strategy.Signal, sell_sig
     }
 
     // Buy succeeded — attempt to track it. If tracking fails, cancel and bail.
-    const buy_tracked = ctx.se.trackOrder(buy_result.success.order_id, buy_market_id, .liquidity_provision, .buy, buy_signal.price);
+    const buy_tracked = ctx.se.trackOrder(buy_result.success.order_id, buy_market_id, .market_making, .buy, buy_signal.price);
     if (!buy_tracked) {
-        ctx.se.incrementOrdersRejected(.liquidity_provision);
+        ctx.se.incrementOrdersRejected(.market_making);
         log.err("strategy_worker", "lp_pair: failed to track buy leg, cancelling: {s}", .{buy_result.success.order_id});
         _ = ctx.om.cancelOrder(buy_result.success.order_id);
         ctx.om.allocator.free(buy_result.success.order_id);
         return;
     }
-    ctx.se.incrementOrdersAccepted(.liquidity_provision);
+    ctx.se.incrementOrdersAccepted(.market_making);
     ctx.database.insertStrategySignal(buy_market_id, origin, buy_signal.confidence, "") catch {};
 
     // Place sell leg. From here on, any failure must roll back the buy.
@@ -1015,7 +1015,7 @@ fn dispatchLpPair(ctx: *StrategyWorkerCtx, buy_signal: strategy.Signal, sell_sig
     });
 
     if (sell_result != .success) {
-        ctx.se.incrementOrdersRejected(.liquidity_provision);
+        ctx.se.incrementOrdersRejected(.market_making);
         const reason: []const u8 = switch (sell_result) {
             .rejected => |r| r.reason,
             .failed => |f| f.reason,
@@ -1031,9 +1031,9 @@ fn dispatchLpPair(ctx: *StrategyWorkerCtx, buy_signal: strategy.Signal, sell_sig
     }
 
     // Sell succeeded — attempt to track it. If tracking fails, cancel both legs.
-    const sell_tracked = ctx.se.trackOrder(sell_result.success.order_id, sell_market_id, .liquidity_provision, .sell, sell_signal.price);
+    const sell_tracked = ctx.se.trackOrder(sell_result.success.order_id, sell_market_id, .market_making, .sell, sell_signal.price);
     if (!sell_tracked) {
-        ctx.se.incrementOrdersRejected(.liquidity_provision);
+        ctx.se.incrementOrdersRejected(.market_making);
         log.err("strategy_worker", "lp_pair: failed to track sell leg, cancelling both legs: buy={s} sell={s}", .{
             buy_result.success.order_id, sell_result.success.order_id,
         });
@@ -1044,7 +1044,7 @@ fn dispatchLpPair(ctx: *StrategyWorkerCtx, buy_signal: strategy.Signal, sell_sig
         ctx.om.allocator.free(sell_result.success.order_id);
         return;
     }
-    ctx.se.incrementOrdersAccepted(.liquidity_provision);
+    ctx.se.incrementOrdersAccepted(.market_making);
     ctx.database.insertStrategySignal(sell_market_id, origin, sell_signal.confidence, "") catch {};
 
     // Link the two tracked orders so a fill on one triggers cancel of the other.
@@ -1175,9 +1175,9 @@ fn persistStrategyStats(ctx: *StrategyWorkerCtx) void {
         ns.cancels,
         ns.realized_pnl_estimate,
     ) catch {};
-    const ls = ctx.se.getStats(.liquidity_provision);
+    const ls = ctx.se.getStats(.market_making);
     ctx.database.insertStrategyStats(
-        "liquidity_provision",
+        "market_making",
         ls.signals_emitted,
         ls.orders_accepted,
         ls.orders_rejected,

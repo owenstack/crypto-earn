@@ -715,6 +715,28 @@ pub const DB = struct {
         return @intCast(c.sqlite3_column_int(stmt, 0));
     }
 
+    /// Phase 6: compute total open position notional in USD from `positions`
+    /// rows still flagged `open`. Uses `mark_price` when populated by the HL
+    /// portfolio tracker, falling back to `entry_price` so cold-start risk
+    /// checks still produce a usable number. The result is the sum of
+    /// |size| * price for every open row — the basis for margin-aware
+    /// account leverage checks in the risk gate.
+    pub fn queryOpenPositionNotional(self: DB) !f64 {
+        const sql = "SELECT COALESCE(SUM(ABS(CAST(size AS REAL)) * (CASE WHEN mark_price > 0 THEN mark_price WHEN CAST(entry_price AS REAL) > 0 THEN CAST(entry_price AS REAL) ELSE 0.0 END)), 0.0) FROM positions WHERE status='open';" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare queryOpenPositionNotional", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) {
+            log.err("db", "failed to execute queryOpenPositionNotional", .{});
+            return error.DBExecFailed;
+        }
+        return c.sqlite3_column_double(stmt, 0);
+    }
+
     pub fn queryOpenExposureUsd(self: DB) !f64 {
         // Match queryOpenOrderCount: only placed / partially_filled orders
         // represent real exchange exposure.
@@ -1955,6 +1977,49 @@ pub const DB = struct {
         }
 
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DBExecFailed;
+    }
+
+    /// Phase 6: persist a CEX↔DEX arbitrage telemetry row to `arb_events`.
+    /// `order_id` may be null when the event is a confirmed signal that
+    /// fired but the order submission was suppressed (circuit breaker, dry
+    /// run, etc.). `realised_pnl` is null on emission and back-filled when
+    /// the round-trip closes.
+    pub fn insertArbEvent(
+        self: DB,
+        asset: []const u8,
+        binance_mid: f64,
+        hl_mid: f64,
+        delta_bps: f64,
+        order_id: ?[]const u8,
+    ) !void {
+        const sql = "INSERT INTO arb_events(asset,binance_mid,hl_mid,delta_bps,order_id) VALUES(?,?,?,?,?);" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare insertArbEvent", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, asset.ptr, @intCast(asset.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 2, binance_mid) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 3, hl_mid) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 4, delta_bps) != c.SQLITE_OK)
+        {
+            log.err("db", "failed to bind insertArbEvent parameters", .{});
+            return error.DBExecFailed;
+        }
+        if (order_id) |oid| {
+            if (c.sqlite3_bind_text(stmt, 5, oid.ptr, @intCast(oid.len), null) != c.SQLITE_OK) {
+                return error.DBExecFailed;
+            }
+        } else {
+            if (c.sqlite3_bind_null(stmt, 5) != c.SQLITE_OK) return error.DBExecFailed;
+        }
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
+            log.err("db", "failed to execute insertArbEvent", .{});
+            return error.DBExecFailed;
+        }
     }
 
     /// Fill the provided buffer with up to out.len open dry_run_orders rows.

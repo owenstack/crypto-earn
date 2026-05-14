@@ -1,8 +1,15 @@
-//! Strategy engine — news repricing and liquidity provision signal generation.
+//! Strategy engine — news repricing and market-making signal generation.
+//!
+//! Phase 6: the legacy `liquidity_provision` strategy was reframed as
+//! Hyperliquid `market_making`. The enum tag was renamed accordingly; the
+//! evaluator now tracks per-market inventory-skew state so we suppress bids
+//! after a long fill (and skew asks down) until inventory drains back below
+//! the exit threshold. The wire IPC layer accepts both old and new names
+//! so the dashboard/Telegram rename can land independently in phase 8.
 const std = @import("std");
 const log = @import("logger.zig");
 
-pub const StrategyName = enum { news_repricing, liquidity_provision };
+pub const StrategyName = enum { news_repricing, market_making };
 
 pub const SignalDirection = enum { buy, sell };
 
@@ -31,9 +38,12 @@ pub const StrategyConfig = struct {
     /// Dollar notional fallback when balance is unknown (cold start).
     news_order_fallback_usd: f64 = 1.20,
 
-    // Liquidity provision
-    lp_min_spread: f64 = 0.06,
-    lp_exit_spread: f64 = 0.03,
+    // Market making (formerly liquidity_provision). Phase 6 tightens the
+    // spread defaults to better fit Hyperliquid perp books, which trade at
+    // tighter spreads than the Polymarket CLOB this strategy was first
+    // calibrated against.
+    lp_min_spread: f64 = 0.02,
+    lp_exit_spread: f64 = 0.01,
 
     /// LP TOTAL pair notional as fraction of USDC balance (covers BOTH legs
     /// combined). Interpreted as dollars-of-collateral, then split per leg
@@ -41,6 +51,19 @@ pub const StrategyConfig = struct {
     lp_order_size_pct: f64 = 0.07,
     /// Dollar notional fallback (per-pair-total) when balance is unknown.
     lp_order_fallback_usd: f64 = 0.70,
+
+    /// Phase 6: inventory-skew thresholds, expressed as a fraction of
+    /// `lp_max_position_usd`. After a long fill pushes the per-market
+    /// exposure above `mm_skew_enter_pct * lp_max_position_usd` we enter
+    /// the skewed-quote regime: bids are suppressed and asks are biased
+    /// toward the inside to drain inventory. We exit the regime once
+    /// exposure drops below `mm_skew_exit_pct * lp_max_position_usd`.
+    mm_skew_enter_pct: f64 = 0.50,
+    mm_skew_exit_pct: f64 = 0.20,
+    /// Tightens the ask quote when skewed long. The ask leg moves from
+    /// `mid + spread*0.25` (normal) toward `mid + spread*mm_skew_quote_pct`
+    /// — a smaller value crosses closer to the bid to flush inventory.
+    mm_skew_quote_pct: f64 = 0.05,
 };
 
 /// Polymarket CLOB share floor. Orders below this are dust-rejected.
@@ -80,7 +103,13 @@ pub const MarketInventory = struct {
     market_id_len: usize,
     net_shares: f64,
     cost_basis: f64,
+    /// Phase 6: per-market inventory-skew state. `.normal` quotes both
+    /// legs, `.long_skewed` suppresses the bid leg and tightens the ask
+    /// (we are long, want to flush), `.short_skewed` is the mirror image.
+    skew: SkewState = .normal,
 };
+
+pub const SkewState = enum { normal, long_skewed, short_skewed };
 
 pub const ActiveOrder = struct {
     order_id: [68]u8,
@@ -135,7 +164,7 @@ pub const StrategyEngine = struct {
     pub fn enableStrategy(self: *StrategyEngine, name: StrategyName) void {
         switch (name) {
             .news_repricing => self.news_enabled.store(true, .seq_cst),
-            .liquidity_provision => self.lp_enabled.store(true, .seq_cst),
+            .market_making => self.lp_enabled.store(true, .seq_cst),
         }
         log.info("strategy", "enabled strategy: {s}", .{@tagName(name)});
     }
@@ -143,7 +172,7 @@ pub const StrategyEngine = struct {
     pub fn disableStrategy(self: *StrategyEngine, name: StrategyName) void {
         switch (name) {
             .news_repricing => self.news_enabled.store(false, .seq_cst),
-            .liquidity_provision => self.lp_enabled.store(false, .seq_cst),
+            .market_making => self.lp_enabled.store(false, .seq_cst),
         }
         log.info("strategy", "disabled strategy: {s}", .{@tagName(name)});
     }
@@ -151,7 +180,7 @@ pub const StrategyEngine = struct {
     pub fn isEnabled(self: *StrategyEngine, name: StrategyName) bool {
         return switch (name) {
             .news_repricing => self.news_enabled.load(.seq_cst),
-            .liquidity_provision => self.lp_enabled.load(.seq_cst),
+            .market_making => self.lp_enabled.load(.seq_cst),
         };
     }
 
@@ -242,6 +271,16 @@ pub const StrategyEngine = struct {
         count: usize,
     };
 
+    /// Phase 6: market-making evaluator. Renamed conceptually from
+    /// `liquidity_provision`; the function name is preserved so call sites
+    /// in main.zig and tests do not need a coordinated rename. The
+    /// evaluator now consults the per-market inventory-skew state machine
+    /// and emits:
+    ///   - normal regime → both bid + ask legs.
+    ///   - .long_skewed  → ask only, biased toward the inside (cross-down)
+    ///                     to flush inventory; bid is suppressed.
+    ///   - .short_skewed → bid only, biased toward the inside (cross-up)
+    ///                     to cover the short; ask is suppressed.
     pub fn evaluateLiquidityProvision(
         self: *StrategyEngine,
         market_id: []const u8,
@@ -253,11 +292,9 @@ pub const StrategyEngine = struct {
         const spread = best_ask - best_bid;
         if (spread < self.config.lp_min_spread) return .{ .signals = undefined, .count = 0 };
 
-        // Check per-market inventory limit and current inventory. With the
-        // current token-resolution path, we can only quote a paired LP bid+ask
-        // when we already own enough inventory to safely back the sell leg.
         const mid_price = (best_bid + best_ask) / 2.0;
         var inventory_shares: f64 = 0.0;
+        var skew_state: SkewState = .normal;
         {
             self.state_mu.lock();
             defer self.state_mu.unlock();
@@ -265,9 +302,10 @@ pub const StrategyEngine = struct {
                 if (slot) |inv| {
                     if (std.mem.eql(u8, inv.market_id[0..inv.market_id_len], market_id)) {
                         inventory_shares = inv.net_shares;
+                        skew_state = inv.skew;
                         const exposure = @abs(inv.net_shares) * mid_price;
                         if (exposure >= self.lp_max_position_usd) {
-                            log.info("strategy", "LP signal blocked: inventory limit reached for {s} (exposure={d:.2} >= limit={d:.2})", .{
+                            log.info("strategy", "MM signal blocked: inventory limit reached for {s} (exposure={d:.2} >= limit={d:.2})", .{
                                 market_id, exposure, self.lp_max_position_usd,
                             });
                             return .{ .signals = undefined, .count = 0 };
@@ -278,71 +316,41 @@ pub const StrategyEngine = struct {
             }
         }
 
-        const bid_price = best_bid + spread * 0.25;
-        const ask_price = best_ask - spread * 0.25;
         const confidence = @min(1.0, spread / 0.1);
+        const skew_bias = self.config.mm_skew_quote_pct;
 
-        var mid: [68]u8 = undefined;
+        var mid_id: [68]u8 = undefined;
         const mid_len = @min(market_id.len, 68);
-        @memcpy(mid[0..mid_len], market_id[0..mid_len]);
+        @memcpy(mid_id[0..mid_len], market_id[0..mid_len]);
 
-        self.state_mu.lock();
-        defer self.state_mu.unlock();
-
-        log.info("strategy", "lp signals: market={s} bid={d:.4} ask={d:.4} spread={d:.4}", .{
-            market_id,
-            bid_price,
-            ask_price,
-            spread,
-        });
-
-        // Each leg gets half the configured pair notional, so the pair-total
-        // matches lp_order_size_pct of balance instead of doubling it.
         const per_leg_pct = self.config.lp_order_size_pct * 0.5;
         const per_leg_fallback_usd = self.config.lp_order_fallback_usd * 0.5;
-
-        const buy_size = resolveOrderSize(balance, per_leg_pct, bid_price, per_leg_fallback_usd);
-        const ask_leg_size = resolveOrderSize(balance, per_leg_pct, ask_price, per_leg_fallback_usd);
         const ts = std.time.timestamp();
 
-        // LP must never emit a naked sell. If we do not already own enough
-        // inventory to back the ask leg, skip this market entirely rather than
-        // place an orphan buy that cannot be paired.
-        if (inventory_shares < MIN_ORDER_SHARES) {
-            log.info("strategy", "LP skipped: insufficient inventory for paired quote on {s} (inventory={d:.4})", .{
-                market_id,
-                inventory_shares,
-            });
-            return .{ .signals = undefined, .count = 0 };
-        }
+        switch (skew_state) {
+            .long_skewed => {
+                // Suppress bid; emit a single ask-only quote biased toward
+                // the bid (mid + spread*skew_bias) to drain long inventory.
+                const ask_price = best_bid + spread * (0.5 + skew_bias);
+                const ask_leg_size = resolveOrderSize(balance, per_leg_pct, ask_price, per_leg_fallback_usd);
+                const sell_size = @min(ask_leg_size, @abs(inventory_shares));
+                if (sell_size < MIN_ORDER_SHARES) {
+                    log.info("strategy", "MM long-skewed quote skipped: ask leg below minimum on {s} (size={d:.4})", .{
+                        market_id, sell_size,
+                    });
+                    return .{ .signals = undefined, .count = 0 };
+                }
 
-        const sell_size = @min(ask_leg_size, inventory_shares);
-        if (sell_size < MIN_ORDER_SHARES) {
-            log.info("strategy", "LP skipped: sell leg below minimum size on {s} (size={d:.4})", .{
-                market_id,
-                sell_size,
-            });
-            return .{ .signals = undefined, .count = 0 };
-        }
-
-        self.lp_stats.signals_emitted += 2;
-        return .{
-            .signals = .{
-                Signal{
-                    .strategy = .liquidity_provision,
-                    .market_id = mid,
-                    .market_id_len = mid_len,
-                    .direction = .buy,
-                    .price = bid_price,
-                    .size = buy_size,
-                    .confidence = confidence,
-                    .timestamp = ts,
-                    .best_bid = best_bid,
-                    .best_ask = best_ask,
-                },
-                Signal{
-                    .strategy = .liquidity_provision,
-                    .market_id = mid,
+                self.state_mu.lock();
+                defer self.state_mu.unlock();
+                self.lp_stats.signals_emitted += 1;
+                log.info("strategy", "MM skewed-long ask: market={s} ask={d:.4} inventory={d:.4}", .{
+                    market_id, ask_price, inventory_shares,
+                });
+                var sigs: [2]Signal = undefined;
+                sigs[0] = Signal{
+                    .strategy = .market_making,
+                    .market_id = mid_id,
                     .market_id_len = mid_len,
                     .direction = .sell,
                     .price = ask_price,
@@ -351,10 +359,106 @@ pub const StrategyEngine = struct {
                     .timestamp = ts,
                     .best_bid = best_bid,
                     .best_ask = best_ask,
-                },
+                };
+                return .{ .signals = sigs, .count = 1 };
             },
-            .count = 2,
-        };
+            .short_skewed => {
+                // Suppress ask; emit a single bid-only quote biased toward
+                // the ask (mid - spread*skew_bias) to cover the short.
+                const bid_price = best_ask - spread * (0.5 + skew_bias);
+                const buy_size = resolveOrderSize(balance, per_leg_pct, bid_price, per_leg_fallback_usd);
+                const cover_size = @min(buy_size, @abs(inventory_shares));
+                if (cover_size < MIN_ORDER_SHARES) {
+                    log.info("strategy", "MM short-skewed quote skipped: bid leg below minimum on {s} (size={d:.4})", .{
+                        market_id, cover_size,
+                    });
+                    return .{ .signals = undefined, .count = 0 };
+                }
+
+                self.state_mu.lock();
+                defer self.state_mu.unlock();
+                self.lp_stats.signals_emitted += 1;
+                log.info("strategy", "MM skewed-short bid: market={s} bid={d:.4} inventory={d:.4}", .{
+                    market_id, bid_price, inventory_shares,
+                });
+                var sigs: [2]Signal = undefined;
+                sigs[0] = Signal{
+                    .strategy = .market_making,
+                    .market_id = mid_id,
+                    .market_id_len = mid_len,
+                    .direction = .buy,
+                    .price = bid_price,
+                    .size = cover_size,
+                    .confidence = confidence,
+                    .timestamp = ts,
+                    .best_bid = best_bid,
+                    .best_ask = best_ask,
+                };
+                return .{ .signals = sigs, .count = 1 };
+            },
+            .normal => {
+                const bid_price = best_bid + spread * 0.25;
+                const ask_price = best_ask - spread * 0.25;
+
+                const buy_size = resolveOrderSize(balance, per_leg_pct, bid_price, per_leg_fallback_usd);
+                const ask_leg_size = resolveOrderSize(balance, per_leg_pct, ask_price, per_leg_fallback_usd);
+
+                // Normal regime still requires inventory to back the sell
+                // leg of the pair (HL spot pairs would otherwise emit a
+                // naked sell). For perp markets this guard is a no-op once
+                // a long fill seeds inventory.
+                if (inventory_shares < MIN_ORDER_SHARES) {
+                    log.info("strategy", "MM skipped: insufficient inventory for paired quote on {s} (inventory={d:.4})", .{
+                        market_id, inventory_shares,
+                    });
+                    return .{ .signals = undefined, .count = 0 };
+                }
+
+                const sell_size = @min(ask_leg_size, inventory_shares);
+                if (sell_size < MIN_ORDER_SHARES) {
+                    log.info("strategy", "MM skipped: sell leg below minimum size on {s} (size={d:.4})", .{
+                        market_id, sell_size,
+                    });
+                    return .{ .signals = undefined, .count = 0 };
+                }
+
+                self.state_mu.lock();
+                defer self.state_mu.unlock();
+                log.info("strategy", "mm signals: market={s} bid={d:.4} ask={d:.4} spread={d:.4}", .{
+                    market_id, bid_price, ask_price, spread,
+                });
+                self.lp_stats.signals_emitted += 2;
+                return .{
+                    .signals = .{
+                        Signal{
+                            .strategy = .market_making,
+                            .market_id = mid_id,
+                            .market_id_len = mid_len,
+                            .direction = .buy,
+                            .price = bid_price,
+                            .size = buy_size,
+                            .confidence = confidence,
+                            .timestamp = ts,
+                            .best_bid = best_bid,
+                            .best_ask = best_ask,
+                        },
+                        Signal{
+                            .strategy = .market_making,
+                            .market_id = mid_id,
+                            .market_id_len = mid_len,
+                            .direction = .sell,
+                            .price = ask_price,
+                            .size = sell_size,
+                            .confidence = confidence,
+                            .timestamp = ts,
+                            .best_bid = best_bid,
+                            .best_ask = best_ask,
+                        },
+                    },
+                    .count = 2,
+                };
+            },
+        }
     }
 
     /// Check if a market is in LP cooldown. If not, mark it as cooling down.
@@ -462,7 +566,7 @@ pub const StrategyEngine = struct {
 
         switch (strategy) {
             .news_repricing => self.news_stats.active_order_overflow_count += 1,
-            .liquidity_provision => self.lp_stats.active_order_overflow_count += 1,
+            .market_making => self.lp_stats.active_order_overflow_count += 1,
         }
         log.warn("strategy", "cannot track order: active_orders full ({d})", .{MAX_ACTIVE_ORDERS});
         return false;
@@ -584,7 +688,7 @@ pub const StrategyEngine = struct {
 
         return switch (name) {
             .news_repricing => self.news_stats,
-            .liquidity_provision => self.lp_stats,
+            .market_making => self.lp_stats,
         };
     }
 
@@ -594,7 +698,7 @@ pub const StrategyEngine = struct {
 
         switch (name) {
             .news_repricing => self.news_stats.orders_accepted += 1,
-            .liquidity_provision => self.lp_stats.orders_accepted += 1,
+            .market_making => self.lp_stats.orders_accepted += 1,
         }
     }
 
@@ -604,7 +708,7 @@ pub const StrategyEngine = struct {
 
         switch (name) {
             .news_repricing => self.news_stats.orders_rejected += 1,
-            .liquidity_provision => self.lp_stats.orders_rejected += 1,
+            .market_making => self.lp_stats.orders_rejected += 1,
         }
     }
 
@@ -614,24 +718,52 @@ pub const StrategyEngine = struct {
 
         switch (name) {
             .news_repricing => self.news_stats.cancels += 1,
-            .liquidity_provision => self.lp_stats.cancels += 1,
+            .market_making => self.lp_stats.cancels += 1,
         }
     }
 
     /// Update per-market inventory on fill.
     /// direction: .buy increments net_shares, .sell decrements.
+    /// Phase 6: also runs the inventory-skew state transition. The skew
+    /// state is keyed off the absolute exposure
+    /// (|net_shares| * mark_price) crossing a fraction of
+    /// `lp_max_position_usd`. `mark_price` defaults to the absolute fill
+    /// size when no orderbook reference is available, which keeps the
+    /// transitions deterministic for tests that don't pass a price.
     pub fn updateInventory(self: *StrategyEngine, market_id: []const u8, direction: SignalDirection, fill_size: f64) void {
+        self.recordMarketMakingFill(market_id, direction, fill_size, 1.0);
+    }
+
+    /// Phase 6: explicit market-making fill recorder. Updates inventory
+    /// and the per-market skew-state machine using `mark_price` to convert
+    /// shares → exposure for threshold comparisons. The two-threshold
+    /// machine prevents flapping: enter at `mm_skew_enter_pct *
+    /// lp_max_position_usd`, leave at `mm_skew_exit_pct *
+    /// lp_max_position_usd`.
+    pub fn recordMarketMakingFill(
+        self: *StrategyEngine,
+        market_id: []const u8,
+        direction: SignalDirection,
+        fill_size: f64,
+        mark_price: f64,
+    ) void {
         self.state_mu.lock();
         defer self.state_mu.unlock();
 
         const delta: f64 = if (direction == .buy) fill_size else -fill_size;
+
+        const enter_threshold = self.lp_max_position_usd * self.config.mm_skew_enter_pct;
+        const exit_threshold = self.lp_max_position_usd * self.config.mm_skew_exit_pct;
 
         // Find existing entry first
         for (self.market_inventory[0..self.inventory_count]) |*slot| {
             if (slot.*) |*inv| {
                 if (std.mem.eql(u8, inv.market_id[0..inv.market_id_len], market_id)) {
                     inv.net_shares += delta;
-                    log.info("strategy", "inventory updated: {s} net_shares={d:.4}", .{ market_id, inv.net_shares });
+                    inv.skew = computeSkew(inv.net_shares, mark_price, enter_threshold, exit_threshold, inv.skew);
+                    log.info("strategy", "inventory updated: {s} net_shares={d:.4} skew={s}", .{
+                        market_id, inv.net_shares, @tagName(inv.skew),
+                    });
                     return;
                 }
             }
@@ -646,14 +778,33 @@ pub const StrategyEngine = struct {
         const mid_len = @min(market_id.len, 68);
         @memcpy(mid[0..mid_len], market_id[0..mid_len]);
 
+        const initial_skew = computeSkew(delta, mark_price, enter_threshold, exit_threshold, .normal);
         self.market_inventory[self.inventory_count] = MarketInventory{
             .market_id = mid,
             .market_id_len = mid_len,
             .net_shares = delta,
             .cost_basis = 0.0,
+            .skew = initial_skew,
         };
         self.inventory_count += 1;
-        log.info("strategy", "inventory created: {s} net_shares={d:.4}", .{ market_id, delta });
+        log.info("strategy", "inventory created: {s} net_shares={d:.4} skew={s}", .{
+            market_id, delta, @tagName(initial_skew),
+        });
+    }
+
+    /// Test helper: read the inventory-skew state for a market without
+    /// taking a public dependency on the inventory array layout.
+    pub fn skewStateFor(self: *StrategyEngine, market_id: []const u8) SkewState {
+        self.state_mu.lock();
+        defer self.state_mu.unlock();
+        for (self.market_inventory[0..self.inventory_count]) |slot| {
+            if (slot) |inv| {
+                if (std.mem.eql(u8, inv.market_id[0..inv.market_id_len], market_id)) {
+                    return inv.skew;
+                }
+            }
+        }
+        return .normal;
     }
 
     /// Get a snapshot of inventory for IPC.
@@ -700,6 +851,42 @@ pub const StrategyEngine = struct {
         return null;
     }
 };
+
+/// Phase 6: pure two-threshold inventory-skew transition. Hysteresis
+/// prevents flapping when exposure hovers around the boundary:
+///
+///   normal       → long_skewed when net_shares > 0 and exposure ≥ enter
+///   normal       → short_skewed when net_shares < 0 and exposure ≥ enter
+///   long_skewed  → normal when exposure ≤ exit OR net_shares ≤ 0
+///   short_skewed → normal when exposure ≤ exit OR net_shares ≥ 0
+fn computeSkew(
+    net_shares: f64,
+    mark_price: f64,
+    enter_threshold: f64,
+    exit_threshold: f64,
+    current: SkewState,
+) SkewState {
+    const exposure = @abs(net_shares) * @abs(mark_price);
+
+    switch (current) {
+        .normal => {
+            if (exposure < enter_threshold) return .normal;
+            if (net_shares > 0) return .long_skewed;
+            if (net_shares < 0) return .short_skewed;
+            return .normal;
+        },
+        .long_skewed => {
+            if (net_shares <= 0) return .normal;
+            if (exposure <= exit_threshold) return .normal;
+            return .long_skewed;
+        },
+        .short_skewed => {
+            if (net_shares >= 0) return .normal;
+            if (exposure <= exit_threshold) return .normal;
+            return .short_skewed;
+        },
+    }
+}
 
 fn escapeJsonString(src: []const u8, buf: []u8) ![]const u8 {
     var i: usize = 0;
