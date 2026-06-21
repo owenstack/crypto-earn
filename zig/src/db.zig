@@ -623,8 +623,8 @@ pub const DB = struct {
                     return null;
                 }
                 if (balance <= 0 or !std.math.isFinite(balance)) {
-                    log.warn("db", "ignoring invalid balance snapshot: id={d} balance={d:.6}", .{ row_id, balance });
-                    continue;
+                    log.warn("db", "latest balance snapshot is non-positive; returning null to trigger risk-gate fallback: id={d} balance={d:.6}", .{ row_id, balance });
+                    return null;
                 }
                 return balance;
             } else if (rc == c.SQLITE_DONE) {

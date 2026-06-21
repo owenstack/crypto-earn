@@ -565,6 +565,8 @@ test "risk_gate: rejects when max open orders reached" {
 
     try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50", null);
     try database.insertOrder("o2", "m2", "co2", "limit", "sell", "10", "0.50", null);
+    try database.updateOrderStatus("o1", "placed");
+    try database.updateOrderStatus("o2", "placed");
 
     const request = risk_gate.OrderRequest{
         .market_id = "m3",
@@ -591,6 +593,7 @@ test "risk_gate: pair preflight rejects when only one open-order slot remains" {
 
     try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
     try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50", null);
+    try database.updateOrderStatus("o1", "placed");
 
     const config = risk_gate.RiskConfig{
         .max_position_usd_fallback = 500.0,
@@ -809,7 +812,7 @@ test "db: migration 002 creates risk_events and balance_snapshots tables" {
     try database.execZ("SELECT count(*) FROM balance_snapshots;");
 }
 
-test "db: queryLatestUsdcBalance skips invalid recent snapshots" {
+test "db: queryLatestUsdcBalance returns null when latest snapshot is non-positive" {
     var database = try openTempDb();
     defer database.close();
     try database.runMigrations();
@@ -818,7 +821,7 @@ test "db: queryLatestUsdcBalance skips invalid recent snapshots" {
     try database.insertBalanceSnapshot(0.0, 0.0, 0.0, 0.0);
 
     const balance = try database.queryLatestUsdcBalance(600);
-    try testing.expectEqual(@as(?f64, 25.0), balance);
+    try testing.expectEqual(@as(?f64, null), balance);
 }
 
 test "db: insertOrder and queryOpenOrderCount" {
@@ -832,6 +835,7 @@ test "db: insertOrder and queryOpenOrderCount" {
     try testing.expectEqual(@as(u32, 0), count_before);
 
     try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50", null);
+    try database.updateOrderStatus("o1", "placed");
     const count_after = try database.queryOpenOrderCount();
     try testing.expectEqual(@as(u32, 1), count_after);
 }
@@ -1247,6 +1251,7 @@ test "db: insertOrder with strategy_origin" {
 
     try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('m1','SYM','B','Q');");
     try database.insertOrder("o1", "m1", "co1", "limit", "buy", "10", "0.50", "news_repricing");
+    try database.updateOrderStatus("o1", "placed");
 
     const count = try database.queryOpenOrderCount();
     try testing.expectEqual(@as(u32, 1), count);
