@@ -1,11 +1,10 @@
-//! Fill poller — Phase 2 stub.
+//! Fill poller — Phase 5 Hyperliquid fill ingestion wrapper.
 //!
-//! The legacy Polymarket REST polling and user-channel WebSocket logic was
-//! removed in Phase 1. The HL equivalents (l2Book + user channel) land in
-//! Phase 5 (FR-12). For Phase 2 we keep the public surface stable so the
-//! engine can boot, the IPC reconciliation gate opens, and existing tests
-//! that exercise parseOrderResponse / circuit-breaker fields still pass.
-//! All network-bound methods are no-ops that log and return immediately.
+//! Keeps the public API used by `main.zig` while delegating fill parsing and
+//! persistence to `hl_fill_poller.zig`. The live path uses Hyperliquid's REST
+//! `userFills` endpoint as the fallback/portable ingestion source; parsed fills
+//! update local `orders`/`fills`, refresh the in-memory portfolio cache, and
+//! publish the standard order fill events.
 const std = @import("std");
 const log = @import("logger.zig");
 const db_mod = @import("db.zig");
@@ -14,6 +13,11 @@ const portfolio = @import("portfolio_tracker.zig");
 const strategy = @import("strategy_engine.zig");
 const ipc = @import("ipc.zig");
 const ipc_types = @import("ipc_types.zig");
+const http = @import("http_client.zig");
+const hl_auth = @import("hl_auth.zig");
+const hl_fill = @import("hl_fill_poller.zig");
+const ws_lib = @import("websocket");
+const c = db_mod.c;
 
 // ---------------------------------------------------------------------------
 // Fill check result (kept for parseOrderResponse test parity)
@@ -66,7 +70,7 @@ pub const FillPoller = struct {
     consecutive_http_failures: u32,
     circuit_breaker_until: i64,
 
-    const POLL_INTERVAL_NS: u64 = 3 * std.time.ns_per_s;
+    const POLL_INTERVAL_NS: u64 = 5 * std.time.ns_per_s;
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -95,26 +99,75 @@ pub const FillPoller = struct {
     }
 
     pub fn pollLoop(self: *FillPoller) void {
-        log.info("fill_poller", "REST polling stub started (HL fill polling lands in Phase 5)", .{});
+        if (!self.om.config.hl.enabled or self.om.config.dry_run_enabled) {
+            log.info("fill_poller", "HL REST fill polling idle (hl_enabled={any} dry_run={any})", .{ self.om.config.hl.enabled, self.om.config.dry_run_enabled });
+            while (!self.should_stop.load(.seq_cst)) {
+                std.Thread.sleep(POLL_INTERVAL_NS);
+            }
+            return;
+        }
+
+        log.info("fill_poller", "HL REST fill polling started", .{});
         while (!self.should_stop.load(.seq_cst)) {
+            const now = std.time.timestamp();
+            if (self.circuit_breaker_until > now) {
+                std.Thread.sleep(POLL_INTERVAL_NS);
+                continue;
+            }
+
+            const applied = self.pollUserFillsOnce() catch |e| {
+                self.consecutive_http_failures += 1;
+                log.warn("fill_poller", "HL userFills poll failed ({d}): {s}", .{ self.consecutive_http_failures, @errorName(e) });
+                if (self.consecutive_http_failures >= 5) {
+                    self.circuit_breaker_until = now + 30;
+                    log.warn("fill_poller", "HL fill poll circuit breaker open for 30s", .{});
+                }
+                std.Thread.sleep(POLL_INTERVAL_NS);
+                continue;
+            };
+            self.consecutive_http_failures = 0;
+            if (applied > 0) {
+                log.info("fill_poller", "applied {d} HL fills", .{applied});
+            }
             std.Thread.sleep(POLL_INTERVAL_NS);
         }
-        log.info("fill_poller", "REST polling stub stopped", .{});
+        log.info("fill_poller", "HL REST fill polling stopped", .{});
     }
 
     pub fn wsLoop(self: *FillPoller) void {
-        log.info("fill_poller", "WebSocket user-channel stub started (HL user channel lands in Phase 5)", .{});
-        while (!self.should_stop.load(.seq_cst)) {
-            std.Thread.sleep(5 * std.time.ns_per_s);
+        if (!self.om.config.hl.enabled or self.om.config.dry_run_enabled) {
+            log.info("fill_poller", "HL user WebSocket idle (hl_enabled={any} dry_run={any})", .{ self.om.config.hl.enabled, self.om.config.dry_run_enabled });
+            while (!self.should_stop.load(.seq_cst)) {
+                std.Thread.sleep(5 * std.time.ns_per_s);
+            }
+            return;
         }
-        log.info("fill_poller", "WebSocket user-channel stub stopped", .{});
+
+        var reconnect_ms: u64 = 1_000;
+        while (!self.should_stop.load(.seq_cst)) {
+            self.runUserWsConnection() catch |e| {
+                self.ws_connected.store(false, .seq_cst);
+                self.ws_disconnect_ts.store(std.time.timestamp(), .seq_cst);
+                log.warn("fill_poller", "HL user WebSocket connection ended: {s}", .{@errorName(e)});
+            };
+            if (self.should_stop.load(.seq_cst)) break;
+            std.Thread.sleep(reconnect_ms * std.time.ns_per_ms);
+            reconnect_ms = @min(reconnect_ms * 2, @as(u64, 30_000));
+        }
+        log.info("fill_poller", "HL user WebSocket stopped", .{});
     }
 
-    /// Phase 2 stub: pretend reconciliation completed cleanly so the order
-    /// gate can open. Phase 5 will replace this with HL openOrders + fills
-    /// reconciliation.
+    /// Startup reconciliation opens the order gate after one REST fill sweep
+    /// when HL is configured. Dry-run/unconfigured engines are allowed through
+    /// immediately so local development remains offline.
     pub fn reconcileOnStartup(self: *FillPoller) ReconcileResult {
-        log.info("fill_poller", "reconciliation stub: skipping HL openOrders fetch (Phase 5)", .{});
+        if (self.om.config.hl.enabled and !self.om.config.dry_run_enabled) {
+            _ = self.pollUserFillsOnce() catch |e| {
+                log.warn("fill_poller", "startup userFills reconciliation failed: {s}", .{@errorName(e)});
+            };
+        } else {
+            log.info("fill_poller", "reconciliation: offline/dry-run mode, no remote HL sweep", .{});
+        }
         const result = ReconcileResult{ .adopted = 0, .closed = 0, .unchanged = 1 };
         self.last_reconcile_result = result;
 
@@ -126,6 +179,141 @@ pub const FillPoller = struct {
         ) catch "{}";
         ipc.publishEvent(ipc_types.T.reconcile_status, evt);
         return result;
+    }
+
+    fn runUserWsConnection(self: *FillPoller) !void {
+        const host = hyperliquidWsHost(self.om.config.hl.api_base);
+        var client = try ws_lib.Client.init(self.allocator, .{
+            .host = host,
+            .port = 443,
+            .tls = true,
+            .max_size = 8 * 1024 * 1024,
+        });
+        defer client.deinit();
+
+        var host_buf: [128]u8 = undefined;
+        const host_hdr = std.fmt.bufPrint(&host_buf, "Host: {s}\r\n", .{host}) catch unreachable;
+        try client.handshake("/ws", .{ .timeout_ms = 10_000, .headers = host_hdr });
+
+        const user_addr = hl_auth.formatAddressEip55(self.om.config.hl.signer_address);
+        var sub_buf: [256]u8 = undefined;
+        const sub_msg = std.fmt.bufPrint(
+            &sub_buf,
+            "{{\"method\":\"subscribe\",\"subscription\":{{\"type\":\"userEvents\",\"user\":\"{s}\"}}}}",
+            .{user_addr[0..]},
+        ) catch return error.WsFailed;
+        var send_buf: [256]u8 = undefined;
+        @memcpy(send_buf[0..sub_msg.len], sub_msg);
+        try client.write(send_buf[0..sub_msg.len]);
+
+        self.ws_connected.store(true, .seq_cst);
+        log.info("fill_poller", "HL user WebSocket subscribed user={s}", .{user_addr[0..]});
+
+        try client.readTimeout(5_000);
+        while (!self.should_stop.load(.seq_cst)) {
+            const message = client.read() catch |err| switch (err) {
+                error.Closed => return,
+                else => return err,
+            } orelse continue;
+            defer client.done(message);
+
+            switch (message.type) {
+                .text, .binary => {
+                    const n = self.applyFillFrame(message.data) catch |e| {
+                        log.warn("fill_poller", "HL user WS frame apply failed: {s}", .{@errorName(e)});
+                        continue;
+                    };
+                    if (n > 0) log.info("fill_poller", "applied {d} HL WS fills", .{n});
+                },
+                .close => return,
+                .ping, .pong => {},
+            }
+        }
+    }
+
+    fn pollUserFillsOnce(self: *FillPoller) !usize {
+        var url_buf: [256]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, "{s}/info", .{self.om.config.hl.api_base}) catch return error.HttpFailed;
+        const user_addr = hl_auth.formatAddressEip55(self.om.config.hl.signer_address);
+
+        var body_buf: [160]u8 = undefined;
+        const body = std.fmt.bufPrint(
+            &body_buf,
+            "{{\"type\":\"userFills\",\"user\":\"{s}\"}}",
+            .{user_addr[0..]},
+        ) catch return error.HttpFailed;
+
+        var client = http.HttpClient.init(self.allocator);
+        defer client.deinit();
+        var response = client.postJson(url, body) catch return error.HttpFailed;
+        defer response.deinit();
+        if (response.status.class() != .success) return error.HttpFailed;
+
+        return self.applyFillFrame(response.body);
+    }
+
+    fn applyFillFrame(self: *FillPoller, body: []const u8) !usize {
+        const parsed = hl_fill.parseUserChannelFills(body) orelse return 0;
+        var applied: usize = 0;
+        for (parsed.fills[0..parsed.count]) |fill| {
+            if (self.applyFill(fill)) applied += 1;
+        }
+        return applied;
+    }
+
+    fn applyFill(self: *FillPoller, fill: hl_fill.HlFill) bool {
+        var local = self.resolveLocalOrder(fill.id());
+        const result = hl_fill.applyFillToDb(self.database, fill) catch |e| {
+            log.warn("fill_poller", "failed to apply HL fill oid={s}: {s}", .{ fill.id(), @errorName(e) });
+            return false;
+        };
+        if (!result.updated) return false;
+
+        if (local.market_id_len > 0 and local.side_len > 0) {
+            self.pt.applyFillDelta(local.marketId(), fill.sz, fill.px, local.side());
+        }
+        hl_fill.emitFillEvent(fill, result.new_status);
+        return true;
+    }
+
+    const LocalOrderRef = struct {
+        market_id_buf: [128]u8 = [_]u8{0} ** 128,
+        market_id_len: usize = 0,
+        side_buf: [8]u8 = [_]u8{0} ** 8,
+        side_len: usize = 0,
+
+        fn marketId(self: *const LocalOrderRef) []const u8 {
+            return self.market_id_buf[0..self.market_id_len];
+        }
+
+        fn side(self: *const LocalOrderRef) []const u8 {
+            return self.side_buf[0..self.side_len];
+        }
+    };
+
+    fn resolveLocalOrder(self: *FillPoller, oid: []const u8) LocalOrderRef {
+        var out = LocalOrderRef{};
+        const sql = "SELECT market_id, side FROM orders WHERE id=? OR client_order_id=? LIMIT 1;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return out;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, oid.ptr, @intCast(oid.len), null);
+        _ = c.sqlite3_bind_text(stmt, 2, oid.ptr, @intCast(oid.len), null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return out;
+
+        if (c.sqlite3_column_text(stmt, 0)) |p| {
+            const span = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+            const n = @min(span.len, out.market_id_buf.len);
+            @memcpy(out.market_id_buf[0..n], span[0..n]);
+            out.market_id_len = n;
+        }
+        if (c.sqlite3_column_text(stmt, 1)) |p| {
+            const span = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+            const n = @min(span.len, out.side_buf.len);
+            @memcpy(out.side_buf[0..n], span[0..n]);
+            out.side_len = n;
+        }
+        return out;
     }
 
     /// Parse order response JSON into FillCheckResult.
@@ -175,6 +363,11 @@ pub const FillPoller = struct {
         return result;
     }
 };
+
+fn hyperliquidWsHost(api_base: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, api_base, "testnet") != null) return "api.hyperliquid-testnet.xyz";
+    return "api.hyperliquid.xyz";
+}
 
 /// Extract a string value for a key from a flat JSON object without heap
 /// allocation. Returns a slice into `data`.

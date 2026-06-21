@@ -15,6 +15,7 @@ const std = @import("std");
 const log = @import("logger.zig");
 const db_mod = @import("db.zig");
 const c = db_mod.c;
+const http = @import("http_client.zig");
 
 pub const MAX_POSITIONS = 64;
 pub const MAX_FUNDING_RATES = 64;
@@ -177,6 +178,72 @@ pub const HlPortfolioTracker = struct {
         };
     }
 
+    /// Fetch `clearinghouseState` once, update the in-memory snapshot, and
+    /// persist the equity row for historical/risk consumers.
+    pub fn fetchAndApplySnapshot(
+        self: *HlPortfolioTracker,
+        api_base: []const u8,
+        user: []const u8,
+    ) !void {
+        var url_buf: [256]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, "{s}/info", .{api_base}) catch return error.HttpFailed;
+
+        var body_buf: [128]u8 = undefined;
+        const body = std.fmt.bufPrint(
+            &body_buf,
+            "{{\"type\":\"clearinghouseState\",\"user\":\"{s}\"}}",
+            .{user},
+        ) catch return error.HttpFailed;
+
+        var client = http.HttpClient.init(self.allocator);
+        defer client.deinit();
+
+        var response = client.postJson(url, body) catch |e| {
+            log.warn("hl_portfolio", "clearinghouseState http failed: {s}", .{@errorName(e)});
+            return error.HttpFailed;
+        };
+        defer response.deinit();
+
+        if (response.status.class() != .success) {
+            log.warn("hl_portfolio", "clearinghouseState status={d}", .{@intFromEnum(response.status)});
+            return error.HttpFailed;
+        }
+
+        var snap = parseClearinghouseState(response.body) orelse return error.InvalidJson;
+        snap.snapshot_ts = std.time.timestamp();
+        self.updateSnapshot(snap);
+        self.persistEquity();
+    }
+
+    /// Fetch funding rates once and persist them for `funding.snapshot`.
+    pub fn fetchAndPersistFundingRates(
+        self: *HlPortfolioTracker,
+        api_base: []const u8,
+    ) !void {
+        var url_buf: [256]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, "{s}/info", .{api_base}) catch return error.HttpFailed;
+
+        var client = http.HttpClient.init(self.allocator);
+        defer client.deinit();
+
+        var response = client.postJson(url, "{\"type\":\"fundingRate\"}") catch |e| {
+            log.warn("hl_portfolio", "fundingRate http failed: {s}", .{@errorName(e)});
+            return error.HttpFailed;
+        };
+        defer response.deinit();
+
+        if (response.status.class() != .success) {
+            log.warn("hl_portfolio", "fundingRate status={d}", .{@intFromEnum(response.status)});
+            return error.HttpFailed;
+        }
+
+        var rates_buf: [MAX_FUNDING_RATES]FundingRate = undefined;
+        const n = parseFundingRates(response.body, &rates_buf);
+        if (n == 0) return;
+        self.setFundingRates(rates_buf[0..n]);
+        try persistFundingRates(self.database, rates_buf[0..n]);
+    }
+
     /// Serialize the current snapshot as JSON for the IPC `portfolio.response`.
     /// Format matches the Phase 5 plan:
     ///   {"equity":..,"margin_used_pct":..,"funding_accrued":..,
@@ -187,6 +254,11 @@ pub const HlPortfolioTracker = struct {
         const snap = self.getSnapshot();
         return writeSnapshotJsonInner(snap, buf);
     }
+};
+
+const FetchError = error{
+    HttpFailed,
+    InvalidJson,
 };
 
 fn emptySnapshot() HlSnapshot {
@@ -363,9 +435,7 @@ fn parsePositionObject(obj: []const u8) ?HlPosition {
     };
 
     if (extractStringField(obj, "coin")) |s| {
-        const n = @min(s.len, p.coin.len);
-        @memcpy(p.coin[0..n], s[0..n]);
-        p.coin_len = n;
+        p.coin_len = copyJsonStringDecoded(&p.coin, s);
     }
     if (extractFloatField(obj, "szi")) |v| p.szi = v;
     if (extractFloatField(obj, "entryPx")) |v| p.entry_px = v;
@@ -382,6 +452,40 @@ fn parsePositionObject(obj: []const u8) ?HlPosition {
 
     if (p.coin_len == 0) return null;
     return p;
+}
+
+/// Copy a JSON string payload into `dest`, decoding the small escape subset
+/// that can appear in HL symbols. In particular, `\\\"` decodes to
+/// `\"` (a literal backslash followed by a quote).
+fn copyJsonStringDecoded(dest: []u8, src: []const u8) usize {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < src.len and j < dest.len) {
+        if (src[i] == '\\' and i + 2 < src.len and src[i + 1] == '\\' and src[i + 2] == '"') {
+            if (j + 2 > dest.len) break;
+            dest[j] = '\\';
+            dest[j + 1] = '"';
+            j += 2;
+            i += 3;
+            continue;
+        }
+        if (src[i] == '\\' and i + 1 < src.len) {
+            const next = src[i + 1];
+            switch (next) {
+                '"', '\\', '/' => {
+                    dest[j] = next;
+                    j += 1;
+                    i += 2;
+                    continue;
+                },
+                else => {},
+            }
+        }
+        dest[j] = src[i];
+        j += 1;
+        i += 1;
+    }
+    return j;
 }
 
 /// Extract a numeric field stored as either a string ("123.45") or a raw

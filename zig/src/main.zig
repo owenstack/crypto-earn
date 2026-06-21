@@ -186,6 +186,24 @@ pub fn main() !void {
     var pt = portfolio.PortfolioTracker.init(allocator, &database, .{});
     log.info("engine", "portfolio tracker ready", .{});
 
+    // Phase 5: live HL equity/margin polling. This feeds `/portfolio` with
+    // clearinghouseState semantics while preserving the legacy balance cache
+    // used by existing risk/strategy paths. Dry-run without a signer skips it.
+    var hl_portfolio_user_addr = hl_auth.formatAddressEip55(hl_config.signer_address);
+    var hl_portfolio_thread: ?std.Thread = null;
+    if (hl_config.enabled) {
+        hl_portfolio_thread = try std.Thread.spawn(.{}, portfolio.PortfolioTracker.hlPollingLoop, .{
+            &pt,
+            hl_config.api_base,
+            hl_portfolio_user_addr[0..],
+        });
+        log.info("engine", "HL portfolio polling thread started", .{});
+    }
+    defer {
+        pt.stop();
+        if (hl_portfolio_thread) |t| t.join();
+    }
+
     // ─── Phase 3: HL asset metadata preload ─────────────────────────────
     // Pull the HL universe before strategy/feed threads so the orderbook
     // module and order manager can resolve asset_index lookups against a

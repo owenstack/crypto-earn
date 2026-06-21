@@ -55,6 +55,8 @@ pub const ParsedFills = struct {
 ///     {"oid":12345,"sz":"0.05","px":"45000.0","side":"B","time":1700000000000},
 ///     ...
 ///   ]}}
+/// Also accepts the REST `/info {"type":"userFills"}` response shape, which
+/// is a top-level fill array.
 ///
 /// Tolerates the alternate `"side":"buy"|"sell"` form (some HL SDK builds
 /// translate B/A → buy/sell before forwarding). Returns `null` if the
@@ -65,10 +67,16 @@ pub fn parseUserChannelFills(body: []const u8) ?ParsedFills {
     // Locate the "fills":[ ... ] array. We do byte-level scanning so the
     // parser is allocation-free and safe to call from hot paths.
     const fills_key = "\"fills\"";
-    const fkidx = std.mem.indexOf(u8, body, fills_key) orelse return null;
-    var i = fkidx + fills_key.len;
-    while (i < body.len and body[i] != '[') : (i += 1) {}
-    if (i >= body.len) return null;
+    var i: usize = if (std.mem.indexOf(u8, body, fills_key)) |fkidx| blk: {
+        var arr_idx = fkidx + fills_key.len;
+        while (arr_idx < body.len and body[arr_idx] != '[') : (arr_idx += 1) {}
+        break :blk arr_idx;
+    } else blk: {
+        var arr_idx: usize = 0;
+        while (arr_idx < body.len and (body[arr_idx] == ' ' or body[arr_idx] == '\n' or body[arr_idx] == '\r' or body[arr_idx] == '\t')) : (arr_idx += 1) {}
+        break :blk arr_idx;
+    };
+    if (i >= body.len or body[i] != '[') return null;
     i += 1; // past '['
 
     while (i < body.len and out.count < out.fills.len) {
@@ -207,6 +215,23 @@ pub fn applyFillToDb(database: *db_mod.DB, fill: HlFill) !ApplyResult {
     const oid = fill.id();
     if (oid.len == 0) return result;
 
+    var fid_buf: [80]u8 = undefined;
+    const fid = std.fmt.bufPrint(&fid_buf, "{s}-{d}", .{ oid, fill.time_ms }) catch oid;
+
+    // Replay safety: both HL WS reconnects and REST fallback can deliver a
+    // fill we've already processed. Check before mutating the parent order so
+    // duplicate events cannot double-count filled_size.
+    const dup_sql = "SELECT 1 FROM fills WHERE id=? LIMIT 1;" ++ &[_:0]u8{};
+    var dup: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(database.handle, dup_sql.ptr, -1, &dup, null) != c.SQLITE_OK) {
+        return error.DbPrepareFailed;
+    }
+    defer _ = c.sqlite3_finalize(dup);
+    _ = c.sqlite3_bind_text(dup, 1, fid.ptr, @intCast(fid.len), null);
+    if (c.sqlite3_step(dup) == c.SQLITE_ROW) {
+        return result;
+    }
+
     const select_sql =
         "SELECT id, size, COALESCE(filled_size, '0'), COALESCE(average_fill_price, '0') " ++
         "FROM orders WHERE id=? OR client_order_id=? LIMIT 1;" ++ &[_:0]u8{};
@@ -286,9 +311,6 @@ pub fn applyFillToDb(database: *db_mod.DB, fill: HlFill) !ApplyResult {
     // (e.g. WS reconnect replays) collide on PRIMARY KEY and are ignored.
     var sz_str_buf: [32]u8 = undefined;
     const sz_str = std.fmt.bufPrint(&sz_str_buf, "{d:.10}", .{fill.sz}) catch "0";
-    var fid_buf: [80]u8 = undefined;
-    const fid = std.fmt.bufPrint(&fid_buf, "{s}-{d}", .{ oid, fill.time_ms }) catch oid;
-
     const ins_sql = "INSERT OR IGNORE INTO fills(id, order_id, size, price, fee, detected_at, filled_at) VALUES(?, ?, ?, ?, '0', ?, ?);" ++ &[_:0]u8{};
     var ins: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(database.handle, ins_sql.ptr, -1, &ins, null) != c.SQLITE_OK) {
@@ -413,6 +435,17 @@ test "hl_fill_poller: parseUserChannelFills returns null on empty array" {
     try std.testing.expect(parseUserChannelFills(json) == null);
 }
 
+test "hl_fill_poller: parseUserChannelFills accepts REST userFills array" {
+    const json = "[{\"oid\":67890,\"sz\":\"0.10\",\"px\":\"123.45\",\"side\":\"A\",\"time\":1700000000123}]";
+    const parsed = parseUserChannelFills(json) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqual(@as(usize, 1), parsed.count);
+    try std.testing.expectEqualStrings("67890", parsed.fills[0].id());
+    try std.testing.expectEqualStrings("sell", parsed.fills[0].sideStr());
+}
+
 test "hl_fill_poller: simulateDryRunFill — buy crosses ask" {
     const r = simulateDryRunFill(true, 0.55, 0.50, 0.52, 10.0);
     try std.testing.expect(r.would_fill);
@@ -495,6 +528,24 @@ test "hl_fill_poller: applyFillToDb updates order + inserts fill" {
     const avg_span = std.mem.span(c.sqlite3_column_text(stmt2, 0).?);
     const vwap = try std.fmt.parseFloat(f64, avg_span);
     try std.testing.expectApproxEqAbs(@as(f64, 45500.0), vwap, 1e-3);
+
+    // Replaying the same fill id is ignored before mutating filled_size.
+    const replay = try applyFillToDb(&database, fill);
+    try std.testing.expect(!replay.updated);
+
+    var replay_stmt: ?*c.sqlite3_stmt = null;
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(
+        database.handle,
+        "SELECT filled_size FROM orders WHERE id='order-1';",
+        -1,
+        &replay_stmt,
+        null,
+    ));
+    defer _ = c.sqlite3_finalize(replay_stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(replay_stmt));
+    const filled_span = std.mem.span(c.sqlite3_column_text(replay_stmt, 0).?);
+    const filled_after_replay = try std.fmt.parseFloat(f64, filled_span);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.10), filled_after_replay, 1e-9);
 
     // Verify two fill rows landed in the fills table.
     var stmt: ?*c.sqlite3_stmt = null;

@@ -5,6 +5,7 @@ const std = @import("std");
 const log = @import("logger.zig");
 const db_mod = @import("db.zig");
 const c = db_mod.c;
+const hl_portfolio = @import("hl_portfolio_tracker.zig");
 
 pub const Position = struct {
     market_id: [64]u8,
@@ -43,6 +44,7 @@ pub const PortfolioTracker = struct {
     allocator: std.mem.Allocator,
     database: *db_mod.DB,
     fee_config: FeeConfig,
+    hl_tracker: hl_portfolio.HlPortfolioTracker,
 
     // In-memory state (lightweight cache)
     positions: [MAX_POSITIONS]Position,
@@ -68,6 +70,7 @@ pub const PortfolioTracker = struct {
             .allocator = allocator,
             .database = database,
             .fee_config = fee_config,
+            .hl_tracker = hl_portfolio.HlPortfolioTracker.init(allocator, database),
             .positions = undefined,
             .position_count = 0,
             .usdc_balance = 0.0,
@@ -78,6 +81,52 @@ pub const PortfolioTracker = struct {
         };
         tracker.syncFromDB();
         return tracker;
+    }
+
+    /// Stop background Phase 5 HL portfolio polling.
+    pub fn stop(self: *PortfolioTracker) void {
+        self.hl_tracker.stop();
+    }
+
+    /// Phase 5 HL portfolio polling loop. Keeps the new HL snapshot fresh for
+    /// IPC while the legacy fields remain available for risk/strategy code.
+    pub fn hlPollingLoop(self: *PortfolioTracker, api_base: []const u8, user: []const u8) void {
+        const interval_s: i64 = blk: {
+            if (std.posix.getenv("PORTFOLIO_POLL_INTERVAL_SEC")) |raw| {
+                const parsed = std.fmt.parseInt(i64, raw, 10) catch 60;
+                break :blk std.math.clamp(parsed, @as(i64, 10), @as(i64, 3600));
+            }
+            break :blk 60;
+        };
+
+        var failures: u32 = 0;
+        var funding_tick: u32 = 0;
+        log.info("portfolio", "HL portfolio polling started interval={d}s user={s}", .{ interval_s, user });
+
+        while (!self.hl_tracker.should_stop.load(.seq_cst)) {
+            self.hl_tracker.fetchAndApplySnapshot(api_base, user) catch |e| {
+                failures += 1;
+                log.warn("portfolio", "HL portfolio poll failed ({d}/3): {s}", .{ failures, @errorName(e) });
+                if (failures >= 3) {
+                    self.hl_tracker.markStale();
+                }
+            };
+            if (!self.hl_tracker.isStale()) failures = 0;
+
+            funding_tick += 1;
+            if (funding_tick == 1 or funding_tick * @as(u32, @intCast(interval_s)) >= 300) {
+                self.hl_tracker.fetchAndPersistFundingRates(api_base) catch |e| {
+                    log.warn("portfolio", "HL funding poll failed: {s}", .{@errorName(e)});
+                };
+                funding_tick = 0;
+            }
+
+            var slept: i64 = 0;
+            while (slept < interval_s and !self.hl_tracker.should_stop.load(.seq_cst)) : (slept += 1) {
+                std.Thread.sleep(std.time.ns_per_s);
+            }
+        }
+        log.info("portfolio", "HL portfolio polling stopped", .{});
     }
 
     /// Mark the balance cache as dirty so the next syncFromDB re-queries
@@ -427,6 +476,11 @@ pub const PortfolioTracker = struct {
 
     /// Write snapshot as JSON to a buffer for IPC responses.
     pub fn writeSnapshotJson(self: *PortfolioTracker, buf: []u8) ![]const u8 {
+        const hl_snap = self.hl_tracker.getSnapshot();
+        if (hl_snap.snapshot_ts > 0) {
+            return hl_portfolio.writeSnapshotJsonInner(hl_snap, buf);
+        }
+
         var fbs = std.io.fixedBufferStream(buf);
         const writer = fbs.writer();
         const snap = self.getSnapshot();
