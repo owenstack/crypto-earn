@@ -246,64 +246,90 @@ pub fn main() !void {
     }
     log.info("engine", "HL asset metadata refresh loop started", .{});
 
+    const disable_market_data = if (std.posix.getenv("DISABLE_MARKET_DATA")) |v|
+        (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true"))
+    else
+        false;
+
+    if (disable_market_data) {
+        log.warn("engine", "market data feeds disabled by DISABLE_MARKET_DATA", .{});
+    } else {
+        log.info("engine", "market data feeds enabled", .{});
+    }
+
     // ─── Phase 3: HL l2Book orderbook feed ──────────────────────────────
     // Configurable symbol list via HL_SYMBOLS=BTC,ETH,SOL.
     var hl_symbols_buf: [4096]u8 = undefined;
-    const hl_symbols = parseSymbolList(
-        std.posix.getenv("HL_SYMBOLS") orelse "BTC,ETH,SOL",
-        &hl_symbols_buf,
-        allocator,
-    ) catch |e| {
-        log.err("engine", "failed to parse HL_SYMBOLS: {s}", .{@errorName(e)});
-        return e;
-    };
-    defer allocator.free(hl_symbols);
+    var hl_symbols: ?[][]const u8 = null;
+    defer if (hl_symbols) |symbols| allocator.free(symbols);
 
-    const hl_ws_host = switch (hl_config.network) {
-        .mainnet => hl_orderbook.HL_WS_HOST_MAINNET,
-        .testnet => hl_orderbook.HL_WS_HOST_TESTNET,
-    };
-    var hl_ob = hl_orderbook.Orderbook.init(allocator, hl_ws_host, hl_symbols);
-    defer hl_ob.deinit();
-
+    var hl_ob: hl_orderbook.Orderbook = undefined;
+    var hl_ob_started = false;
+    var hl_ob_thread: ?std.Thread = null;
     var hl_persist_ctx = HlPersistCtx{ .database = &database, .meta = &asset_meta };
-    hl_ob.setPersistCallback(&hlOrderbookPersistCallback, &hl_persist_ctx);
-
-    const hl_ob_thread = try std.Thread.spawn(.{}, hl_orderbook.Orderbook.run, .{&hl_ob});
-    defer {
+    defer if (hl_ob_started) {
         hl_ob.stop();
-        hl_ob_thread.join();
-    }
-    log.info("engine", "HL l2Book feed started ({d} symbols, host={s})", .{
-        hl_symbols.len, hl_ws_host,
-    });
+        if (hl_ob_thread) |t| t.join();
+        hl_ob.deinit();
+    };
 
     // ─── Phase 3: Binance bookTicker feed ───────────────────────────────
     var binance_symbols_buf: [4096]u8 = undefined;
-    const binance_symbols = parseSymbolList(
-        std.posix.getenv("BINANCE_SYMBOLS") orelse "BTCUSDT,ETHUSDT,SOLUSDT",
-        &binance_symbols_buf,
-        allocator,
-    ) catch |e| {
-        log.err("engine", "failed to parse BINANCE_SYMBOLS: {s}", .{@errorName(e)});
-        return e;
-    };
-    defer allocator.free(binance_symbols);
+    var binance_symbols: ?[][]const u8 = null;
+    defer if (binance_symbols) |symbols| allocator.free(symbols);
 
-    var binance_feed = binance_ws.BinanceFeed.init(allocator, binance_symbols);
-    defer binance_feed.deinit();
-
+    var binance_feed: binance_ws.BinanceFeed = undefined;
+    var binance_started = false;
+    var binance_thread: ?std.Thread = null;
+    var binance_watchdog_thread: ?std.Thread = null;
     var binance_persist_ctx = BinancePersistCtx{ .database = &database };
-    binance_feed.setPersistCallback(&binancePersistCallback, &binance_persist_ctx);
-
-    const binance_thread = try std.Thread.spawn(.{}, binance_ws.BinanceFeed.run, .{&binance_feed});
-    const binance_watchdog_thread = try std.Thread.spawn(.{}, binance_ws.BinanceFeed.watchdogLoop, .{&binance_feed});
-    defer {
+    defer if (binance_started) {
         binance_feed.stop();
-        binance_thread.join();
-        binance_watchdog_thread.join();
+        if (binance_thread) |t| t.join();
+        if (binance_watchdog_thread) |t| t.join();
+        binance_feed.deinit();
+    };
+
+    if (!disable_market_data) {
+        hl_symbols = parseSymbolList(
+            std.posix.getenv("HL_SYMBOLS") orelse "BTC,ETH,SOL",
+            &hl_symbols_buf,
+            allocator,
+        ) catch |e| {
+            log.err("engine", "failed to parse HL_SYMBOLS: {s}", .{@errorName(e)});
+            return e;
+        };
+
+        const hl_ws_host = switch (hl_config.network) {
+            .mainnet => hl_orderbook.HL_WS_HOST_MAINNET,
+            .testnet => hl_orderbook.HL_WS_HOST_TESTNET,
+        };
+        hl_ob = hl_orderbook.Orderbook.init(allocator, hl_ws_host, hl_symbols.?);
+        hl_ob_started = true;
+        hl_ob.setPersistCallback(&hlOrderbookPersistCallback, &hl_persist_ctx);
+
+        hl_ob_thread = try std.Thread.spawn(.{}, hl_orderbook.Orderbook.run, .{&hl_ob});
+        log.info("engine", "HL l2Book feed started ({d} symbols, host={s})", .{
+            hl_symbols.?.len, hl_ws_host,
+        });
+
+        binance_symbols = parseSymbolList(
+            std.posix.getenv("BINANCE_SYMBOLS") orelse "BTCUSDT,ETHUSDT,SOLUSDT",
+            &binance_symbols_buf,
+            allocator,
+        ) catch |e| {
+            log.err("engine", "failed to parse BINANCE_SYMBOLS: {s}", .{@errorName(e)});
+            return e;
+        };
+
+        binance_feed = binance_ws.BinanceFeed.init(allocator, binance_symbols.?);
+        binance_started = true;
+        binance_feed.setPersistCallback(&binancePersistCallback, &binance_persist_ctx);
+
+        binance_thread = try std.Thread.spawn(.{}, binance_ws.BinanceFeed.run, .{&binance_feed});
+        binance_watchdog_thread = try std.Thread.spawn(.{}, binance_ws.BinanceFeed.watchdogLoop, .{&binance_feed});
+        log.info("engine", "Binance bookTicker feed started ({d} symbols)", .{binance_symbols.?.len});
     }
-    log.info("engine", "Binance bookTicker feed started ({d} symbols)", .{binance_symbols.len});
 
     // Spawn stale order scan ticker
     om.should_stop.store(false, .seq_cst);

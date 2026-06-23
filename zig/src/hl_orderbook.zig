@@ -283,6 +283,9 @@ pub const Orderbook = struct {
         try client.readTimeout(5_000);
         while (!self.should_stop.load(.seq_cst)) {
             const message = client.read() catch |err| switch (err) {
+                // Zig 0.15 TLS surfaces socket read timeouts as ReadFailed
+                // here. An idle HL book is not a broken connection.
+                error.ReadFailed => continue,
                 error.Closed => return,
                 else => return err,
             } orelse continue;

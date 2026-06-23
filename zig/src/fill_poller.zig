@@ -212,6 +212,9 @@ pub const FillPoller = struct {
         try client.readTimeout(5_000);
         while (!self.should_stop.load(.seq_cst)) {
             const message = client.read() catch |err| switch (err) {
+                // User-events streams are often idle; the TLS layer reports
+                // the read timeout as ReadFailed instead of WouldBlock.
+                error.ReadFailed => continue,
                 error.Closed => return,
                 else => return err,
             } orelse continue;

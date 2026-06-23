@@ -237,10 +237,18 @@ pub const Client = struct {
     }
 
     pub fn read(self: *Client) !?proto.Message {
+        if (@atomicLoad(bool, &self._closed, .monotonic)) {
+            return error.Closed;
+        }
+
         var reader = &self._reader;
         const stream = &self.stream;
 
         while (true) {
+            if (@atomicLoad(bool, &self._closed, .monotonic)) {
+                return error.Closed;
+            }
+
             // try to read a message from our buffer first, before trying to
             // get more data from the socket.
             const has_more, const message = reader.read() catch |err| {
@@ -419,6 +427,7 @@ pub const Stream = struct {
                 std.posix.shutdown(fd, .both) catch {};
             }
             tls_client.deinit();
+            self.tls_client = null;
         }
 
         // std.posix.close panics on EBADF
@@ -439,13 +448,15 @@ pub const Stream = struct {
 
     pub fn read(self: *Stream, buf: []u8) !usize {
         if (self.tls_client) |tls_client| {
-            var w: std.Io.Writer = .fixed(buf);
-            while (true) {
-                const n = try tls_client.client.reader.stream(&w, .limited(buf.len));
-                if (n != 0) {
-                    return n;
-                }
+            const reader = &tls_client.client.reader;
+            while (reader.bufferedLen() == 0) {
+                try reader.fillMore();
             }
+            const available = reader.buffered();
+            const n = @min(buf.len, available.len);
+            @memcpy(buf[0..n], available[0..n]);
+            reader.toss(n);
+            return n;
         }
         return self.stream.read(buf);
     }

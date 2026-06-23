@@ -226,14 +226,14 @@ pub const HlPortfolioTracker = struct {
         var client = http.HttpClient.init(self.allocator);
         defer client.deinit();
 
-        var response = client.postJson(url, "{\"type\":\"fundingRate\"}") catch |e| {
-            log.warn("hl_portfolio", "fundingRate http failed: {s}", .{@errorName(e)});
+        var response = client.postJson(url, "{\"type\":\"predictedFundings\"}") catch |e| {
+            log.warn("hl_portfolio", "predictedFundings http failed: {s}", .{@errorName(e)});
             return error.HttpFailed;
         };
         defer response.deinit();
 
         if (response.status.class() != .success) {
-            log.warn("hl_portfolio", "fundingRate status={d}", .{@intFromEnum(response.status)});
+            log.warn("hl_portfolio", "predictedFundings status={d}", .{@intFromEnum(response.status)});
             return error.HttpFailed;
         }
 
@@ -548,13 +548,21 @@ fn extractRawValue(obj: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Parse an HL fundingRate response body of the form:
-///   [{"coin":"BTC","fundingRate":"0.0001","nextFundingTime":1700000000000},
-///    {"coin":"ETH","fundingRate":"0.00005","nextFundingTime":1700000000000}]
+/// Parse an HL `predictedFundings` response body. The endpoint returns a
+/// nested array, one entry per coin, each pairing the coin name with a list
+/// of per-venue predicted funding objects:
+///   [["BTC",[["BinPerp",{"fundingRate":"0.0001","nextFundingTime":...}],
+///            ["HlPerp",{"fundingRate":"0.0000125","nextFundingTime":...}],
+///            ...]],
+///    ["ETH",[...]], ...]
+/// We extract the Hyperliquid venue ("HlPerp") rate for each coin, since that
+/// is the funding the engine pays/receives on HL positions. Coins without an
+/// HlPerp entry are skipped.
 pub fn parseFundingRates(body: []const u8, out: []FundingRate) usize {
+    const venue_marker = "\"HlPerp\"";
     var n: usize = 0;
     var i: usize = 0;
-    // Find first '['.
+    // Find first '[' (outer array open).
     while (i < body.len and body[i] != '[') : (i += 1) {}
     if (i >= body.len) return 0;
     i += 1;
@@ -562,21 +570,44 @@ pub fn parseFundingRates(body: []const u8, out: []FundingRate) usize {
     while (i < body.len and n < out.len) {
         while (i < body.len and (body[i] == ' ' or body[i] == ',' or body[i] == '\n' or body[i] == '\r' or body[i] == '\t')) : (i += 1) {}
         if (i >= body.len or body[i] == ']') break;
-        if (body[i] != '{') {
+        // Each coin entry is itself an array: ["COIN",[...]].
+        if (body[i] != '[') {
             i += 1;
             continue;
         }
+        // Capture the full coin entry by bracket depth.
         var depth: i32 = 0;
         var end: usize = i;
         while (end < body.len) : (end += 1) {
-            if (body[end] == '{') depth += 1;
-            if (body[end] == '}') {
+            if (body[end] == '[') depth += 1;
+            if (body[end] == ']') {
                 depth -= 1;
                 if (depth == 0) break;
             }
         }
         if (end >= body.len) break;
-        const obj = body[i .. end + 1];
+        const entry = body[i .. end + 1];
+        i = end + 1;
+
+        // Coin name: first quoted string in the entry.
+        const coin = firstQuotedString(entry) orelse continue;
+
+        // Locate the HlPerp venue object inside this entry.
+        const venue_pos = std.mem.indexOf(u8, entry, venue_marker) orelse continue;
+        var oi = venue_pos + venue_marker.len;
+        while (oi < entry.len and entry[oi] != '{') : (oi += 1) {}
+        if (oi >= entry.len) continue;
+        var od: i32 = 0;
+        var oe = oi;
+        while (oe < entry.len) : (oe += 1) {
+            if (entry[oe] == '{') od += 1;
+            if (entry[oe] == '}') {
+                od -= 1;
+                if (od == 0) break;
+            }
+        }
+        if (oe >= entry.len) continue;
+        const obj = entry[oi .. oe + 1];
 
         var fr = FundingRate{
             .asset = [_]u8{0} ** 16,
@@ -584,20 +615,31 @@ pub fn parseFundingRates(body: []const u8, out: []FundingRate) usize {
             .rate = 0.0,
             .next_payment_ts = 0,
         };
-        if (extractStringField(obj, "coin")) |s| {
-            const m = @min(s.len, fr.asset.len);
-            @memcpy(fr.asset[0..m], s[0..m]);
-            fr.asset_len = m;
-        }
+        const m = @min(coin.len, fr.asset.len);
+        @memcpy(fr.asset[0..m], coin[0..m]);
+        fr.asset_len = m;
         if (extractFloatField(obj, "fundingRate")) |v| fr.rate = v;
         if (extractIntField(obj, "nextFundingTime")) |v| fr.next_payment_ts = v;
         if (fr.asset_len > 0) {
             out[n] = fr;
             n += 1;
         }
-        i = end + 1;
     }
     return n;
+}
+
+/// Return the contents of the first double-quoted string in `s`, without the
+/// surrounding quotes. Assumes no escaped quotes in coin names (HL coin
+/// symbols are plain alphanumerics).
+fn firstQuotedString(s: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < s.len and s[i] != '"') : (i += 1) {}
+    if (i >= s.len) return null;
+    const start = i + 1;
+    var end = start;
+    while (end < s.len and s[end] != '"') : (end += 1) {}
+    if (end >= s.len) return null;
+    return s[start..end];
 }
 
 /// Persist a slice of funding rates into the funding_snapshots table.
@@ -758,16 +800,23 @@ test "hl_portfolio_tracker: writeSnapshotJsonInner escapes asset JSON special ch
     try std.testing.expect(std.mem.indexOf(u8, json, "\\u000a") != null);
 }
 
-test "hl_portfolio_tracker: parseFundingRates extracts rates" {
+test "hl_portfolio_tracker: parseFundingRates extracts HlPerp rates" {
+    // Mirrors the real `predictedFundings` shape: per-coin, per-venue tuples.
+    // Only the HlPerp venue should be extracted.
     const json =
-        \\[{"coin":"BTC","fundingRate":"0.0001","nextFundingTime":1700000000000},
-        \\ {"coin":"ETH","fundingRate":"0.00005","nextFundingTime":1700000003600}]
+        \\[["BTC",[["BinPerp",{"fundingRate":"-0.00002098","nextFundingTime":1782086400000,"fundingIntervalHours":4}],
+        \\         ["HlPerp",{"fundingRate":"0.0001","nextFundingTime":1700000000000,"fundingIntervalHours":1}],
+        \\         ["BybitPerp",{"fundingRate":"0.00005","nextFundingTime":1782086400000,"fundingIntervalHours":4}]]],
+        \\ ["ETH",[["HlPerp",{"fundingRate":"0.00005","nextFundingTime":1700000003600,"fundingIntervalHours":1}]]],
+        \\ ["NOHL",[["BinPerp",{"fundingRate":"0.0002","nextFundingTime":1782086400000,"fundingIntervalHours":4}]]]]
     ;
     var out: [4]FundingRate = undefined;
     const n = parseFundingRates(json, &out);
+    // NOHL has no HlPerp entry → skipped.
     try std.testing.expectEqual(@as(usize, 2), n);
     try std.testing.expectEqualStrings("BTC", out[0].name());
     try std.testing.expectApproxEqAbs(@as(f64, 0.0001), out[0].rate, 1e-12);
+    try std.testing.expectEqual(@as(i64, 1700000000000), out[0].next_payment_ts);
     try std.testing.expectEqualStrings("ETH", out[1].name());
     try std.testing.expectApproxEqAbs(@as(f64, 0.00005), out[1].rate, 1e-12);
 }
