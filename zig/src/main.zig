@@ -14,6 +14,7 @@ const hl_auth = @import("hl_auth.zig");
 const hl_market_meta = @import("hl_market_meta.zig");
 const hl_orderbook = @import("hl_orderbook.zig");
 const binance_ws = @import("binance_ws.zig");
+const cex_dex_arb = @import("cex_dex_arb.zig");
 
 fn roundUpToCents(value: f64) f64 {
     const step = 100.0;
@@ -421,6 +422,21 @@ pub fn main() !void {
         }
     }
 
+    // Phase 6: CEX↔DEX arb. ENABLE_CEX_DEX_ARB turns the evaluator on
+    // (telemetry-only). ARB_SUBMIT_ORDERS additionally enables live taker
+    // submission, which is deferred and therefore off by default.
+    const arb_enabled = if (std.posix.getenv("ENABLE_CEX_DEX_ARB")) |v|
+        (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true"))
+    else
+        false;
+    const arb_submit_orders = if (std.posix.getenv("ARB_SUBMIT_ORDERS")) |v|
+        (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true"))
+    else
+        false;
+    if (arb_enabled) {
+        log.info("engine", "CEX↔DEX arb evaluator enabled (submit_orders={any})", .{arb_submit_orders});
+    }
+
     // Dry-run mode: log signals without placing real orders
     const dry_run = if (std.posix.getenv("DRY_RUN")) |v|
         (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true"))
@@ -456,6 +472,15 @@ pub fn main() !void {
         .database = &database,
         .should_stop = std.atomic.Value(bool).init(false),
         .dry_run = dry_run,
+        // Phase 6: live market-data sources for arb (and future MM source
+        // switch). Only wired when the corresponding feed thread started.
+        .hl_ob = if (hl_ob_started) &hl_ob else null,
+        .hl_symbols = hl_symbols,
+        .binance_feed = if (binance_started) &binance_feed else null,
+        .binance_symbols = binance_symbols,
+        .arb = cex_dex_arb.ArbState.init(.{}),
+        .arb_enabled = arb_enabled,
+        .arb_submit_orders = arb_submit_orders,
     };
     const strategy_thread = try std.Thread.spawn(.{}, strategyWorker, .{&strategy_ctx});
     defer {
@@ -499,6 +524,30 @@ const StrategyWorkerCtx = struct {
     persist_tick: u64 = 0,
     /// Counter for dry-run fill simulation (every ~30s when in dry-run).
     sim_tick: u64 = 0,
+
+    // ─── Phase 6 engine integration: live market-data sources ───────────
+    /// In-memory HL top-of-book cache (null when market data is disabled).
+    /// Used as the live source for both market-making evaluation and the
+    /// CEX↔DEX arb evaluator instead of the legacy `orderbooks` table.
+    hl_ob: ?*hl_orderbook.Orderbook = null,
+    /// HL coin symbols (e.g. BTC, ETH, SOL) the orderbook feed tracks.
+    hl_symbols: ?[][]const u8 = null,
+    /// In-memory Binance bookTicker cache for arb mid prices.
+    binance_feed: ?*binance_ws.BinanceFeed = null,
+    /// Binance symbols (e.g. BTCUSDT) index-aligned with `hl_symbols`.
+    binance_symbols: ?[][]const u8 = null,
+
+    // ─── Phase 6 CEX↔DEX arb ────────────────────────────────────────────
+    /// Arb evaluator state. Owned and mutated exclusively by the strategy
+    /// worker thread, so it needs no extra synchronisation.
+    arb: cex_dex_arb.ArbState = cex_dex_arb.ArbState.init(.{}),
+    /// Whether the arb evaluator runs at all (ENABLE_CEX_DEX_ARB).
+    arb_enabled: bool = false,
+    /// Whether confirmed arb signals are submitted as live taker orders.
+    /// Defaults false: the live arb order lifecycle (open/close tracking and
+    /// the circuit-breaker P&L feedback) is intentionally deferred, so this
+    /// phase only emits telemetry to `arb_events`.
+    arb_submit_orders: bool = false,
 };
 
 /// Strategy worker: periodically evaluates enabled strategies and dispatches signals.
@@ -527,6 +576,11 @@ fn strategyWorker(ctx: *StrategyWorkerCtx) void {
         // Evaluate liquidity provision using recent orderbook data
         if (ctx.se.isEnabled(.market_making)) {
             evaluateLpSignals(ctx);
+        }
+
+        // Phase 6: CEX↔DEX arb evaluation (telemetry-only by default).
+        if (ctx.arb_enabled) {
+            evaluateArbSignals(ctx);
         }
 
         // Persist strategy stats + balance snapshot once every 5 minutes.
@@ -590,6 +644,85 @@ fn evaluateLpSignals(ctx: *StrategyWorkerCtx) void {
             }
         }
     }
+}
+
+/// Phase 6: evaluate CEX↔DEX (Binance↔Hyperliquid) basis arbitrage.
+///
+/// Reads the live in-memory HL and Binance mids per asset, runs the pure
+/// `ArbState` evaluator (signed delta → confirm window → circuit breaker),
+/// and persists every confirmed signal to `arb_events`. Live taker order
+/// submission is gated behind `arb_submit_orders` (default off): the arb
+/// order lifecycle and circuit-breaker P&L feedback are intentionally
+/// deferred to a later, separately-reviewed change, so this path is
+/// telemetry-only.
+fn evaluateArbSignals(ctx: *StrategyWorkerCtx) void {
+    const hl_ob = ctx.hl_ob orelse return;
+    const hl_syms = ctx.hl_symbols orelse return;
+    const now = std.time.timestamp();
+    const now_ns = std.time.nanoTimestamp();
+    const max_age_ns: i128 = 10 * std.time.ns_per_s;
+
+    for (hl_syms, 0..) |sym, i| {
+        const hlq = hl_ob.quote(sym) orelse continue;
+        if (hlq.ts_ns == 0) continue;
+        if (now_ns - @as(i128, hlq.ts_ns) > max_age_ns) continue;
+        if (hlq.mid <= 0) continue;
+
+        const binance_mid = arbBinanceMid(ctx, sym, i, now_ns, max_age_ns) orelse continue;
+
+        const sig = ctx.arb.evaluate(sym, binance_mid, hlq.mid, now) orelse continue;
+
+        ctx.database.insertArbEvent(sym, sig.binance_mid, sig.hl_mid, sig.delta_bps, null) catch |e| {
+            log.warn("arb", "failed to persist arb event for {s}: {s}", .{ sym, @errorName(e) });
+        };
+
+        const side: []const u8 = switch (sig.direction) {
+            .short_hl_long_cex => "sell",
+            .long_hl_short_cex => "buy",
+        };
+        log.info("arb", "confirmed signal {s} hl_side={s} delta={d:.2}bps binance={d:.4} hl={d:.4} submit={any}", .{
+            sym, side, sig.delta_bps, sig.binance_mid, sig.hl_mid, ctx.arb_submit_orders,
+        });
+
+        // NOTE: live taker submission (ctx.arb_submit_orders) and the
+        // ArbState.recordTradeResult circuit-breaker feedback are deferred;
+        // see StrategyWorkerCtx.arb_submit_orders.
+    }
+}
+
+/// Resolve the latest Binance mid for an HL coin symbol. Prefers the live
+/// in-memory feed (index-aligned `binance_symbols`, else `<SYM>USDT`) and
+/// falls back to the most recent persisted `binance_prices` row. Returns
+/// null when no sufficiently-fresh quote is available.
+fn arbBinanceMid(
+    ctx: *StrategyWorkerCtx,
+    hl_symbol: []const u8,
+    idx: usize,
+    now_ns: i128,
+    max_age_ns: i128,
+) ?f64 {
+    var sym_buf: [32]u8 = undefined;
+    const bsym: []const u8 = blk: {
+        if (ctx.binance_symbols) |bs| {
+            if (idx < bs.len) break :blk bs[idx];
+        }
+        break :blk std.fmt.bufPrint(&sym_buf, "{s}USDT", .{hl_symbol}) catch return null;
+    };
+
+    if (ctx.binance_feed) |feed| {
+        if (feed.quote(bsym)) |q| {
+            if (q.ts_ns != 0 and now_ns - @as(i128, q.ts_ns) <= max_age_ns and q.mid > 0) {
+                return q.mid;
+            }
+        }
+    }
+
+    if (ctx.database.queryLatestBinancePrice(bsym)) |row| {
+        if (row.ts_ns != 0 and now_ns - @as(i128, row.ts_ns) <= max_age_ns and row.mid > 0) {
+            return row.mid;
+        }
+    }
+    return null;
 }
 
 fn cancelOrphanLpBuys(ctx: *StrategyWorkerCtx) void {

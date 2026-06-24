@@ -29,6 +29,14 @@ pub const Level = struct {
     size: f64 = 0.0,
 };
 
+/// Immutable top-of-book snapshot returned by `Orderbook.quote`.
+pub const Quote = struct {
+    bid: f64,
+    ask: f64,
+    mid: f64,
+    ts_ns: i64,
+};
+
 pub const Book = struct {
     bids: [MAX_LEVELS]Level = [_]Level{.{}} ** MAX_LEVELS,
     n_bids: u8 = 0,
@@ -155,6 +163,20 @@ pub const Orderbook = struct {
         defer self.mu.unlock();
         const e = self.findEntry(symbol) orelse return null;
         return e.book.mid();
+    }
+
+    /// Top-of-book snapshot for `symbol` read under a single lock so the
+    /// bid/ask/mid are mutually consistent (the separate best*/mid getters
+    /// each re-lock and could observe a partially-updated book between
+    /// calls). Returns null when the symbol is unknown or has no two-sided
+    /// book yet.
+    pub fn quote(self: *Orderbook, symbol: []const u8) ?Quote {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const e = self.findEntry(symbol) orelse return null;
+        const b = e.book.bestBid() orelse return null;
+        const a = e.book.bestAsk() orelse return null;
+        return Quote{ .bid = b, .ask = a, .mid = (b + a) / 2.0, .ts_ns = e.book.last_update_ns };
     }
 
     /// Replace the entire book for `symbol` with `bids`/`asks` (sorted

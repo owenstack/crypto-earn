@@ -274,6 +274,22 @@ pub const FillPoller = struct {
 
         if (local.market_id_len > 0 and local.side_len > 0) {
             self.pt.applyFillDelta(local.marketId(), fill.sz, fill.px, local.side());
+
+            // Phase 6 engine integration: feed market-making fills into the
+            // strategy engine's per-market inventory + skew state machine so
+            // live quoting reacts to accumulated inventory. Only runs when a
+            // strategy engine is wired and the order was an MM order; other
+            // origins (e.g. arb takers) do not touch MM inventory. Inventory
+            // is mutated only here, where `applyFillToDb` reported
+            // `updated=true`, so duplicate WS/REST fill events (which return
+            // `updated=false` on the second sighting) cannot double-count.
+            if (self.se) |se| {
+                if (local.isMarketMaking()) {
+                    const dir: strategy.SignalDirection =
+                        if (std.mem.eql(u8, local.side(), "buy")) .buy else .sell;
+                    se.recordMarketMakingFill(local.marketId(), dir, fill.sz, fill.px);
+                }
+            }
         }
         hl_fill.emitFillEvent(fill, result.new_status);
         return true;
@@ -284,6 +300,8 @@ pub const FillPoller = struct {
         market_id_len: usize = 0,
         side_buf: [8]u8 = [_]u8{0} ** 8,
         side_len: usize = 0,
+        origin_buf: [32]u8 = [_]u8{0} ** 32,
+        origin_len: usize = 0,
 
         fn marketId(self: *const LocalOrderRef) []const u8 {
             return self.market_id_buf[0..self.market_id_len];
@@ -292,11 +310,24 @@ pub const FillPoller = struct {
         fn side(self: *const LocalOrderRef) []const u8 {
             return self.side_buf[0..self.side_len];
         }
+
+        fn origin(self: *const LocalOrderRef) []const u8 {
+            return self.origin_buf[0..self.origin_len];
+        }
+
+        /// True when the originating order was placed by the market-making
+        /// strategy (current tag) or the legacy `liquidity_provision`
+        /// alias retained for orders predating the Phase 6 rename.
+        fn isMarketMaking(self: *const LocalOrderRef) bool {
+            const o = self.origin();
+            return std.mem.eql(u8, o, "market_making") or
+                std.mem.eql(u8, o, "liquidity_provision");
+        }
     };
 
     fn resolveLocalOrder(self: *FillPoller, oid: []const u8) LocalOrderRef {
         var out = LocalOrderRef{};
-        const sql = "SELECT market_id, side FROM orders WHERE id=? OR client_order_id=? LIMIT 1;" ++ &[_:0]u8{};
+        const sql = "SELECT market_id, side, COALESCE(strategy_origin,'') FROM orders WHERE id=? OR client_order_id=? LIMIT 1;" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return out;
         defer _ = c.sqlite3_finalize(stmt);
@@ -315,6 +346,12 @@ pub const FillPoller = struct {
             const n = @min(span.len, out.side_buf.len);
             @memcpy(out.side_buf[0..n], span[0..n]);
             out.side_len = n;
+        }
+        if (c.sqlite3_column_text(stmt, 2)) |p| {
+            const span = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+            const n = @min(span.len, out.origin_buf.len);
+            @memcpy(out.origin_buf[0..n], span[0..n]);
+            out.origin_len = n;
         }
         return out;
     }
