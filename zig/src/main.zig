@@ -608,34 +608,33 @@ fn strategyWorker(ctx: *StrategyWorkerCtx) void {
 fn evaluateLpSignals(ctx: *StrategyWorkerCtx) void {
     cancelOrphanLpBuys(ctx);
 
+    const hl_ob = ctx.hl_ob orelse {
+        log.debug("strategy_worker", "skipping market_making: HL orderbook cache unavailable", .{});
+        return;
+    };
+    const hl_syms = ctx.hl_symbols orelse {
+        log.debug("strategy_worker", "skipping market_making: HL symbols unavailable", .{});
+        return;
+    };
+    const now_ns = std.time.nanoTimestamp();
+    const max_age_ns: i128 = 10 * std.time.ns_per_s;
+
     // Read cooldown from runtime_config; default 15s, clamp 5–300s.
     var cd_buf: [16]u8 = undefined;
     const cd_str = ctx.database.getConfig("lp_cooldown_seconds", &cd_buf) orelse "15";
     const cooldown_s = std.fmt.parseInt(i64, cd_str, 10) catch 15;
     const cooldown = std.math.clamp(cooldown_s, @as(i64, 5), @as(i64, 300));
 
-    // Get the most recent bid/ask per market from the last 30 seconds, using gamma_id as the market identifier
-    const sql = "SELECT gamma_id, best_bid, best_ask FROM orderbooks WHERE gamma_id IS NOT NULL AND id IN (SELECT MAX(id) FROM orderbooks WHERE created_at >= unixepoch() - 30 AND gamma_id IS NOT NULL GROUP BY gamma_id);" ++ &[_:0]u8{};
-    var stmt: ?*db.c.sqlite3_stmt = null;
-    if (db.c.sqlite3_prepare_v2(ctx.database.handle, sql.ptr, -1, &stmt, null) != db.c.SQLITE_OK) return;
-    defer _ = db.c.sqlite3_finalize(stmt);
-
-    while (db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW) {
-        const gid_raw = db.c.sqlite3_column_text(stmt, 0);
-        const gid_span = if (gid_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else continue;
-        const bid_raw = db.c.sqlite3_column_text(stmt, 1);
-        const bid_span = if (bid_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else continue;
-        const ask_raw = db.c.sqlite3_column_text(stmt, 2);
-        const ask_span = if (ask_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else continue;
-
-        const best_bid = std.fmt.parseFloat(f64, bid_span) catch continue;
-        const best_ask = std.fmt.parseFloat(f64, ask_span) catch continue;
+    for (hl_syms) |sym| {
+        const quote = hl_ob.quote(sym) orelse continue;
+        if (quote.ts_ns == 0) continue;
+        if (now_ns - @as(i128, quote.ts_ns) > max_age_ns) continue;
+        if (quote.bid <= 0 or quote.ask <= 0 or quote.ask <= quote.bid) continue;
 
         // Per-market cooldown: configurable via runtime_config.lp_cooldown_seconds.
-        if (ctx.se.checkLpCooldown(gid_span, cooldown)) continue;
+        if (ctx.se.checkLpCooldown(sym, cooldown)) continue;
 
-        // Pass gamma_id (Gamma market id) so placeOrder receives a Gamma id
-        const lp_result = ctx.se.evaluateLiquidityProvision(gid_span, best_bid, best_ask, ctx.pt.usdc_balance);
+        const lp_result = ctx.se.evaluateLiquidityProvision(sym, quote.bid, quote.ask, ctx.pt.usdc_balance);
         if (lp_result.count == 2) {
             dispatchLpPair(ctx, lp_result.signals[0], lp_result.signals[1]);
         } else {
@@ -763,13 +762,13 @@ fn cancelOrphanLpBuys(ctx: *StrategyWorkerCtx) void {
     }
 }
 
-/// Query the latest orderbook (best bid/ask + mid) for a Gamma market id.
+/// Query the latest persisted HL orderbook (best bid/ask + mid) for a coin symbol.
 fn queryOrderbookForMarket(database: *db.DB, market_id: []const u8) ?struct {
     best_bid: f64,
     best_ask: f64,
     mid_price: f64,
 } {
-    const sql = "SELECT best_bid, best_ask, mid_price FROM orderbooks WHERE gamma_id=? ORDER BY created_at DESC LIMIT 1;" ++ &[_:0]u8{};
+    const sql = "SELECT best_bid, best_ask, mid_price FROM orderbooks WHERE market=? ORDER BY created_at DESC LIMIT 1;" ++ &[_:0]u8{};
     var stmt: ?*db.c.sqlite3_stmt = null;
     if (db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) != db.c.SQLITE_OK) return null;
     defer _ = db.c.sqlite3_finalize(stmt);
@@ -925,12 +924,11 @@ fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
 
     const market_id = signal.market_id[0..signal.market_id_len];
     const side_str: []const u8 = if (signal.direction == .buy) "buy" else "sell";
-
-    // Round price to 0.01 tick size (Polymarket default min_tick_size)
-    const tick = 0.01;
-    const rounded_price = @round(signal.price / tick) * tick;
-    // Clamp to valid Polymarket price range (0.01 to 0.99)
-    const clamped_price = std.math.clamp(rounded_price, 0.01, 0.99);
+    const order_price = normalizePerpLimitPrice(signal.price) orelse {
+        log.warn("strategy_worker", "skipping signal with invalid price: market={s} price={d}", .{ market_id, signal.price });
+        ctx.se.incrementOrdersRejected(signal.strategy);
+        return;
+    };
 
     // Optional runtime override: hard cap on order notional (USD).
     // Allows `/config set max_order_size_usd 5.00` to throttle orders during
@@ -942,10 +940,8 @@ fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
         const cap_str_opt = ctx.database.getConfig("max_order_size_usd", &cap_buf);
         if (cap_str_opt) |cap_str| {
             if (std.fmt.parseFloat(f64, cap_str)) |cap_usd| {
-                if (clamped_price > 0) {
-                    const cap_size = cap_usd / clamped_price;
-                    if (effective_size > cap_size) effective_size = cap_size;
-                }
+                const cap_size = cap_usd / order_price;
+                if (effective_size > cap_size) effective_size = cap_size;
             } else |_| {}
         }
     }
@@ -955,11 +951,11 @@ fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
     }
 
     var price_buf: [32]u8 = undefined;
-    const price_str = std.fmt.bufPrint(&price_buf, "{d:.2}", .{clamped_price}) catch "0";
+    const price_str = std.fmt.bufPrint(&price_buf, "{d:.6}", .{order_price}) catch "0";
     var size_buf: [32]u8 = undefined;
     const size_str = std.fmt.bufPrint(&size_buf, "{d:.2}", .{effective_size}) catch "0";
 
-    const notional = effective_size * clamped_price;
+    const notional = effective_size * order_price;
     if (shouldSkipForMaxPosition(ctx, market_id, side_str, notional)) return;
 
     const origin = @tagName(signal.strategy);
@@ -1009,6 +1005,20 @@ fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
             ctx.se.incrementOrdersRejected(signal.strategy);
         },
     }
+}
+
+fn normalizePerpLimitPrice(price: f64) ?f64 {
+    if (!std.math.isFinite(price) or price <= 0) return null;
+    const tick: f64 = 0.01;
+    const rounded = @round(price / tick) * tick;
+    if (rounded <= 0) return null;
+    return rounded;
+}
+
+test "normalizePerpLimitPrice keeps perp-scale prices above prediction-market range" {
+    const rounded = normalizePerpLimitPrice(50_000.123) orelse return error.TestExpectedEqual;
+    try std.testing.expectApproxEqAbs(@as(f64, 50_000.12), rounded, 1e-9);
+    try std.testing.expectEqual(@as(?f64, null), normalizePerpLimitPrice(0.0));
 }
 
 fn shouldSkipForMaxPosition(ctx: *StrategyWorkerCtx, market_id: []const u8, side: []const u8, notional: f64) bool {
@@ -1083,8 +1093,6 @@ fn dispatchLpPair(ctx: *StrategyWorkerCtx, buy_signal: strategy.Signal, sell_sig
     if (ctx.om.isHalted()) return;
     if (checkSaturation(ctx)) return;
 
-    const tick: f64 = 0.01;
-
     const buy_market_id = buy_signal.market_id[0..buy_signal.market_id_len];
     const sell_market_id = sell_signal.market_id[0..sell_signal.market_id_len];
 
@@ -1099,8 +1107,16 @@ fn dispatchLpPair(ctx: *StrategyWorkerCtx, buy_signal: strategy.Signal, sell_sig
         }
     }
 
-    const buy_price = std.math.clamp(@round(buy_signal.price / tick) * tick, 0.01, 0.99);
-    const sell_price = std.math.clamp(@round(sell_signal.price / tick) * tick, 0.01, 0.99);
+    const buy_price = normalizePerpLimitPrice(buy_signal.price) orelse {
+        log.warn("strategy_worker", "lp_pair: invalid buy price market={s} price={d}", .{ buy_market_id, buy_signal.price });
+        ctx.se.incrementOrdersRejected(.market_making);
+        return;
+    };
+    const sell_price = normalizePerpLimitPrice(sell_signal.price) orelse {
+        log.warn("strategy_worker", "lp_pair: invalid sell price market={s} price={d}", .{ sell_market_id, sell_signal.price });
+        ctx.se.incrementOrdersRejected(.market_making);
+        return;
+    };
 
     var buy_size = buy_signal.size;
     var sell_size = sell_signal.size;
@@ -1120,8 +1136,8 @@ fn dispatchLpPair(ctx: *StrategyWorkerCtx, buy_signal: strategy.Signal, sell_sig
     var buy_size_buf: [32]u8 = undefined;
     var sell_size_buf: [32]u8 = undefined;
 
-    const buy_price_str = std.fmt.bufPrint(&buy_price_buf, "{d:.2}", .{buy_price}) catch "0";
-    const sell_price_str = std.fmt.bufPrint(&sell_price_buf, "{d:.2}", .{sell_price}) catch "0";
+    const buy_price_str = std.fmt.bufPrint(&buy_price_buf, "{d:.6}", .{buy_price}) catch "0";
+    const sell_price_str = std.fmt.bufPrint(&sell_price_buf, "{d:.6}", .{sell_price}) catch "0";
     const buy_size_str = std.fmt.bufPrint(&buy_size_buf, "{d:.2}", .{buy_size}) catch "0";
     const sell_size_str = std.fmt.bufPrint(&sell_size_buf, "{d:.2}", .{sell_size}) catch "0";
 

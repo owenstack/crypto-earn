@@ -66,24 +66,31 @@ pub const StrategyConfig = struct {
     mm_skew_quote_pct: f64 = 0.05,
 };
 
-/// Polymarket CLOB share floor. Orders below this are dust-rejected.
+/// Minimum order quantity used by the strategy sizing fallback.
 pub const MIN_ORDER_SHARES: f64 = 5.0;
-/// Polymarket CLOB notional floor (USD). Orders smaller than this are dust.
+/// Minimum order notional (USD) used by the strategy sizing fallback.
 pub const MIN_ORDER_NOTIONAL_USD: f64 = 1.0;
 
 /// Resolve a strategy order size (in shares) from a balance-scaled DOLLAR
-/// fraction at a given quote price. Replaces the legacy share-only sizing,
-/// which ignored price and over-committed at low prices.
+/// fraction at a given quote price.
 ///
 /// Semantics:
 ///   target_usd = balance > 0 ? balance * pct : fallback_usd
 ///   notional   = max(target_usd, MIN_ORDER_NOTIONAL_USD)
 ///   shares     = max(notional / price, MIN_ORDER_SHARES)
 pub fn resolveOrderSize(balance: f64, pct: f64, price: f64, fallback_usd: f64) f64 {
-    const px = std.math.clamp(price, 0.01, 0.99);
+    const px = if (std.math.isFinite(price) and price > 0) price else 0.01;
     const target_usd = if (balance <= 0) fallback_usd else balance * pct;
     const notional_usd = @max(target_usd, MIN_ORDER_NOTIONAL_USD);
     return @max(notional_usd / px, MIN_ORDER_SHARES);
+}
+
+test "resolveOrderSize uses perp-scale prices without prediction-market cap" {
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 20.0),
+        resolveOrderSize(0.0, 0.1, 50_000.0, 1_000_000.0),
+        1e-9,
+    );
 }
 
 pub const StrategyStats = struct {
