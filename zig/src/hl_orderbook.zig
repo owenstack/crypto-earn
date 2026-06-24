@@ -518,6 +518,30 @@ test "hl_orderbook: delta zero-size removes level" {
     try testing.expectEqual(@as(?f64, 100.5), ob.bestAsk("ETH"));
 }
 
+test "hl_orderbook: quote returns consistent bid/ask/mid under one lock" {
+    var syms = [_][]const u8{"BTC"};
+    var ob = Orderbook.init(testing.allocator, HL_WS_HOST_TESTNET, &syms);
+    defer ob.deinit();
+
+    const bids = [_]Level{.{ .price = 100.0, .size = 1.0 }};
+    const asks = [_]Level{.{ .price = 104.0, .size = 1.0 }};
+    ob.applySnapshot("BTC", &bids, &asks, 42);
+
+    const q = ob.quote("BTC");
+    try testing.expect(q != null);
+    try testing.expectEqual(@as(f64, 100.0), q.?.bid);
+    try testing.expectEqual(@as(f64, 104.0), q.?.ask);
+    try testing.expectEqual(@as(f64, 102.0), q.?.mid);
+    try testing.expectEqual(@as(i64, 42), q.?.ts_ns);
+
+    // Unknown symbol and one-sided books both yield null.
+    try testing.expect(ob.quote("ETH") == null);
+
+    const one_sided = [_]Level{};
+    ob.applySnapshot("BTC", &one_sided, &asks, 43);
+    try testing.expect(ob.quote("BTC") == null);
+}
+
 test "hl_orderbook: mid returns null when one side empty" {
     var syms = [_][]const u8{"SOL"};
     var ob = Orderbook.init(testing.allocator, HL_WS_HOST_TESTNET, &syms);

@@ -462,3 +462,122 @@ test "fill_poller: parseOrderResponse returns null for invalid json" {
     const result = FillPoller.parseOrderResponse("not json");
     try std.testing.expect(result == null);
 }
+
+// ─── Phase 6: market-making inventory wiring through fills ───────────────────
+
+fn mkFill(oid: []const u8, side: []const u8, sz: f64, px: f64, time_ms: i64) hl_fill.HlFill {
+    var f = hl_fill.HlFill{
+        .oid = [_]u8{0} ** 40,
+        .oid_len = 0,
+        .sz = sz,
+        .px = px,
+        .side = [_]u8{0} ** 4,
+        .side_len = @intCast(side.len),
+        .time_ms = time_ms,
+    };
+    @memcpy(f.oid[0..oid.len], oid);
+    f.oid_len = oid.len;
+    @memcpy(f.side[0..side.len], side);
+    return f;
+}
+
+/// Test harness for the fill → inventory path. OrderManager, PortfolioTracker
+/// and StrategyEngine are large fixed-array structs, so they are heap-allocated
+/// to keep the test's stack frame small (the parallel test runner gives each
+/// test thread a modest stack). None of the inits allocate, so destroy is the
+/// only cleanup required.
+const FillHarness = struct {
+    om: *order_mgr.OrderManager,
+    pt: *portfolio.PortfolioTracker,
+    se: *strategy.StrategyEngine,
+    fp: FillPoller,
+
+    fn init(database: *db_mod.DB) !FillHarness {
+        const a = std.testing.allocator;
+        const om = try a.create(order_mgr.OrderManager);
+        om.* = order_mgr.OrderManager.init(a, database, .{}, .{});
+        const pt = try a.create(portfolio.PortfolioTracker);
+        pt.* = portfolio.PortfolioTracker.init(a, database, .{});
+        const se = try a.create(strategy.StrategyEngine);
+        se.* = strategy.StrategyEngine.init(.{});
+        return .{ .om = om, .pt = pt, .se = se, .fp = FillPoller.init(a, database, om, pt, se) };
+    }
+
+    fn deinit(self: *FillHarness) void {
+        const a = std.testing.allocator;
+        a.destroy(self.om);
+        a.destroy(self.pt);
+        a.destroy(self.se);
+    }
+};
+
+test "fill_poller: market-making fill updates strategy inventory + skew" {
+    var database = try db_mod.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('M-BTC','BTC','BTC','USDC');");
+    // market_id is the HL coin symbol; strategy_origin marks it as MM.
+    try database.execZ(
+        "INSERT INTO orders(id,market_id,client_order_id,type,side,size,price,status,filled_size,strategy_origin) " ++
+            "VALUES('order-mm','BTC','77001','limit','buy','0.10','45000','placed','0','market_making');",
+    );
+
+    var h = try FillHarness.init(&database);
+    defer h.deinit();
+
+    // Default lp_max_position_usd=50 → enter threshold 25. One buy fill of
+    // 0.001 BTC @ 45000 = $45 exposure crosses it → long_skewed.
+    try std.testing.expect(h.fp.applyFill(mkFill("77001", "buy", 0.001, 45000.0, 1)));
+    try std.testing.expectEqual(strategy.SkewState.long_skewed, h.se.skewStateFor("BTC"));
+}
+
+test "fill_poller: non market-making fill leaves MM inventory untouched" {
+    var database = try db_mod.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('M-BTC','BTC','BTC','USDC');");
+    try database.execZ(
+        "INSERT INTO orders(id,market_id,client_order_id,type,side,size,price,status,filled_size,strategy_origin) " ++
+            "VALUES('order-arb','BTC','77002','limit','buy','0.10','45000','placed','0','cex_dex_arb');",
+    );
+
+    var h = try FillHarness.init(&database);
+    defer h.deinit();
+
+    try std.testing.expect(h.fp.applyFill(mkFill("77002", "buy", 0.001, 45000.0, 1)));
+    // Arb fill must not seed MM inventory.
+    try std.testing.expectEqual(strategy.SkewState.normal, h.se.skewStateFor("BTC"));
+}
+
+test "fill_poller: duplicate fill does not double-count MM inventory" {
+    var database = try db_mod.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('M-BTC','BTC','BTC','USDC');");
+    try database.execZ(
+        "INSERT INTO orders(id,market_id,client_order_id,type,side,size,price,status,filled_size,strategy_origin) " ++
+            "VALUES('order-mm','BTC','77003','limit','buy','0.10','45000','placed','0','market_making');",
+    );
+
+    var h = try FillHarness.init(&database);
+    defer h.deinit();
+
+    // First fill: $18 exposure (0.0004 * 45000) — below the $25 enter
+    // threshold, so state stays normal.
+    try std.testing.expect(h.fp.applyFill(mkFill("77003", "buy", 0.0004, 45000.0, 1)));
+    try std.testing.expectEqual(strategy.SkewState.normal, h.se.skewStateFor("BTC"));
+
+    // Exact replay (same oid + time_ms) is deduped by applyFillToDb and must
+    // NOT touch inventory; otherwise the doubled $36 exposure would flip the
+    // state to long_skewed.
+    try std.testing.expect(!h.fp.applyFill(mkFill("77003", "buy", 0.0004, 45000.0, 1)));
+    try std.testing.expectEqual(strategy.SkewState.normal, h.se.skewStateFor("BTC"));
+
+    // A genuinely new fill (distinct time_ms) does count: net $36 crosses
+    // the enter threshold → long_skewed.
+    try std.testing.expect(h.fp.applyFill(mkFill("77003", "buy", 0.0004, 45000.0, 2)));
+    try std.testing.expectEqual(strategy.SkewState.long_skewed, h.se.skewStateFor("BTC"));
+}

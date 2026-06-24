@@ -507,7 +507,7 @@ test "hl_fill_poller: applyFillToDb updates order + inserts fill" {
     try std.testing.expectEqualStrings("partially_filled", r.new_status);
     try std.testing.expectApproxEqAbs(@as(f64, 0.5), r.fill_ratio, 1e-9);
 
-    // Apply the rest at a different price → fully filled; VWAP = (45000*0.05 + 46000*0.05) / 0.1
+    // Apply the rest at a different price → fully filled; VWAP = (45100*0.05 + 46000*0.05) / 0.1
     fill.time_ms = 1_700_000_001_000;
     fill.px = 46000.0;
     const r2 = try applyFillToDb(&database, fill);
@@ -527,7 +527,7 @@ test "hl_fill_poller: applyFillToDb updates order + inserts fill" {
     try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt2));
     const avg_span = std.mem.span(c.sqlite3_column_text(stmt2, 0).?);
     const vwap = try std.fmt.parseFloat(f64, avg_span);
-    try std.testing.expectApproxEqAbs(@as(f64, 45500.0), vwap, 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f64, 45550.0), vwap, 1e-3);
 
     // Replaying the same fill id is ignored before mutating filled_size.
     const replay = try applyFillToDb(&database, fill);
