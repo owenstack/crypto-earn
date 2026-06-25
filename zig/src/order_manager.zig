@@ -130,8 +130,8 @@ pub const OrderManager = struct {
     should_stop: std.atomic.Value(bool),
     reconciliation_complete: std.atomic.Value(bool),
     domain_separator: [32]u8,
-    /// Phase 3: shared asset metadata (symbol → asset_index). May be null
-    /// for tests / legacy paths; falls back to asset_index 0 when absent.
+    /// Phase 3: shared asset metadata (symbol -> asset_index). May be null
+    /// for tests / legacy paths where HL submission is disabled.
     asset_meta: ?*hl_market_meta.AssetMeta = null,
 
     pub fn init(
@@ -167,28 +167,30 @@ pub const OrderManager = struct {
         self.asset_meta = meta;
     }
 
-    /// Resolve the asset index for an order. Returns 0 when no metadata is
-    /// bound (legacy/test path) or the symbol is unknown — the latter is
-    /// also logged so misconfigured strategies are visible.
-    fn resolveAssetIndex(self: *OrderManager, market_id: []const u8) i64 {
+    /// Resolve the asset index for an HL order/cancel. A missing cache or
+    /// symbol is a live-trading safety rejection, not an asset_index=0
+    /// fallback.
+    fn resolveAssetIndex(self: *OrderManager, market_id: []const u8) ?i64 {
         if (self.asset_meta) |meta| {
             if (meta.lookup(market_id)) |idx| return @intCast(idx);
-            log.warn("order_mgr", "asset_meta lookup miss for symbol {s}; using 0", .{market_id});
+            log.warn("order_mgr", "asset_meta lookup miss for symbol {s}", .{market_id});
+            return null;
         }
-        return 0;
+        log.warn("order_mgr", "asset_meta unavailable while resolving symbol {s}", .{market_id});
+        return null;
     }
 
-    /// Resolve the asset index for a cancel by joining orders → market_id →
-    /// hl_market_meta. Falls back to 0 if any link is missing.
-    fn resolveCancelAssetIndex(self: *OrderManager, order_id: []const u8) i64 {
+    /// Resolve the asset index for a cancel by joining orders -> market_id ->
+    /// hl_market_meta. Returns null if any link is missing.
+    fn resolveCancelAssetIndex(self: *OrderManager, order_id: []const u8) ?i64 {
         const sql = "SELECT market_id FROM orders WHERE id=? LIMIT 1;" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return 0;
+        if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return null;
         defer _ = c.sqlite3_finalize(stmt);
-        if (c.sqlite3_bind_text(stmt, 1, order_id.ptr, @intCast(order_id.len), null) != c.SQLITE_OK) return 0;
-        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+        if (c.sqlite3_bind_text(stmt, 1, order_id.ptr, @intCast(order_id.len), null) != c.SQLITE_OK) return null;
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
         const raw = c.sqlite3_column_text(stmt, 0);
-        const market_id = if (raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else return 0;
+        const market_id = if (raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else return null;
         return self.resolveAssetIndex(market_id);
     }
 
@@ -259,6 +261,13 @@ pub const OrderManager = struct {
 
         if (strategy_origin) |so| {
             log.info("order_mgr", "order from strategy: {s}", .{so});
+        }
+
+        if (self.config.hl.enabled and !self.config.dry_run_enabled) {
+            if (self.resolveAssetIndex(market_id) == null) {
+                log.warn("order_mgr", "order rejected: unknown HL symbol {s}", .{market_id});
+                return .{ .rejected = .{ .reason = "unknown_hl_symbol" } };
+            }
         }
 
         // Phase 4: Dry-run interception. The risk gate has already passed
@@ -858,7 +867,10 @@ pub const OrderManager = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
 
-        const asset_index = self.resolveAssetIndex(market_id);
+        const asset_index = self.resolveAssetIndex(market_id) orelse {
+            log.err("order_mgr", "refusing HL submit without asset metadata for {s}", .{market_id});
+            return false;
+        };
         const action = buildOrderAction(arena.allocator(), asset_index, market_id, side, size, price, order_type) catch |e| {
             log.err("order_mgr", "failed to build HL order action: {s}", .{@errorName(e)});
             return false;
@@ -949,7 +961,10 @@ pub const OrderManager = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
 
-        const asset_index = self.resolveCancelAssetIndex(order_id);
+        const asset_index = self.resolveCancelAssetIndex(order_id) orelse {
+            log.err("order_mgr", "refusing HL cancel without asset metadata for order {s}", .{order_id});
+            return false;
+        };
         const action = buildCancelAction(arena.allocator(), asset_index, order_id) catch |e| {
             log.err("order_mgr", "failed to build HL cancel action: {s}", .{@errorName(e)});
             return false;

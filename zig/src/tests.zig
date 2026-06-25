@@ -2243,6 +2243,63 @@ test "phase3 order_manager: setAssetMeta resolves asset_index for orders" {
     try testing.expect(meta.lookup("DOGE") == null);
 }
 
+test "phase3 order_manager: live order rejects when asset metadata is missing" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    var om = order_manager_mod.OrderManager.init(testing.allocator, &database, .{}, .{
+        .hl = .{ .enabled = true },
+    });
+    om.reconciliation_complete.store(true, .seq_cst);
+
+    const result = om.placeOrder("BTC", "buy", "1", "1.00", "limit", null);
+    switch (result) {
+        .rejected => |r| try testing.expectEqualStrings("unknown_hl_symbol", r.reason),
+        else => try testing.expect(false),
+    }
+
+    const sql = "SELECT COUNT(*) FROM orders;" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(stmt);
+    try testing.expect(db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW);
+    try testing.expectEqual(@as(c_int, 0), db.c.sqlite3_column_int(stmt, 0));
+}
+
+test "phase3 order_manager: live order rejects unknown HL symbol instead of asset zero fallback" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    var meta = hl_market_meta.AssetMeta.init(testing.allocator, "https://api.hyperliquid-testnet.xyz");
+    defer meta.deinit();
+
+    var btc: hl_market_meta.Asset = .{};
+    @memcpy(btc.name_buf[0..3], "BTC");
+    btc.name_len = 3;
+    try meta.replace(&[_]hl_market_meta.Asset{btc});
+
+    var om = order_manager_mod.OrderManager.init(testing.allocator, &database, .{}, .{
+        .hl = .{ .enabled = true },
+    });
+    om.setAssetMeta(&meta);
+    om.reconciliation_complete.store(true, .seq_cst);
+
+    const result = om.placeOrder("DOGE", "buy", "1", "1.00", "limit", null);
+    switch (result) {
+        .rejected => |r| try testing.expectEqualStrings("unknown_hl_symbol", r.reason),
+        else => try testing.expect(false),
+    }
+
+    const sql = "SELECT COUNT(*) FROM orders;" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expect(db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) == db.c.SQLITE_OK);
+    defer _ = db.c.sqlite3_finalize(stmt);
+    try testing.expect(db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW);
+    try testing.expectEqual(@as(c_int, 0), db.c.sqlite3_column_int(stmt, 0));
+}
+
 test "phase3 hl_orderbook: snapshot then delta updates best bid/ask" {
     var syms = [_][]const u8{"BTC"};
     var ob = hl_orderbook.Orderbook.init(testing.allocator, hl_orderbook.HL_WS_HOST_TESTNET, &syms);
