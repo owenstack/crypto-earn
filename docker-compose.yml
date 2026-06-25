@@ -10,8 +10,9 @@ services:
     environment:
       DB_PATH: /app/data/cex.db
       IPC_SOCKET: /ipc/cex-engine.sock
-      ENABLE_NEWS_REPRICING: "${ENABLE_NEWS_REPRICING:-1}"
       ENABLE_LIQUIDITY_PROVISION: "${ENABLE_LIQUIDITY_PROVISION:-1}"
+      ENABLE_CEX_DEX_ARB: "${ENABLE_CEX_DEX_ARB:-0}"
+      ARB_SUBMIT_ORDERS: "${ARB_SUBMIT_ORDERS:-0}"
     volumes:
       - engine-data:/app/data
       - ipc:/ipc

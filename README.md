@@ -18,13 +18,13 @@ infrastructure/ — Terraform (Phase 2+)
 | Phase | Scope |
 |-------|-------|
 | **0** | Infrastructure, split architecture, SQLite WAL, IPC transport, read-only control plane |
-| **1** | Strategy signals, risk gate, order execution (CLOB signing) |
-| **2** | Multi-exchange, advanced risk, backtesting |
-| **3** | Paper-trading simulation, P&L tracking |
-| **4** | Live execution hardening, circuit breakers |
-| **5** | Observability, metrics, alerting |
-| **6** | Performance tuning, latency profiling |
-| **7** | Deployment automation, systemd hardening, e2e validation |
+| **1** | Strategy signals, risk gate, order execution |
+| **2** | Hyperliquid signing and authenticated order submission |
+| **3** | Hyperliquid and Binance market-data feeds |
+| **4** | Dry-run simulation and paper order lifecycle |
+| **5** | Hyperliquid portfolio, fills, funding, and control-plane telemetry |
+| **6** | Binance-Hyperliquid arb evaluation |
+| **7** | Hyperliquid schema cleanup, deployment hardening, e2e validation |
 
 ## Prerequisites
 
@@ -65,26 +65,24 @@ Required keys in `.env`:
 - `DASHBOARD_SECRET`: Bearer token used to protect dashboard API routes.
   - Generate with: `openssl rand -hex 32`
   - Example: `d43b6fd9a0a81b7e5f6be4a6bd3d2f0e9f0c0ad4c08371d4d4f3d4a2df922e15`
-- `POLYMARKET_PRIVATE_KEY`: Polymarket wallet private key used by the engine for live order signing.
-- `POLYMARKET_PRIVATE_KEY`: Polymarket wallet private key used by the engine for live order signing.
+- `HL_NETWORK`: Hyperliquid network, either `testnet` or `mainnet`.
+- `HL_API_PRIVATE_KEY`: 32-byte Hyperliquid API wallet private key, with or without `0x`.
+  - Required when `DRY_RUN` is unset or disabled.
 
 Optional/common keys:
 
-- `POLYMARKET_SIGNATURE_TYPE`: Wallet signature type for Polymarket live mode. Accepts `0`/`EOA`, `1`/`POLY_PROXY`, or `2`/`GNOSIS_SAFE`. Defaults to `0`.
-- `POLYMARKET_FUNDER_ADDRESS`: Required when the funded Polymarket wallet differs from the signing key, such as proxy or Safe wallets.
-- `KALSHI_API_KEY` (strongly recommended for primary probability data)
-
-Optional/common keys:
-
-- `KALSHI_API_KEY` (strongly recommended for primary probability data)
+- `HL_SYMBOLS` (default: `BTC,ETH,SOL`): Hyperliquid coins subscribed via `l2Book`.
+- `BINANCE_SYMBOLS` (default: `BTCUSDT,ETHUSDT,SOLUSDT`): Binance USDT-M futures symbols used as cross-venue reference prices.
+- `ENABLE_LIQUIDITY_PROVISION` (default in Docker: `1`): Enables market-making at startup.
+- `ENABLE_CEX_DEX_ARB` (default: `0`): Enables Binance-Hyperliquid arb evaluation.
+- `ARB_SUBMIT_ORDERS` (default: `0`): Submits confirmed arb signals as Hyperliquid taker orders.
+- `DISABLE_MARKET_DATA` (default: unset): Set to `1`/`true` to skip HL and Binance feed threads.
 - `DASHBOARD_PORT` (default: `3000`)
 - `LOG_LEVEL` (example: `info`)
 - `NODE_ENV` (example: `production`)
+- `DRY_RUN` (example: `1`)
 - `DRY_RUN_INITIAL_BALANCE` (default: `10.0`)
-
-Optional overrides:
-
-- `kalshi_market_map`: legacy runtime config override for manually pinning Kalshi tickers to Gamma IDs when auto-discovery is wrong.
+- `HL_CHAIN_ID`, `HL_EIP712_NAME`, `HL_EIP712_VERSION`, `HL_EIP712_VERIFIER_MAINNET`, `HL_EIP712_VERIFIER_TESTNET`: advanced signing-domain overrides.
 
 ## Quick Start (Docker — recommended)
 
@@ -164,28 +162,19 @@ Envelope:
 { "v": 1, "id": "<uuid>", "ts": <epoch_ms>, "type": "<type>", "payload": {} }
 ```
 
+Supported request types include `heartbeat`, `status`, `portfolio`, `orders`,
+`config.get`, `logs`, `funding.snapshot`, and `arb.events`.
+
 ## Market Data Transport
 
-Real-time CLOB price feeds are delivered via WebSocket to
-`ws-subscriptions-clob.polymarket.com`. Token IDs are subscribed dynamically
-as markets are discovered by the scanner. New markets are subscribed without
-reconnecting via dynamic subscription messages on the live socket.
+The engine consumes Hyperliquid `l2Book` WebSocket feeds for the coins in
+`HL_SYMBOLS` and persists book snapshots with their Hyperliquid `asset_index`.
+It also consumes Binance USDT-M `bookTicker` streams for `BINANCE_SYMBOLS`;
+those quotes are used as the cross-venue reference price for arb evaluation.
 
-Supported types (Phase 0): `heartbeat`, `status`, `portfolio`, `orders`, `config.get`, `logs`.
-
-## Kalshi Integration
-
-The engine automatically maps Kalshi tickers to Polymarket markets using a
-three-tier resolution strategy:
-
-1. DB-persisted map: previously discovered mappings that survive restarts.
-2. Runtime auto-map: mappings discovered during the current session.
-3. Title fuzzy-match: normalized matching against market questions in SQLite.
-
-No manual configuration is required. Discovered mappings are written to the
-`kalshi_market_map` table and can be inspected with `/mappings` in Telegram.
-The optional `kalshi_market_map` runtime config key still works as a manual
-override for edge cases.
+Hyperliquid asset metadata is loaded from the configured HL network at startup
+and refreshed periodically so order submission can reject unknown symbols
+instead of falling back to an unsafe asset index.
 
 ## Runtime Tuning
 
@@ -196,9 +185,6 @@ All values below can be changed live with `/config set <key> <value>`.
 | `lp_cooldown_seconds` | 15 | Seconds between LP signals per market |
 | `lp_max_position_usd_pct` | 0.20 | LP max exposure as fraction of balance |
 | `max_order_size_usd` | unset | Hard cap on any single order |
-| `prob_source_poll_seconds` | 60 | Kalshi REST poll interval |
-| `kalshi_series_tickers` | unset | Comma-separated Kalshi series to focus on |
-| `kalshi_api_key` | unset | Required for Kalshi WS primary source |
 
 ## Dry-Run Mode
 

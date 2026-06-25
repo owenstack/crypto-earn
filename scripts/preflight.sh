@@ -10,6 +10,13 @@ DB="${1:-data/cex.db}"
 PASS=0
 FAIL=0
 
+if [[ -f .env ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
+fi
+
 check() {
     local label="$1"
     local condition="$2"
@@ -41,16 +48,20 @@ check "Dry-run filled orders > 10" \
     "[ '$ORDER_COUNT' -gt 10 ]" \
     "Have $ORDER_COUNT filled paper orders. Strategy may not be signalling correctly."
 
-# Kalshi mappings discovered
-MAP_COUNT=$(sqlite3 "$DB" "SELECT COUNT(*) FROM kalshi_market_map;" 2>/dev/null || echo 0)
-check "Kalshi mappings discovered > 0" \
-    "[ '$MAP_COUNT' -gt 0 ]" \
-    "No auto-mappings found. News strategy will use Manifold fallback only."
+# Hyperliquid asset metadata discovered
+ASSET_COUNT=$(sqlite3 "$DB" "SELECT COUNT(*) FROM markets WHERE COALESCE(asset_index, -1) >= 0;" 2>/dev/null || echo 0)
+check "Hyperliquid assets discovered > 0" \
+    "[ '$ASSET_COUNT' -gt 0 ]" \
+    "No HL asset metadata found. Start the engine with market data enabled before going live."
 
 # Private key is set
-check "POLYMARKET_PRIVATE_KEY is set" \
-    "[ -n \"\${POLYMARKET_PRIVATE_KEY:-}\" ]" \
-    "Set POLYMARKET_PRIVATE_KEY in .env"
+check "HL_NETWORK is set" \
+    "[ \"\${HL_NETWORK:-}\" = 'testnet' ] || [ \"\${HL_NETWORK:-}\" = 'mainnet' ]" \
+    "Set HL_NETWORK to testnet or mainnet in .env"
+
+check "HL_API_PRIVATE_KEY is set" \
+    "[ -n \"\${HL_API_PRIVATE_KEY:-}\" ]" \
+    "Set HL_API_PRIVATE_KEY in .env"
 
 # DRY_RUN is unset or 0
 check "DRY_RUN is disabled (unset or 0)" \
@@ -61,9 +72,9 @@ echo ""
 echo "══════════════════════════════════════"
 echo "  Manual checks (verify these too):"
 echo "══════════════════════════════════════"
-echo "  [ ] Wallet has ≥ \$10 USDC on Polygon"
+echo "  [ ] Hyperliquid account has enough USDC margin for the configured risk caps"
 echo "  [ ] /config validate on Telegram shows all green"
-echo "  [ ] /balance shows correct starting balance"
+echo "  [ ] /portfolio shows current HL equity, margin, and funding"
 echo "  [ ] /drystatus diagnosis is paper_viable"
 echo "  [ ] /strategy list shows strategies enabled"
 echo ""
