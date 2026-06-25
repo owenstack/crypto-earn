@@ -42,6 +42,9 @@ function startEchoServer() {
 }
 
 beforeAll(() => {
+  try {
+    unlinkSync(SOCK_PATH);
+  } catch {}
   server = startEchoServer();
 });
 
@@ -86,6 +89,9 @@ describe("IPCClient", () => {
 
   test("request-specific timeout overrides the default timeout", async () => {
     const slowSock = `/tmp/cex-test-slow-${Date.now()}.sock`;
+    try {
+      unlinkSync(slowSock);
+    } catch {}
     const slowServer = Bun.listen({
       unix: slowSock,
       socket: {

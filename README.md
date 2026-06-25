@@ -73,7 +73,8 @@ Optional/common keys:
 
 - `HL_SYMBOLS` (default: `BTC,ETH,SOL`): Hyperliquid coins subscribed via `l2Book`.
 - `BINANCE_SYMBOLS` (default: `BTCUSDT,ETHUSDT,SOLUSDT`): Binance USDT-M futures symbols used as cross-venue reference prices.
-- `ENABLE_LIQUIDITY_PROVISION` (default in Docker: `1`): Enables market-making at startup.
+- `ENABLE_MARKET_MAKING` (default in Docker: `1`): Enables market-making at startup.
+  - `ENABLE_LIQUIDITY_PROVISION` is still accepted as a legacy alias.
 - `ENABLE_CEX_DEX_ARB` (default: `0`): Enables Binance-Hyperliquid arb evaluation.
 - `ARB_SUBMIT_ORDERS` (default: `0`): Submits confirmed arb signals as Hyperliquid taker orders.
 - `DISABLE_MARKET_DATA` (default: unset): Set to `1`/`true` to skip HL and Binance feed threads.

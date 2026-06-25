@@ -448,7 +448,9 @@ export interface ReconcileStatusPayload {
   adopted: number;
   closed: number;
   unchanged: number;
-  status: "complete" | "failed";
+  remote_checked?: boolean;
+  error?: string;
+  status: "pending" | "complete" | "error";
 }
 
 // Phase 5: Config/Pause/P&L payloads

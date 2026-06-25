@@ -33,7 +33,7 @@ Example:
   process.exit(0);
 }
 
-const toCamelCase = (str: string): string => str.replace(/-([a-z])/g, g => g[1].toUpperCase());
+const toCamelCase = (str: string): string => str.replace(/-([a-z])/g, g => (g[1] ?? "").toUpperCase());
 
 const parseValue = (value: string): any => {
   if (value === "true") return true;
@@ -48,7 +48,7 @@ const parseValue = (value: string): any => {
 };
 
 function parseArgs(): Partial<Bun.BuildConfig> {
-  const config: Partial<Bun.BuildConfig> = {};
+  const config: Record<string, unknown> = {};
   const args = process.argv.slice(2);
 
   for (let i = 0; i < args.length; i++) {
@@ -82,14 +82,20 @@ function parseArgs(): Partial<Bun.BuildConfig> {
 
     if (key.includes(".")) {
       const [parentKey, childKey] = key.split(".");
-      config[parentKey] = config[parentKey] || {};
-      config[parentKey][childKey] = parseValue(value);
+      if (!parentKey || !childKey) continue;
+      const parent = config[parentKey];
+      const parentConfig =
+        parent && typeof parent === "object" && !Array.isArray(parent)
+          ? parent as Record<string, unknown>
+          : {};
+      parentConfig[childKey] = parseValue(value);
+      config[parentKey] = parentConfig;
     } else {
       config[key] = parseValue(value);
     }
   }
 
-  return config;
+  return config as Partial<Bun.BuildConfig>;
 }
 
 const formatFileSize = (bytes: number): string => {
@@ -102,7 +108,7 @@ const formatFileSize = (bytes: number): string => {
     unitIndex++;
   }
 
-  return `${size.toFixed(2)} ${units[unitIndex]}`;
+  return `${size.toFixed(2)} ${units[unitIndex] ?? "B"}`;
 };
 
 console.log("\n🚀 Starting build process...\n");

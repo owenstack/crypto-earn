@@ -2,12 +2,18 @@
 import { Database } from "bun:sqlite";
 
 let _db: Database | null = null;
+let _dbPath: string | null = null;
 
 export function getDB(): Database {
-  if (_db) return _db;
   const path = Bun.env.DB_PATH ?? "./data/cex.db";
+  if (_db && _dbPath === path) return _db;
+  if (_db) {
+    _db.close();
+    _db = null;
+  }
   const readonly = true;
   _db = new Database(path, { readonly, create: false });
+  _dbPath = path;
   if (!readonly) {
     _db.run("PRAGMA journal_mode=WAL;");
   }

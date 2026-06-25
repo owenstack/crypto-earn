@@ -66,7 +66,7 @@ SELECT
   ROUND(AVG((best_ask - best_bid) / NULLIF((best_bid + best_ask) / 2.0, 0) * 100), 2) as avg_spread_pct,
   COUNT(*) as samples
 FROM dry_run_signals
-WHERE strategy = 'liquidity_provision'
+WHERE strategy IN ('market_making','liquidity_provision')
   AND direction = 'buy'
   AND best_bid > 0 AND best_ask > 0;
 SQL
@@ -89,7 +89,7 @@ WITH lp_pairs AS (
     direction,
     ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY signal_ts) as rn
   FROM dry_run_signals
-  WHERE strategy = 'liquidity_provision'
+  WHERE strategy IN ('market_making','liquidity_provision')
     AND direction = 'buy'
     AND best_bid > 0 AND best_ask > 0
 ),
@@ -197,10 +197,10 @@ sqlite3 "$DB" <<'SQL' >> "$REPORT"
 WITH stats AS (
   SELECT
     COUNT(*) as total,
-    COUNT(DISTINCT CASE WHEN strategy='liquidity_provision' THEN market_id END) as lp_distinct_markets,
-    SUM(CASE WHEN strategy='liquidity_provision' THEN 1 ELSE 0 END) as lp_raw_signals,
+    COUNT(DISTINCT CASE WHEN strategy IN ('market_making','liquidity_provision') THEN market_id END) as lp_distinct_markets,
+    SUM(CASE WHEN strategy IN ('market_making','liquidity_provision') THEN 1 ELSE 0 END) as lp_raw_signals,
     SUM(CASE WHEN strategy='news_repricing' THEN 1 ELSE 0 END) as nr_total,
-    AVG(CASE WHEN strategy='liquidity_provision' AND direction='buy' AND best_bid > 0 AND best_ask > 0 
+    AVG(CASE WHEN strategy IN ('market_making','liquidity_provision') AND direction='buy' AND best_bid > 0 AND best_ask > 0
          THEN (best_ask - best_bid) * size * 0.5 END) as avg_lp_profit_per_pair,
     ROUND((MAX(signal_ts) - MIN(signal_ts)) / 3600.0, 2) as hours
   FROM dry_run_signals
@@ -216,7 +216,7 @@ SELECT
     FROM (
       SELECT AVG((best_ask - best_bid) * size * 0.5) as avg_profit_per_fill
       FROM dry_run_signals
-      WHERE strategy = 'liquidity_provision'
+      WHERE strategy IN ('market_making','liquidity_provision')
         AND direction = 'buy'
         AND best_bid > 0 AND best_ask > 0
       GROUP BY market_id

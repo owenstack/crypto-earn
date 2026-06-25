@@ -418,7 +418,10 @@ pub fn main() !void {
             se.enableStrategy(.news_repricing);
         }
     }
-    if (std.posix.getenv("ENABLE_LIQUIDITY_PROVISION")) |v| {
+    const enable_market_making_env =
+        std.posix.getenv("ENABLE_MARKET_MAKING") orelse
+        std.posix.getenv("ENABLE_LIQUIDITY_PROVISION");
+    if (enable_market_making_env) |v| {
         if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true")) {
             se.enableStrategy(.market_making);
         }
