@@ -26,6 +26,8 @@ import type {
   ConfigValidateResponsePayload,
   DryRunAnalysisResponsePayload,
   AssetMappingsResponsePayload,
+  FundingSnapshotPayload,
+  ArbEventPayload,
 } from "../ipc/types";
 
 export function createAllowedIds(raw: string): Set<number> {
@@ -151,6 +153,70 @@ function fmt(value: unknown, fallback = "unknown"): string {
   return escapeHtml(value);
 }
 
+function fmtNumber(value: unknown, decimals = 2, fallback = "N/A"): string {
+  const n = typeof value === "string" ? Number(value) : value;
+  return typeof n === "number" && Number.isFinite(n) ? n.toFixed(decimals) : fallback;
+}
+
+function fmtSignedNumber(value: unknown, decimals = 2, fallback = "N/A"): string {
+  const n = typeof value === "string" ? Number(value) : value;
+  if (typeof n !== "number" || !Number.isFinite(n)) return fallback;
+  return `${n >= 0 ? "+" : ""}${n.toFixed(decimals)}`;
+}
+
+function fmtUnixTs(value: unknown): string {
+  const n = typeof value === "string" ? Number(value) : value;
+  if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) return "N/A";
+  return new Date(n * 1000).toISOString().replace("T", " ").replace(".000Z", " UTC");
+}
+
+export function formatFundingSnapshot(payload: FundingSnapshotPayload): string {
+  const rows = payload.funding ?? [];
+  if (!rows.length) {
+    return "💸 <b>Funding Snapshot</b>\n\nNo funding snapshots recorded in the last 24h.";
+  }
+
+  const lines = rows.slice(0, 20).map(row => {
+    const ratePct = fmtSignedNumber(row.rate * 100, 4);
+    const rateBps = fmtSignedNumber(row.rate * 10_000, 2);
+    const asset = String(row.asset ?? "?");
+    return (
+      `${asset.padEnd(8)} ` +
+      `${ratePct.padStart(10)}% ` +
+      `${rateBps.padStart(9)} bps ` +
+      `next ${fmtUnixTs(row.next_payment_ts)}`
+    );
+  });
+  const suffix = rows.length > 20 ? `\nShowing 20 of ${rows.length}.` : "";
+  return `<b>Funding Snapshot</b>\n<pre>${escapeHtml(lines.join("\n") + suffix)}</pre>`;
+}
+
+export function formatArbEvents(payload: ArbEventPayload): string {
+  const rows = payload.events ?? [];
+  if (!rows.length) {
+    return "⚖️ <b>Arb Events</b>\n\nNo arb events recorded in the last 7d.";
+  }
+
+  const lines = rows.slice(0, 20).map(row => {
+    const order = row.order_id ? String(row.order_id).slice(0, 12) : "-";
+    const latencyMs = row.fill_ns > 0 && row.submit_ns > 0
+      ? `${fmtNumber((row.fill_ns - row.submit_ns) / 1_000_000, 1)}ms`
+      : "open";
+    return (
+      `${String(row.asset).padEnd(8)} ` +
+      `${fmtSignedNumber(row.delta_bps, 2).padStart(8)}bps ` +
+      `bin ${fmtNumber(row.binance_mid, 2).padStart(10)} ` +
+      `hl ${fmtNumber(row.hl_mid, 2).padStart(10)} ` +
+      `pnl ${fmtSignedNumber(row.realised_pnl, 4).padStart(10)} ` +
+      `lat ${latencyMs.padStart(8)} ` +
+      `oid ${order} ` +
+      `${fmtUnixTs(row.created_at)}`
+    );
+  });
+  const suffix = rows.length > 20 ? `\nShowing 20 of ${rows.length}.` : "";
+  return `<b>Arb Events</b>\n<pre>${escapeHtml(lines.join("\n") + suffix)}</pre>`;
+}
+
 function formatEvent(env: Envelope): string | null {
   const p = env.payload as Record<string, unknown>;
   switch (env.type as EventMessageType) {
@@ -214,6 +280,8 @@ export function createBot(ipc: IPCClient): Bot {
       "/orders — open orders\n" +
       "/config — get or set config\n" +
       "/mappings — asset market mappings\n" +
+      "/funding — latest HL funding rates\n" +
+      "/arb — recent CEX↔DEX arb events\n" +
       "/drystatus — dry-run analysis\n" +
       "/livestatus — live trading status\n" +
       "/trade — place an order\n" +
@@ -287,6 +355,18 @@ export function createBot(ipc: IPCClient): Bot {
     });
     const suffix = rows.length > 30 ? `\n\nShowing 30 of ${rows.length}.` : "";
     await ctx.reply(`🗺️ *Asset Market Mappings*\n\n${lines.join("\n")}${suffix}`, { parse_mode: "Markdown" });
+  }));
+
+  bot.command("funding", guard(async ctx => {
+    if (!ipc.connected) { await ctx.reply("🔴 Engine IPC offline."); return; }
+    const res = await ipc.request<FundingSnapshotPayload>("funding.snapshot");
+    await ctx.reply(formatFundingSnapshot(res.payload), { parse_mode: "HTML" });
+  }));
+
+  bot.command("arb", guard(async ctx => {
+    if (!ipc.connected) { await ctx.reply("🔴 Engine IPC offline."); return; }
+    const res = await ipc.request<ArbEventPayload>("arb.events");
+    await ctx.reply(formatArbEvents(res.payload), { parse_mode: "HTML" });
   }));
 
   bot.command("drystatus", guard(async ctx => {

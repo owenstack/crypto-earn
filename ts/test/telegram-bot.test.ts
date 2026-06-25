@@ -1,5 +1,13 @@
 import { test, expect, describe } from "bun:test";
-import { createBot, createAllowedIds, isAllowedChatId, registerEventPush, shouldNotifyTelegramPush } from "../src/telegram/bot.ts";
+import {
+  createBot,
+  createAllowedIds,
+  isAllowedChatId,
+  registerEventPush,
+  shouldNotifyTelegramPush,
+  formatFundingSnapshot,
+  formatArbEvents,
+} from "../src/telegram/bot.ts";
 import type { Envelope } from "../src/ipc/types.ts";
 
 describe("createBot", () => {
@@ -43,7 +51,7 @@ describe("createBot", () => {
 });
 
 describe("Phase 5 commands", () => {
-  test("/config, /pause, /pnl command handlers exist", async () => {
+  test("/config, /pause, /pnl, /funding, /arb command handlers exist", async () => {
     const original = Bun.env.TELEGRAM_BOT_TOKEN;
     Bun.env.TELEGRAM_BOT_TOKEN = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11";
 
@@ -64,6 +72,50 @@ describe("Phase 5 commands", () => {
         delete Bun.env.TELEGRAM_BOT_TOKEN;
       }
     }
+  });
+
+  test("formats funding snapshots for Telegram operators", () => {
+    const msg = formatFundingSnapshot({
+      funding: [
+        {
+          asset: "BTC",
+          rate: 0.000125,
+          next_payment_ts: 1_700_000_000,
+          recorded_at: 1_699_999_900,
+        },
+      ],
+    });
+
+    expect(msg).toContain("<b>Funding Snapshot</b>");
+    expect(msg).toContain("BTC");
+    expect(msg).toContain("+0.0125%");
+    expect(msg).toContain("+1.25 bps");
+    expect(msg).toContain("2023-11-14 22:13:20 UTC");
+  });
+
+  test("formats arb events for Telegram operators", () => {
+    const msg = formatArbEvents({
+      events: [
+        {
+          asset: "ETH",
+          binance_mid: 3200,
+          hl_mid: 3198.5,
+          delta_bps: -4.6875,
+          order_id: "order-123456789",
+          realised_pnl: 1.23456,
+          submit_ns: 10_000_000,
+          fill_ns: 35_000_000,
+          created_at: 1_700_000_000,
+        },
+      ],
+    });
+
+    expect(msg).toContain("<b>Arb Events</b>");
+    expect(msg).toContain("ETH");
+    expect(msg).toContain("-4.69bps");
+    expect(msg).toContain("+1.2346");
+    expect(msg).toContain("lat   25.0ms");
+    expect(msg).toContain("order-123456");
   });
 });
 
