@@ -77,6 +77,10 @@ interface StatusData {
   engine: string;
   db: string;
   uptime_ms: number;
+  equity?: number;
+  margin_used?: number;
+  margin_used_pct?: number;
+  funding_accrued?: number;
   usdc_balance?: string;
   total_exposure_usd?: string;
   open_orders_exposure_usd?: string;
@@ -86,12 +90,16 @@ interface StatusData {
 }
 
 interface PositionRow {
-  market_id: string;
+  market_id?: string;
+  asset?: string;
   side: string;
-  size: string;
-  entry_price: string;
+  size: string | number;
+  entry_price: string | number;
   current_price?: string;
-  unrealized_pnl?: string;
+  mark_price?: number;
+  unrealized_pnl?: string | number;
+  funding_accrued?: number;
+  leverage?: number;
   status?: string;
 }
 
@@ -125,10 +133,15 @@ interface MarketRow {
 
 interface PortfolioData {
   positions: PositionRow[];
+  equity?: number;
+  margin_used?: number;
+  margin_used_pct?: number;
+  funding_accrued?: number;
+  snapshot_ts?: number;
   total_exposure_usd?: string;
   open_orders_exposure_usd?: string;
   committed_capital_usd?: string;
-  unrealized_pnl?: string;
+  unrealized_pnl?: string | number;
   realized_pnl_today?: string;
   usdc_balance?: string;
 }
@@ -177,8 +190,11 @@ export function Dashboard() {
   const { data: markets } = useApi<MarketsData>("/api/markets", 2000);
   const { data: logs } = useApi<LogsData>("/api/logs", 5000);
 
-  // Derive KPI values — prefer portfolio snapshot fields, fall back to status
-  const usdcBalance = portfolio?.usdc_balance ?? status?.usdc_balance;
+  // Derive KPI values: prefer HL portfolio snapshot fields, then legacy fields.
+  const accountEquity = portfolio?.equity ?? status?.equity ?? portfolio?.usdc_balance ?? status?.usdc_balance;
+  const marginUsed = portfolio?.margin_used ?? status?.margin_used;
+  const marginUsedPct = portfolio?.margin_used_pct ?? status?.margin_used_pct;
+  const fundingAccrued = portfolio?.funding_accrued ?? status?.funding_accrued;
   // "Total Exposure" = committed capital (filled positions + USDC locked in
   // open, unfilled orders). Falls back to position-only exposure for older
   // engines that don't emit the new fields.
@@ -191,6 +207,7 @@ export function Dashboard() {
   const openOrdersExposure =
     portfolio?.open_orders_exposure_usd ?? status?.open_orders_exposure_usd;
   const dailyPnl = portfolio?.realized_pnl_today ?? status?.realized_pnl_today;
+  const unrealizedPnl = portfolio?.unrealized_pnl ?? status?.unrealized_pnl;
   const engineState = status?.engine ?? "unknown";
 
   const engineBadgeClass =
@@ -211,25 +228,16 @@ export function Dashboard() {
       <h1 className="text-3xl font-bold tracking-tight">CEX Engine Dashboard</h1>
 
       {/* FR-64: KPI Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">USDC Balance</CardTitle>
+            <CardTitle className="text-sm font-medium text-muted-foreground">Account Equity</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{formatUsd(usdcBalance)}</div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">Total Exposure</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">{formatUsd(totalExposure)}</div>
-            {(positionsExposure !== undefined || openOrdersExposure !== undefined) && (
+            <div className="text-2xl font-bold">{formatUsd(accountEquity)}</div>
+            {portfolio?.snapshot_ts != null && (
               <div className="text-xs text-muted-foreground mt-1">
-                positions {formatUsd(positionsExposure)} · open orders {formatUsd(openOrdersExposure)}
+                Snapshot: {formatTs(portfolio.snapshot_ts)}
               </div>
             )}
           </CardContent>
@@ -237,10 +245,43 @@ export function Dashboard() {
 
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">Daily P&L</CardTitle>
+            <CardTitle className="text-sm font-medium text-muted-foreground">Margin Used</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className={`text-2xl font-bold ${pnlColor(dailyPnl)}`}>{formatUsd(dailyPnl)}</div>
+            <div className="text-2xl font-bold">{formatUsd(marginUsed)}</div>
+            {marginUsedPct !== undefined && (
+              <div className="text-xs text-muted-foreground mt-1">
+                {Number(marginUsedPct).toFixed(2)}% of equity
+              </div>
+            )}
+            {(positionsExposure !== undefined || openOrdersExposure !== undefined) && (
+              <div className="text-xs text-muted-foreground mt-1">
+                exposure {formatUsd(totalExposure)} · orders {formatUsd(openOrdersExposure)}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground">Funding Accrued</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className={`text-2xl font-bold ${pnlColor(fundingAccrued)}`}>{formatUsd(fundingAccrued)}</div>
+            {dailyPnl !== undefined && (
+              <div className={`text-xs mt-1 ${pnlColor(dailyPnl)}`}>
+                Realized today {formatUsd(dailyPnl)}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground">Unrealized P&L</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className={`text-2xl font-bold ${pnlColor(unrealizedPnl)}`}>{formatUsd(unrealizedPnl)}</div>
           </CardContent>
         </Card>
 
@@ -276,24 +317,30 @@ export function Dashboard() {
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b text-left text-muted-foreground">
-                      <th className="py-2 pr-2">Market</th>
+                      <th className="py-2 pr-2">Asset</th>
                       <th className="py-2 pr-2">Side</th>
                       <th className="py-2 pr-2 text-right">Size</th>
                       <th className="py-2 pr-2 text-right">Entry Price</th>
-                      <th className="py-2 pr-2 text-right">Current Price</th>
+                      <th className="py-2 pr-2 text-right">Mark Price</th>
+                      <th className="py-2 pr-2 text-right">Funding</th>
+                      <th className="py-2 pr-2 text-right">Lev</th>
                       <th className="py-2 text-right">Unrealized P&L</th>
                     </tr>
                   </thead>
                   <tbody>
                     {positions.map((p, i) => (
                       <tr key={i} className="border-b border-muted">
-                        <td className="py-2 pr-2 font-mono text-xs">{truncate(p.market_id, 24)}</td>
+                        <td className="py-2 pr-2 font-mono text-xs">{truncate(p.asset ?? p.market_id ?? "unknown", 24)}</td>
                         <td className={`py-2 pr-2 font-semibold ${p.side === "long" ? "text-green-500" : "text-red-500"}`}>
                           {p.side}
                         </td>
                         <td className="py-2 pr-2 text-right font-mono">{p.size}</td>
                         <td className="py-2 pr-2 text-right font-mono">{formatUsd(p.entry_price)}</td>
-                        <td className="py-2 pr-2 text-right font-mono">{p.current_price ? formatUsd(p.current_price) : "—"}</td>
+                        <td className="py-2 pr-2 text-right font-mono">{p.mark_price != null ? formatUsd(p.mark_price) : p.current_price ? formatUsd(p.current_price) : "—"}</td>
+                        <td className={`py-2 pr-2 text-right font-mono ${pnlColor(p.funding_accrued)}`}>
+                          {p.funding_accrued != null ? formatUsd(p.funding_accrued) : "—"}
+                        </td>
+                        <td className="py-2 pr-2 text-right font-mono">{p.leverage != null ? `${p.leverage}x` : "—"}</td>
                         <td className={`py-2 text-right font-mono ${pnlColor(p.unrealized_pnl)}`}>
                           {p.unrealized_pnl ? formatUsd(p.unrealized_pnl) : "—"}
                         </td>

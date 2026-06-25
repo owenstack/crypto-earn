@@ -3,7 +3,8 @@
  * All /api/* routes require Bearer auth. Frontend is served via HTML import.
  */
 import type { IPCClient } from "../ipc/client";
-import { queryPositions, queryOrders, queryRecentLogs } from "../db/client";
+import type { PortfolioPayload } from "../ipc/types";
+import { queryOrders, queryRecentLogs } from "../db/client";
 
 const DASHBOARD_SECRET = Bun.env.DASHBOARD_SECRET ?? "";
 
@@ -39,9 +40,9 @@ export function dashboardRoutes(ipc: IPCClient) {
     "/api/portfolio": {
       async GET(req: Request) {
         if (!bearerAuth(req)) return unauthorized();
-        // Prefer SQLite snapshot for dashboard (avoids IPC round-trip for tables)
-        const positions = queryPositions();
-        return json({ positions });
+        if (!ipc.connected) return json({ positions: [], error: "engine_offline" });
+        const res = await ipc.request<PortfolioPayload>("portfolio").catch(() => null);
+        return json(res?.payload ?? { positions: [], error: "portfolio_unavailable" }, res ? 200 : 502);
       },
     },
 

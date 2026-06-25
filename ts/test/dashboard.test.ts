@@ -53,6 +53,34 @@ function makeIpcMock(connected = true) {
   return {
     connected,
     async request(_type: string) {
+      if (_type === "portfolio") {
+        return {
+          v: 1 as const,
+          id: "mock-id",
+          ts: Date.now(),
+          type: "portfolio.response",
+          payload: {
+            equity: 12345.67,
+            margin_used: 234.56,
+            margin_used_pct: 1.9,
+            unrealized_pnl: 12.34,
+            funding_accrued: -0.42,
+            snapshot_ts: 1_700_000_000,
+            positions: [
+              {
+                asset: "BTC",
+                side: "long",
+                size: 0.1,
+                entry_price: 50000,
+                mark_price: 50123,
+                unrealized_pnl: 12.34,
+                funding_accrued: -0.42,
+                leverage: 2,
+              },
+            ],
+          },
+        };
+      }
       return {
         v: 1 as const,
         id: "mock-id",
@@ -180,13 +208,26 @@ describe("dashboardRoutes", () => {
   });
 
   describe("DB-dependent routes", () => {
-    test("/api/portfolio returns positions from DB", async () => {
-      const routes = dashboardRoutes(makeIpcMock() as any);
+    test("/api/portfolio returns HL portfolio snapshot from IPC", async () => {
+      const mock = makeIpcMock() as any;
+      const routes = dashboardRoutes(mock);
       const res = await routes["/api/portfolio"].GET(authedReq("/api/portfolio"));
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(Array.isArray(body.positions)).toBe(true);
-      expect(body.positions.length).toBeGreaterThanOrEqual(1);
+      expect(body.equity).toBe(12345.67);
+      expect(body.margin_used).toBe(234.56);
+      expect(body.funding_accrued).toBe(-0.42);
+      expect(body.positions[0].asset).toBe("BTC");
+    });
+
+    test("/api/portfolio returns offline payload when IPC disconnected", async () => {
+      const routes = dashboardRoutes(makeIpcMock(false) as any);
+      const res = await routes["/api/portfolio"].GET(authedReq("/api/portfolio"));
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.positions).toEqual([]);
+      expect(body.error).toBe("engine_offline");
     });
 
     test("/api/orders returns orders from DB", async () => {

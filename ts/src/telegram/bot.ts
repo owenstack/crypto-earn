@@ -77,6 +77,11 @@ function guard(handler: (ctx: Context) => Promise<void>) {
   };
 }
 
+function fmtPortfolioNumber(n: number | string | undefined, decimals = 2): string {
+  const value = typeof n === "string" ? Number(n) : n;
+  return Number.isFinite(value) ? value!.toFixed(decimals) : "N/A";
+}
+
 // Phase 4: Event push notification support
 const DEDUP_MAX_SIZE = 500;
 const REJECTION_PUSH_WINDOW_MS = 5 * 60 * 1000;
@@ -242,29 +247,23 @@ export function createBot(ipc: IPCClient): Bot {
     if (!ipc.connected) { await ctx.reply("🔴 Engine IPC offline."); return; }
     const res = await ipc.request<PortfolioPayload>("portfolio");
     const p = res.payload;
-    if (p.usdc_balance === undefined) {
-      await ctx.reply("⚠️ Balance unavailable (portfolio tracker not initialized).");
-      return;
-    }
-    const fmtNum = (n: number | string | undefined) => {
-      const value = typeof n === "string" ? Number(n) : n;
-      const safeValue = Number.isFinite(value) ? value ?? 0 : 0;
-      return safeValue.toFixed(2);
-    };
     const positionCount = p.positions?.length ?? 0;
     const isDryRun = Bun.env.DRY_RUN === "1" || Bun.env.DRY_RUN === "true";
-    const dryRunBadge = isDryRun ? "🔬 *[DRY RUN - simulated balance]*\n\n" : "";
+    const dryRunBadge = isDryRun ? "🔬 *[DRY RUN - simulated portfolio]*\n\n" : "";
     await ctx.reply(
       dryRunBadge +
-      `💰 *Balance & P&L*\n` +
+      `💰 *HL Portfolio & P&L*\n` +
       "```\n" +
-      `Cash (USDC):       $${fmtNum(p.usdc_balance)}\n` +
-      `Exposure (total):  $${fmtNum(p.committed_capital_usd ?? p.total_exposure_usd)}\n` +
-      `  positions:       $${fmtNum(p.total_exposure_usd)}\n` +
-      `  open orders:     $${fmtNum(p.open_orders_exposure_usd)}\n` +
-      `Unrealized P&L:    $${fmtNum(p.unrealized_pnl)}\n` +
-      `Realized (today):  $${fmtNum(p.realized_pnl_today)}\n` +
+      `Account equity:    $${fmtPortfolioNumber(p.equity ?? p.usdc_balance)}\n` +
+      `Margin used:       $${fmtPortfolioNumber(p.margin_used)} (${fmtPortfolioNumber(p.margin_used_pct)}%)\n` +
+      `Funding accrued:   $${fmtPortfolioNumber(p.funding_accrued)}\n` +
+      `Exposure (total):  $${fmtPortfolioNumber(p.committed_capital_usd ?? p.total_exposure_usd)}\n` +
+      `  positions:       $${fmtPortfolioNumber(p.total_exposure_usd)}\n` +
+      `  open orders:     $${fmtPortfolioNumber(p.open_orders_exposure_usd)}\n` +
+      `Unrealized P&L:    $${fmtPortfolioNumber(p.unrealized_pnl)}\n` +
+      `Realized (today):  $${fmtPortfolioNumber(p.realized_pnl_today)}\n` +
       `Open positions:    ${positionCount}\n` +
+      `Snapshot ts:       ${p.snapshot_ts ?? "N/A"}\n` +
       "```",
       { parse_mode: "Markdown" }
     );
@@ -358,10 +357,7 @@ export function createBot(ipc: IPCClient): Bot {
     const reconcile = value(reconcileResult) as { status?: string } | undefined;
     const mappings = value(mappingsResult);
 
-    const n = (raw: unknown, decimals = 2): string => {
-      const num = typeof raw === "string" ? Number(raw) : Number(raw ?? NaN);
-      return Number.isFinite(num) ? num.toFixed(decimals) : "N/A";
-    };
+    const n = (raw: unknown, decimals = 2): string => fmtPortfolioNumber(raw as number | string | undefined, decimals);
     const count = (arr: unknown[] | undefined): number => Array.isArray(arr) ? arr.length : 0;
     const mode = Bun.env.DRY_RUN === "1" || Bun.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE";
 
@@ -385,7 +381,9 @@ export function createBot(ipc: IPCClient): Bot {
       `DB:           ${status?.db ?? "unknown"}\n` +
       `Uptime:       ${status?.uptime_ms != null ? `${(status.uptime_ms / 1000).toFixed(0)}s` : "N/A"}\n` +
       `Reconcile:    ${reconcile?.status ?? "unknown"}\n` +
-      `Cash USDC:    $${n(portfolio?.usdc_balance)}\n` +
+      `Equity:       $${n(portfolio?.equity ?? portfolio?.usdc_balance)}\n` +
+      `Margin used:  $${n(portfolio?.margin_used)} (${n(portfolio?.margin_used_pct)}%)\n` +
+      `Funding:      $${n(portfolio?.funding_accrued)}\n` +
       `Exposure:     $${n(portfolio?.committed_capital_usd ?? portfolio?.total_exposure_usd)}` +
       ` (pos $${n(portfolio?.total_exposure_usd)} / ord $${n(portfolio?.open_orders_exposure_usd)})\n` +
       `Unrealized:   $${n(portfolio?.unrealized_pnl)}\n` +

@@ -290,13 +290,19 @@ export interface OrderEventPayload {
 }
 
 export interface PortfolioSnapshotPayload {
-  positions: PositionInfo[];
-  total_exposure_usd: string;
+  positions: Array<PositionInfo | HlPositionPayload>;
+  total_exposure_usd?: string;
   open_orders_exposure_usd?: string;
   committed_capital_usd?: string;
-  unrealized_pnl: string;
-  realized_pnl_today: string;
-  usdc_balance: string;
+  unrealized_pnl?: string | number;
+  realized_pnl_today?: string;
+  /** @deprecated Legacy snapshots only. Prefer `equity`. */
+  usdc_balance?: string;
+  equity?: number;
+  margin_used?: number;
+  margin_used_pct?: number;
+  funding_accrued?: number;
+  snapshot_ts?: number;
 }
 
 export interface PositionInfo {
