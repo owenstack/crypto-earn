@@ -852,12 +852,29 @@ fn cancelOrphanLpBuys(ctx: *StrategyWorkerCtx) void {
     }
 }
 
-/// Query the latest persisted HL orderbook (best bid/ask + mid) for a coin symbol.
-fn queryOrderbookForMarket(database: *db.DB, market_id: []const u8) ?struct {
+const DryRunQuote = struct {
     best_bid: f64,
     best_ask: f64,
     mid_price: f64,
-} {
+};
+
+/// Resolve a dry-run settlement quote from HL-native market data. Prefer the
+/// live in-memory HL top-of-book cache; fall back to persisted HL snapshots
+/// keyed by the HL coin symbol in `orderbooks.market`.
+fn queryDryRunQuote(hl_ob: ?*hl_orderbook.Orderbook, database: *db.DB, market_id: []const u8) ?DryRunQuote {
+    if (hl_ob) |ob| {
+        if (ob.quote(market_id)) |q| {
+            if (q.bid > 0 and q.ask > 0 and q.ask > q.bid and q.mid > 0) {
+                return .{ .best_bid = q.bid, .best_ask = q.ask, .mid_price = q.mid };
+            }
+        }
+    }
+
+    return queryPersistedHlOrderbookForMarket(database, market_id);
+}
+
+/// Query the latest persisted HL orderbook (best bid/ask + mid) for a coin symbol.
+fn queryPersistedHlOrderbookForMarket(database: *db.DB, market_id: []const u8) ?DryRunQuote {
     const sql = "SELECT best_bid, best_ask, mid_price FROM orderbooks WHERE market=? ORDER BY created_at DESC LIMIT 1;" ++ &[_:0]u8{};
     var stmt: ?*db.c.sqlite3_stmt = null;
     if (db.c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) != db.c.SQLITE_OK) return null;
@@ -875,6 +892,42 @@ fn queryOrderbookForMarket(database: *db.DB, market_id: []const u8) ?struct {
     const mid = db.c.sqlite3_column_double(stmt, 2);
 
     return .{ .best_bid = bid, .best_ask = ask, .mid_price = mid };
+}
+
+test "dry-run quote lookup ignores legacy gamma_id matches" {
+    var database = try db.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("INSERT INTO orderbooks(market,asset_id,best_bid,best_ask,mid_price,gamma_id) VALUES('legacy-market','legacy-asset','99.0','101.0',100.0,'BTC');");
+    try std.testing.expect(queryDryRunQuote(null, &database, "BTC") == null);
+
+    try database.execZ("INSERT INTO orderbooks(market,asset_id,best_bid,best_ask,mid_price,gamma_id) VALUES('BTC','BTC','100.0','102.0',101.0,'legacy-gamma');");
+    const quote = queryDryRunQuote(null, &database, "BTC") orelse return error.TestUnexpectedResult;
+    try std.testing.expectApproxEqAbs(@as(f64, 100.0), quote.best_bid, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 102.0), quote.best_ask, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 101.0), quote.mid_price, 1e-9);
+}
+
+test "dry-run quote lookup prefers live HL orderbook cache" {
+    var database = try db.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("INSERT INTO orderbooks(market,asset_id,best_bid,best_ask,mid_price,gamma_id) VALUES('BTC','BTC','1.0','2.0',1.5,'legacy-gamma');");
+
+    var syms = [_][]const u8{"BTC"};
+    var ob = hl_orderbook.Orderbook.init(std.testing.allocator, hl_orderbook.HL_WS_HOST_TESTNET, &syms);
+    defer ob.deinit();
+
+    const bids = [_]hl_orderbook.Level{.{ .price = 100.0, .size = 1.0 }};
+    const asks = [_]hl_orderbook.Level{.{ .price = 101.0, .size = 1.0 }};
+    ob.applySnapshot("BTC", &bids, &asks, 42);
+
+    const quote = queryDryRunQuote(&ob, &database, "BTC") orelse return error.TestUnexpectedResult;
+    try std.testing.expectApproxEqAbs(@as(f64, 100.0), quote.best_bid, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 101.0), quote.best_ask, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 100.5), quote.mid_price, 1e-9);
 }
 
 /// Settle open dry-run orders against current orderbook prices.
@@ -905,7 +958,7 @@ fn simulateDryRunFills(ctx: *StrategyWorkerCtx) void {
             continue;
         }
 
-        const ob = queryOrderbookForMarket(ctx.database, mid) orelse continue;
+        const ob = queryDryRunQuote(ctx.hl_ob, ctx.database, mid) orelse continue;
 
         const fills = if (is_buy)
             ob.best_ask <= order.signal_price
