@@ -11,6 +11,7 @@ const db_mod = @import("db.zig");
 const order_mgr = @import("order_manager.zig");
 const portfolio = @import("portfolio_tracker.zig");
 const strategy = @import("strategy_engine.zig");
+const cex_dex_arb = @import("cex_dex_arb.zig");
 const ipc = @import("ipc.zig");
 const ipc_types = @import("ipc_types.zig");
 const http = @import("http_client.zig");
@@ -63,6 +64,7 @@ pub const FillPoller = struct {
     om: *order_mgr.OrderManager,
     pt: *portfolio.PortfolioTracker,
     se: ?*strategy.StrategyEngine,
+    arb_runtime: ?*cex_dex_arb.ArbRuntime,
     should_stop: std.atomic.Value(bool),
     ws_connected: std.atomic.Value(bool),
     ws_disconnect_ts: std.atomic.Value(i64),
@@ -85,6 +87,7 @@ pub const FillPoller = struct {
             .om = om,
             .pt = pt,
             .se = se,
+            .arb_runtime = null,
             .should_stop = std.atomic.Value(bool).init(false),
             .ws_connected = std.atomic.Value(bool).init(false),
             .ws_disconnect_ts = std.atomic.Value(i64).init(0),
@@ -92,6 +95,10 @@ pub const FillPoller = struct {
             .consecutive_http_failures = 0,
             .circuit_breaker_until = 0,
         };
+    }
+
+    pub fn setArbRuntime(self: *FillPoller, arb_runtime: *cex_dex_arb.ArbRuntime) void {
+        self.arb_runtime = arb_runtime;
     }
 
     pub fn stop(self: *FillPoller) void {
@@ -273,6 +280,11 @@ pub const FillPoller = struct {
         if (!result.updated) return false;
 
         if (local.market_id_len > 0 and local.side_len > 0) {
+            const arb_pnl = if (local.isArb())
+                self.computeRealizedPnl(local.marketId(), local.side(), fill.sz, fill.px)
+            else
+                null;
+
             self.pt.applyFillDelta(local.marketId(), fill.sz, fill.px, local.side());
 
             // Phase 6 engine integration: feed market-making fills into the
@@ -288,6 +300,31 @@ pub const FillPoller = struct {
                     const dir: strategy.SignalDirection =
                         if (std.mem.eql(u8, local.side(), "buy")) .buy else .sell;
                     se.recordMarketMakingFill(local.marketId(), dir, fill.sz, fill.px);
+                }
+            }
+
+            if (local.isArb()) {
+                if (arb_pnl) |pnl| {
+                    if (self.arb_runtime) |arb| {
+                        arb.recordTradeResult(pnl, std.time.timestamp());
+                    }
+                    const fill_ns_i128 = std.time.nanoTimestamp();
+                    const fill_ns: i64 = if (fill_ns_i128 > std.math.maxInt(i64))
+                        std.math.maxInt(i64)
+                    else if (fill_ns_i128 < std.math.minInt(i64))
+                        std.math.minInt(i64)
+                    else
+                        @intCast(fill_ns_i128);
+                    self.database.updateArbEventFill(fill.id(), pnl, fill_ns) catch |e| {
+                        log.warn("fill_poller", "failed to backfill arb event pnl oid={s}: {s}", .{ fill.id(), @errorName(e) });
+                    };
+                    log.info("fill_poller", "arb fill feedback: order={s} market={s} pnl={d:.6}", .{
+                        fill.id(), local.marketId(), pnl,
+                    });
+                } else {
+                    log.debug("fill_poller", "arb fill has no realized pnl yet: order={s} market={s}", .{
+                        fill.id(), local.marketId(),
+                    });
                 }
             }
         }
@@ -323,7 +360,44 @@ pub const FillPoller = struct {
             return std.mem.eql(u8, o, "market_making") or
                 std.mem.eql(u8, o, "liquidity_provision");
         }
+
+        fn isArb(self: *const LocalOrderRef) bool {
+            return std.mem.eql(u8, self.origin(), "cex_dex_arb");
+        }
     };
+
+    fn computeRealizedPnl(
+        self: *FillPoller,
+        market_id: []const u8,
+        order_side: []const u8,
+        fill_size: f64,
+        fill_price: f64,
+    ) ?f64 {
+        const position_side: []const u8 = if (std.mem.eql(u8, order_side, "sell"))
+            "long"
+        else if (std.mem.eql(u8, order_side, "buy"))
+            "short"
+        else
+            return null;
+
+        const sql =
+            "SELECT entry_price FROM positions " ++
+            "WHERE market_id=? AND status='open' AND side=? " ++
+            "ORDER BY updated_at DESC LIMIT 1;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return null;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_text(stmt, 1, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK) return null;
+        if (c.sqlite3_bind_text(stmt, 2, position_side.ptr, @intCast(position_side.len), null) != c.SQLITE_OK) return null;
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        const raw = c.sqlite3_column_text(stmt, 0) orelse return null;
+        const entry_price = std.fmt.parseFloat(f64, std.mem.span(@as([*c]const u8, @ptrCast(raw)))) catch return null;
+
+        if (std.mem.eql(u8, order_side, "sell")) {
+            return (fill_price - entry_price) * fill_size;
+        }
+        return (entry_price - fill_price) * fill_size;
+    }
 
     fn resolveLocalOrder(self: *FillPoller, oid: []const u8) LocalOrderRef {
         var out = LocalOrderRef{};
@@ -549,6 +623,41 @@ test "fill_poller: non market-making fill leaves MM inventory untouched" {
     try std.testing.expect(h.fp.applyFill(mkFill("77002", "buy", 0.001, 45000.0, 1)));
     // Arb fill must not seed MM inventory.
     try std.testing.expectEqual(strategy.SkewState.normal, h.se.skewStateFor("BTC"));
+}
+
+test "fill_poller: arb closing fill records pnl feedback" {
+    var database = try db_mod.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote) VALUES('M-BTC','BTC','BTC','USDC');");
+    try database.execZ(
+        "INSERT INTO positions(id,market_id,side,size,entry_price,current_price,pnl,status) " ++
+            "VALUES('pos-short','BTC','short','0.001','45000','45000','0','open');",
+    );
+    try database.execZ(
+        "INSERT INTO orders(id,market_id,client_order_id,type,side,size,price,status,filled_size,strategy_origin) " ++
+            "VALUES('order-arb-close','BTC','77004','market','buy','0.001','44000','placed','0','cex_dex_arb');",
+    );
+    try database.insertArbEvent("BTC", 44100.0, 44000.0, -22.6, "77004");
+
+    var h = try FillHarness.init(&database);
+    defer h.deinit();
+    var arb_runtime = cex_dex_arb.ArbRuntime.init(.{});
+    arb_runtime.state.loss_streak = 1;
+    h.fp.setArbRuntime(&arb_runtime);
+
+    try std.testing.expect(h.fp.applyFill(mkFill("77004", "buy", 0.001, 44000.0, 1)));
+
+    const events = try database.queryArbEvents(std.testing.allocator, 1);
+    defer std.testing.allocator.free(events);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), events[0].realised_pnl, 1e-9);
+    try std.testing.expect(events[0].fill_ns > 0);
+
+    arb_runtime.mu.lock();
+    defer arb_runtime.mu.unlock();
+    try std.testing.expectEqual(@as(u32, 0), arb_runtime.state.loss_streak);
 }
 
 test "fill_poller: duplicate fill does not double-count MM inventory" {

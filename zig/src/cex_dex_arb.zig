@@ -190,3 +190,38 @@ pub const ArbState = struct {
         self.confirm_direction = null;
     }
 };
+
+/// Thread-safe owner for ArbState. The strategy worker evaluates signals,
+/// while fill ingestion can report realized P&L from another thread.
+pub const ArbRuntime = struct {
+    mu: std.Thread.Mutex = .{},
+    state: ArbState,
+
+    pub fn init(config: ArbConfig) ArbRuntime {
+        return .{ .state = ArbState.init(config) };
+    }
+
+    pub fn evaluate(
+        self: *ArbRuntime,
+        asset: []const u8,
+        binance_mid: f64,
+        hl_mid: f64,
+        now: i64,
+    ) ?ArbSignal {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.state.evaluate(asset, binance_mid, hl_mid, now);
+    }
+
+    pub fn recordTradeResult(self: *ArbRuntime, pnl: f64, now: i64) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.state.recordTradeResult(pnl, now);
+    }
+
+    pub fn reenable(self: *ArbRuntime) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.state.reenable();
+    }
+};

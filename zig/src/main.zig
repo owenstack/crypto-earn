@@ -343,9 +343,11 @@ pub fn main() !void {
 
     // Initialize strategy engine early so the fill poller can be wired with it.
     var se = strategy.StrategyEngine.init(.{});
+    var arb_runtime = cex_dex_arb.ArbRuntime.init(.{});
 
     // Initialize fill poller (with strategy engine reference for inventory + LP pair cancel)
     var fp = fill_poller.FillPoller.init(allocator, &database, &om, &pt, &se);
+    fp.setArbRuntime(&arb_runtime);
     log.info("engine", "fill poller ready", .{});
 
     // Run startup reconciliation (blocking, before strategy worker)
@@ -422,9 +424,9 @@ pub fn main() !void {
         }
     }
 
-    // Phase 6: CEX↔DEX arb. ENABLE_CEX_DEX_ARB turns the evaluator on
-    // (telemetry-only). ARB_SUBMIT_ORDERS additionally enables live taker
-    // submission, which is deferred and therefore off by default.
+    // Phase 6: CEX↔DEX arb. ENABLE_CEX_DEX_ARB turns the evaluator on.
+    // ARB_SUBMIT_ORDERS additionally enables HL taker submission through the
+    // same risk-gated OrderManager path used by every other strategy.
     const arb_enabled = if (std.posix.getenv("ENABLE_CEX_DEX_ARB")) |v|
         (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true"))
     else
@@ -478,7 +480,7 @@ pub fn main() !void {
         .hl_symbols = hl_symbols,
         .binance_feed = if (binance_started) &binance_feed else null,
         .binance_symbols = binance_symbols,
-        .arb = cex_dex_arb.ArbState.init(.{}),
+        .arb = &arb_runtime,
         .arb_enabled = arb_enabled,
         .arb_submit_orders = arb_submit_orders,
     };
@@ -538,15 +540,14 @@ const StrategyWorkerCtx = struct {
     binance_symbols: ?[][]const u8 = null,
 
     // ─── Phase 6 CEX↔DEX arb ────────────────────────────────────────────
-    /// Arb evaluator state. Owned and mutated exclusively by the strategy
-    /// worker thread, so it needs no extra synchronisation.
-    arb: cex_dex_arb.ArbState = cex_dex_arb.ArbState.init(.{}),
+    /// Shared arb evaluator/breaker state. The strategy worker evaluates
+    /// signals, while fill ingestion reports realized P&L.
+    arb: *cex_dex_arb.ArbRuntime,
     /// Whether the arb evaluator runs at all (ENABLE_CEX_DEX_ARB).
     arb_enabled: bool = false,
-    /// Whether confirmed arb signals are submitted as live taker orders.
-    /// Defaults false: the live arb order lifecycle (open/close tracking and
-    /// the circuit-breaker P&L feedback) is intentionally deferred, so this
-    /// phase only emits telemetry to `arb_events`.
+    /// Whether confirmed arb signals are submitted as HL taker orders.
+    /// Defaults false so operators must explicitly opt in, but when enabled
+    /// confirmed signals place IOC-style orders through OrderManager.
     arb_submit_orders: bool = false,
 };
 
@@ -578,7 +579,7 @@ fn strategyWorker(ctx: *StrategyWorkerCtx) void {
             evaluateLpSignals(ctx);
         }
 
-        // Phase 6: CEX↔DEX arb evaluation (telemetry-only by default).
+        // Phase 6: CEX↔DEX arb evaluation and optional taker submission.
         if (ctx.arb_enabled) {
             evaluateArbSignals(ctx);
         }
@@ -649,11 +650,9 @@ fn evaluateLpSignals(ctx: *StrategyWorkerCtx) void {
 ///
 /// Reads the live in-memory HL and Binance mids per asset, runs the pure
 /// `ArbState` evaluator (signed delta → confirm window → circuit breaker),
-/// and persists every confirmed signal to `arb_events`. Live taker order
-/// submission is gated behind `arb_submit_orders` (default off): the arb
-/// order lifecycle and circuit-breaker P&L feedback are intentionally
-/// deferred to a later, separately-reviewed change, so this path is
-/// telemetry-only.
+/// persists every confirmed signal to `arb_events`, and, when
+/// `arb_submit_orders` is enabled, submits an IOC-style HL taker order
+/// through the shared OrderManager/risk-gate path.
 fn evaluateArbSignals(ctx: *StrategyWorkerCtx) void {
     const hl_ob = ctx.hl_ob orelse return;
     const hl_syms = ctx.hl_symbols orelse return;
@@ -671,10 +670,6 @@ fn evaluateArbSignals(ctx: *StrategyWorkerCtx) void {
 
         const sig = ctx.arb.evaluate(sym, binance_mid, hlq.mid, now) orelse continue;
 
-        ctx.database.insertArbEvent(sym, sig.binance_mid, sig.hl_mid, sig.delta_bps, null) catch |e| {
-            log.warn("arb", "failed to persist arb event for {s}: {s}", .{ sym, @errorName(e) });
-        };
-
         const side: []const u8 = switch (sig.direction) {
             .short_hl_long_cex => "sell",
             .long_hl_short_cex => "buy",
@@ -683,9 +678,104 @@ fn evaluateArbSignals(ctx: *StrategyWorkerCtx) void {
             sym, side, sig.delta_bps, sig.binance_mid, sig.hl_mid, ctx.arb_submit_orders,
         });
 
-        // NOTE: live taker submission (ctx.arb_submit_orders) and the
-        // ArbState.recordTradeResult circuit-breaker feedback are deferred;
-        // see StrategyWorkerCtx.arb_submit_orders.
+        var submitted_order_id: ?[]u8 = null;
+        if (ctx.arb_submit_orders) {
+            submitted_order_id = dispatchArbSignal(ctx, sig, hlq);
+        }
+        defer if (submitted_order_id) |oid| ctx.om.allocator.free(oid);
+
+        ctx.database.insertArbEvent(
+            sym,
+            sig.binance_mid,
+            sig.hl_mid,
+            sig.delta_bps,
+            submitted_order_id,
+        ) catch |e| {
+            log.warn("arb", "failed to persist arb event for {s}: {s}", .{ sym, @errorName(e) });
+        };
+    }
+}
+
+const ArbOrderParams = struct {
+    side: []const u8,
+    price: f64,
+    size: f64,
+};
+
+fn arbOrderParams(sig: cex_dex_arb.ArbSignal, hlq: hl_orderbook.Quote) ?ArbOrderParams {
+    const side: []const u8 = switch (sig.direction) {
+        .short_hl_long_cex => "sell",
+        .long_hl_short_cex => "buy",
+    };
+    const raw_price = switch (sig.direction) {
+        .short_hl_long_cex => hlq.bid,
+        .long_hl_short_cex => hlq.ask,
+    };
+    const price = normalizePerpLimitPrice(raw_price) orelse return null;
+    if (sig.size_usd <= 0 or !std.math.isFinite(sig.size_usd)) return null;
+    const size = sig.size_usd / price;
+    if (size <= 0 or !std.math.isFinite(size)) return null;
+    return .{ .side = side, .price = price, .size = size };
+}
+
+fn dispatchArbSignal(
+    ctx: *StrategyWorkerCtx,
+    sig: cex_dex_arb.ArbSignal,
+    hlq: hl_orderbook.Quote,
+) ?[]u8 {
+    if (ctx.om.isHalted() or ctx.om.isPaused()) return null;
+    if (checkSaturation(ctx)) return null;
+
+    var params = arbOrderParams(sig, hlq) orelse {
+        log.warn("arb", "skipping signal with invalid taker quote: asset={s} bid={d} ask={d}", .{
+            sig.asset, hlq.bid, hlq.ask,
+        });
+        ctx.arb.recordTradeResult(-sig.size_usd, sig.timestamp);
+        return null;
+    };
+
+    var cap_buf: [16]u8 = undefined;
+    if (ctx.database.getConfig("max_order_size_usd", &cap_buf)) |cap_str| {
+        if (std.fmt.parseFloat(f64, cap_str)) |cap_usd| {
+            if (cap_usd > 0 and cap_usd < sig.size_usd) {
+                params.size = cap_usd / params.price;
+            }
+        } else |_| {}
+    }
+
+    const notional = params.size * params.price;
+    if (shouldSkipForMaxPosition(ctx, sig.asset, params.side, notional)) {
+        ctx.arb.recordTradeResult(-notional, sig.timestamp);
+        return null;
+    }
+
+    var price_buf: [32]u8 = undefined;
+    const price_str = std.fmt.bufPrint(&price_buf, "{d:.6}", .{params.price}) catch return null;
+    var size_buf: [32]u8 = undefined;
+    const size_str = std.fmt.bufPrint(&size_buf, "{d:.6}", .{params.size}) catch return null;
+
+    const result = ctx.om.placeOrder(sig.asset, params.side, size_str, price_str, "market", "cex_dex_arb");
+    switch (result) {
+        .success => |s| {
+            log.info("arb", "submitted HL taker order asset={s} side={s} size={s} price={s} order_id={s}", .{
+                sig.asset, params.side, size_str, price_str, s.order_id,
+            });
+            return s.order_id;
+        },
+        .rejected => |r| {
+            log.warn("arb", "HL taker order rejected asset={s} side={s} reason={s}", .{
+                sig.asset, params.side, r.reason,
+            });
+            ctx.arb.recordTradeResult(-notional, sig.timestamp);
+            return null;
+        },
+        .failed => |f| {
+            log.warn("arb", "HL taker order failed asset={s} side={s} reason={s}", .{
+                sig.asset, params.side, f.reason,
+            });
+            ctx.arb.recordTradeResult(-notional, sig.timestamp);
+            return null;
+        },
     }
 }
 
@@ -1019,6 +1109,35 @@ test "normalizePerpLimitPrice keeps perp-scale prices above prediction-market ra
     const rounded = normalizePerpLimitPrice(50_000.123) orelse return error.TestExpectedEqual;
     try std.testing.expectApproxEqAbs(@as(f64, 50_000.12), rounded, 1e-9);
     try std.testing.expectEqual(@as(?f64, null), normalizePerpLimitPrice(0.0));
+}
+
+test "arbOrderParams builds IOC taker params from confirmed arb signal" {
+    const quote = hl_orderbook.Quote{
+        .bid = 65000.011,
+        .ask = 65001.019,
+        .mid = 65000.515,
+        .ts_ns = 1,
+    };
+    const short_sig = cex_dex_arb.ArbSignal{
+        .asset = "BTC",
+        .direction = .short_hl_long_cex,
+        .delta_bps = 12.0,
+        .binance_mid = 64920.0,
+        .hl_mid = 65000.515,
+        .size_usd = 10.0,
+        .timestamp = 1,
+    };
+    const short_params = arbOrderParams(short_sig, quote) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("sell", short_params.side);
+    try std.testing.expectApproxEqAbs(@as(f64, 65000.01), short_params.price, 1e-9);
+    try std.testing.expect(short_params.size > 0.00015);
+    try std.testing.expect(short_params.size < 0.00016);
+
+    var long_sig = short_sig;
+    long_sig.direction = .long_hl_short_cex;
+    const long_params = arbOrderParams(long_sig, quote) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("buy", long_params.side);
+    try std.testing.expectApproxEqAbs(@as(f64, 65001.02), long_params.price, 1e-9);
 }
 
 fn shouldSkipForMaxPosition(ctx: *StrategyWorkerCtx, market_id: []const u8, side: []const u8, notional: f64) bool {

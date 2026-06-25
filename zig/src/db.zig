@@ -2175,6 +2175,38 @@ pub const DB = struct {
         }
     }
 
+    /// Back-fill an arb event after an arb-origin order fill is observed.
+    /// `order_id` may match either the local order id or client_order_id.
+    pub fn updateArbEventFill(
+        self: DB,
+        order_id: []const u8,
+        realised_pnl: f64,
+        fill_ns: i64,
+    ) !void {
+        const sql =
+            "UPDATE arb_events SET realised_pnl=?, fill_ns=? " ++
+            "WHERE order_id=?;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare updateArbEventFill", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_double(stmt, 1, realised_pnl) != c.SQLITE_OK or
+            c.sqlite3_bind_int64(stmt, 2, fill_ns) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 3, order_id.ptr, @intCast(order_id.len), null) != c.SQLITE_OK)
+        {
+            log.err("db", "failed to bind updateArbEventFill parameters", .{});
+            return error.DBExecFailed;
+        }
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
+            log.err("db", "failed to execute updateArbEventFill", .{});
+            return error.DBExecFailed;
+        }
+    }
+
     /// Fill the provided buffer with up to out.len open dry_run_orders rows.
     pub fn getOpenDryRunOrders(self: DB, out: []DryRunOrderRow) !usize {
         const sql =
