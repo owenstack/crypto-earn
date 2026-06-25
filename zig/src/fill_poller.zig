@@ -56,6 +56,76 @@ pub const ReconcileResult = struct {
     adopted: u32,
     closed: u32,
     unchanged: u32,
+    remote_checked: bool = false,
+    complete: bool = false,
+    error_buf: [96]u8 = [_]u8{0} ** 96,
+    error_len: usize = 0,
+
+    pub fn status(self: *const ReconcileResult) []const u8 {
+        if (self.complete) return "complete";
+        if (self.error_len > 0) return "error";
+        return "pending";
+    }
+
+    pub fn errorText(self: *const ReconcileResult) []const u8 {
+        return self.error_buf[0..self.error_len];
+    }
+};
+
+const MAX_RECONCILE_OPEN_ORDERS = 256;
+
+const RemoteOpenOrder = struct {
+    oid_buf: [48]u8 = [_]u8{0} ** 48,
+    oid_len: usize = 0,
+    cloid_buf: [80]u8 = [_]u8{0} ** 80,
+    cloid_len: usize = 0,
+    coin_buf: [32]u8 = [_]u8{0} ** 32,
+    coin_len: usize = 0,
+    side_buf: [8]u8 = [_]u8{0} ** 8,
+    side_len: usize = 0,
+    size_buf: [32]u8 = [_]u8{0} ** 32,
+    size_len: usize = 0,
+    price_buf: [32]u8 = [_]u8{0} ** 32,
+    price_len: usize = 0,
+
+    fn oid(self: *const RemoteOpenOrder) []const u8 {
+        return self.oid_buf[0..self.oid_len];
+    }
+
+    fn cloid(self: *const RemoteOpenOrder) []const u8 {
+        return self.cloid_buf[0..self.cloid_len];
+    }
+
+    fn coin(self: *const RemoteOpenOrder) []const u8 {
+        return self.coin_buf[0..self.coin_len];
+    }
+
+    fn side(self: *const RemoteOpenOrder) []const u8 {
+        return self.side_buf[0..self.side_len];
+    }
+
+    fn size(self: *const RemoteOpenOrder) []const u8 {
+        return self.size_buf[0..self.size_len];
+    }
+
+    fn price(self: *const RemoteOpenOrder) []const u8 {
+        return self.price_buf[0..self.price_len];
+    }
+};
+
+const LocalOpenOrder = struct {
+    id_buf: [80]u8 = [_]u8{0} ** 80,
+    id_len: usize = 0,
+    client_order_id_buf: [80]u8 = [_]u8{0} ** 80,
+    client_order_id_len: usize = 0,
+
+    fn id(self: *const LocalOpenOrder) []const u8 {
+        return self.id_buf[0..self.id_len];
+    }
+
+    fn clientOrderId(self: *const LocalOpenOrder) []const u8 {
+        return self.client_order_id_buf[0..self.client_order_id_len];
+    }
 };
 
 pub const FillPoller = struct {
@@ -164,27 +234,117 @@ pub const FillPoller = struct {
         log.info("fill_poller", "HL user WebSocket stopped", .{});
     }
 
-    /// Startup reconciliation opens the order gate after one REST fill sweep
-    /// when HL is configured. Dry-run/unconfigured engines are allowed through
-    /// immediately so local development remains offline.
+    /// Startup reconciliation ingests fills, then compares local open orders
+    /// with Hyperliquid's live open-order set. Remote orders missing locally
+    /// are adopted; local orders missing remotely are closed so capacity and
+    /// exposure gates do not carry stale state across restarts.
     pub fn reconcileOnStartup(self: *FillPoller) ReconcileResult {
+        var result = ReconcileResult{ .adopted = 0, .closed = 0, .unchanged = 0 };
         if (self.om.config.hl.enabled and !self.om.config.dry_run_enabled) {
             _ = self.pollUserFillsOnce() catch |e| {
                 log.warn("fill_poller", "startup userFills reconciliation failed: {s}", .{@errorName(e)});
             };
+
+            result = self.reconcileRemoteOpenOrders() catch |e| blk: {
+                log.warn("fill_poller", "startup open-order reconciliation failed: {s}", .{@errorName(e)});
+                var failed = ReconcileResult{ .adopted = 0, .closed = 0, .unchanged = 0, .remote_checked = false, .complete = false };
+                const err = std.fmt.bufPrint(&failed.error_buf, "{s}", .{@errorName(e)}) catch "";
+                failed.error_len = err.len;
+                break :blk failed;
+            };
         } else {
             log.info("fill_poller", "reconciliation: offline/dry-run mode, no remote HL sweep", .{});
+            result.unchanged = self.countLocalOpenOrders();
+            result.complete = true;
         }
-        const result = ReconcileResult{ .adopted = 0, .closed = 0, .unchanged = 1 };
         self.last_reconcile_result = result;
+        ipc.setReconcileStatus(.{
+            .adopted = result.adopted,
+            .closed = result.closed,
+            .unchanged = result.unchanged,
+            .remote_checked = result.remote_checked,
+            .complete = result.complete,
+            .error_buf = result.error_buf,
+            .error_len = result.error_len,
+        });
 
-        var evt_buf: [256]u8 = undefined;
-        const evt = std.fmt.bufPrint(
-            &evt_buf,
-            "{{\"adopted\":{d},\"closed\":{d},\"unchanged\":{d},\"status\":\"complete\"}}",
-            .{ result.adopted, result.closed, result.unchanged },
-        ) catch "{}";
+        var evt_buf: [384]u8 = undefined;
+        const evt = if (result.error_len > 0)
+            std.fmt.bufPrint(
+                &evt_buf,
+                "{{\"adopted\":{d},\"closed\":{d},\"unchanged\":{d},\"remote_checked\":{},\"status\":\"{s}\",\"error\":\"{s}\"}}",
+                .{ result.adopted, result.closed, result.unchanged, result.remote_checked, result.status(), result.errorText() },
+            ) catch "{}"
+        else
+            std.fmt.bufPrint(
+                &evt_buf,
+                "{{\"adopted\":{d},\"closed\":{d},\"unchanged\":{d},\"remote_checked\":{},\"status\":\"{s}\"}}",
+                .{ result.adopted, result.closed, result.unchanged, result.remote_checked, result.status() },
+            ) catch "{}";
         ipc.publishEvent(ipc_types.T.reconcile_status, evt);
+        return result;
+    }
+
+    fn reconcileRemoteOpenOrders(self: *FillPoller) !ReconcileResult {
+        var url_buf: [256]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, "{s}/info", .{self.om.config.hl.api_base}) catch return error.HttpFailed;
+        const user_addr = hl_auth.formatAddressEip55(self.om.config.hl.signer_address);
+
+        var body_buf: [160]u8 = undefined;
+        const body = std.fmt.bufPrint(
+            &body_buf,
+            "{{\"type\":\"openOrders\",\"user\":\"{s}\"}}",
+            .{user_addr[0..]},
+        ) catch return error.HttpFailed;
+
+        var client = http.HttpClient.init(self.allocator);
+        defer client.deinit();
+        var response = client.postJson(url, body) catch return error.HttpFailed;
+        defer response.deinit();
+        if (response.status.class() != .success) return error.HttpFailed;
+
+        return self.reconcileOpenOrdersBody(response.body);
+    }
+
+    fn reconcileOpenOrdersBody(self: *FillPoller, body: []const u8) !ReconcileResult {
+        var remote: [MAX_RECONCILE_OPEN_ORDERS]RemoteOpenOrder = undefined;
+        const remote_count = try parseOpenOrdersResponse(self.allocator, body, &remote);
+        var matched_remote = [_]bool{false} ** MAX_RECONCILE_OPEN_ORDERS;
+
+        var local: [MAX_RECONCILE_OPEN_ORDERS]LocalOpenOrder = undefined;
+        const local_count = try self.loadLocalOpenOrders(&local);
+
+        var result = ReconcileResult{
+            .adopted = 0,
+            .closed = 0,
+            .unchanged = 0,
+            .remote_checked = true,
+            .complete = true,
+        };
+
+        for (local[0..local_count]) |lo| {
+            if (findRemoteOrder(remote[0..remote_count], lo)) |idx| {
+                matched_remote[idx] = true;
+                result.unchanged += 1;
+                self.database.updateOrderLastChecked(lo.id()) catch |e| {
+                    log.warn("fill_poller", "failed to mark reconciled order {s}: {s}", .{ lo.id(), @errorName(e) });
+                };
+            } else {
+                try self.closeLocalOpenOrder(lo.id());
+                result.closed += 1;
+            }
+        }
+
+        for (remote[0..remote_count], 0..) |ro, idx| {
+            if (matched_remote[idx]) continue;
+            if (ro.oid_len == 0 or ro.coin_len == 0) continue;
+            try self.adoptRemoteOpenOrder(ro);
+            result.adopted += 1;
+        }
+
+        log.info("fill_poller", "reconciliation complete: adopted={d} closed={d} unchanged={d}", .{
+            result.adopted, result.closed, result.unchanged,
+        });
         return result;
     }
 
@@ -430,6 +590,113 @@ pub const FillPoller = struct {
         return out;
     }
 
+    fn countLocalOpenOrders(self: *FillPoller) u32 {
+        const sql = "SELECT count(*) FROM orders WHERE status IN ('placed','partially_filled');" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return 0;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+        const n = c.sqlite3_column_int64(stmt, 0);
+        return if (n < 0) 0 else @intCast(@min(n, std.math.maxInt(u32)));
+    }
+
+    fn loadLocalOpenOrders(self: *FillPoller, out: []LocalOpenOrder) !usize {
+        const sql = "SELECT id, COALESCE(client_order_id,'') FROM orders WHERE status IN ('placed','partially_filled') ORDER BY created_at ASC LIMIT ?;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_int(stmt, 1, @intCast(out.len)) != c.SQLITE_OK) return error.DBExecFailed;
+
+        var count: usize = 0;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW and count < out.len) : (count += 1) {
+            out[count] = .{};
+            copyColumnText(stmt.?, 0, &out[count].id_buf, &out[count].id_len);
+            copyColumnText(stmt.?, 1, &out[count].client_order_id_buf, &out[count].client_order_id_len);
+        }
+        return count;
+    }
+
+    fn closeLocalOpenOrder(self: *FillPoller, order_id: []const u8) !void {
+        const sql = "UPDATE orders SET status='cancelled', last_checked_at=unixepoch(), updated_at=unixepoch() WHERE id=? AND status IN ('placed','partially_filled');" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_text(stmt, 1, order_id.ptr, @intCast(order_id.len), null) != c.SQLITE_OK) return error.DBExecFailed;
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DBExecFailed;
+    }
+
+    fn adoptRemoteOpenOrder(self: *FillPoller, order: RemoteOpenOrder) !void {
+        try self.ensureMarket(order.coin());
+
+        const id = order.oid();
+        const cloid = if (order.cloid_len > 0) order.cloid() else order.oid();
+        const side = normalizeRemoteSide(order.side());
+        const size = if (order.size_len > 0) order.size() else "0";
+        const price = if (order.price_len > 0) order.price() else "0";
+
+        if (order.cloid_len > 0 and !std.mem.eql(u8, order.cloid(), order.oid())) {
+            if (try self.reopenRemoteOrderByClientId(order, side, size, price)) return;
+        }
+
+        const sql =
+            "INSERT INTO orders(id,market_id,client_order_id,type,side,size,price,status,filled_size,last_checked_at,updated_at) " ++
+            "VALUES(?,?,?,?,?,?,?,'placed','0',unixepoch(),unixepoch()) " ++
+            "ON CONFLICT(id) DO UPDATE SET status='placed', last_checked_at=unixepoch(), updated_at=unixepoch();" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 2, order.coin().ptr, @intCast(order.coin().len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 3, cloid.ptr, @intCast(cloid.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 4, "limit", 5, null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 5, side.ptr, @intCast(side.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 6, size.ptr, @intCast(size.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 7, price.ptr, @intCast(price.len), null) != c.SQLITE_OK)
+        {
+            return error.DBExecFailed;
+        }
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DBExecFailed;
+    }
+
+    fn reopenRemoteOrderByClientId(
+        self: *FillPoller,
+        order: RemoteOpenOrder,
+        side: []const u8,
+        size: []const u8,
+        price: []const u8,
+    ) !bool {
+        const sql =
+            "UPDATE orders SET market_id=?, type='limit', side=?, size=?, price=?, status='placed', last_checked_at=unixepoch(), updated_at=unixepoch() " ++
+            "WHERE client_order_id=?;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_text(stmt, 1, order.coin().ptr, @intCast(order.coin().len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 2, side.ptr, @intCast(side.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 3, size.ptr, @intCast(size.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 4, price.ptr, @intCast(price.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 5, order.cloid().ptr, @intCast(order.cloid().len), null) != c.SQLITE_OK)
+        {
+            return error.DBExecFailed;
+        }
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DBExecFailed;
+        return c.sqlite3_changes(self.database.handle) > 0;
+    }
+
+    fn ensureMarket(self: *FillPoller, market_id: []const u8) !void {
+        const sql = "INSERT OR IGNORE INTO markets(id,symbol,base,quote,status) VALUES(?,?,?,'USDC','active');" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_text(stmt, 1, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 2, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 3, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK)
+        {
+            return error.DBExecFailed;
+        }
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DBExecFailed;
+    }
+
     /// Parse order response JSON into FillCheckResult.
     pub fn parseOrderResponse(body: []const u8) ?FillCheckResult {
         var result: FillCheckResult = .{
@@ -481,6 +748,81 @@ pub const FillPoller = struct {
 fn hyperliquidWsHost(api_base: []const u8) []const u8 {
     if (std.mem.indexOf(u8, api_base, "testnet") != null) return "api.hyperliquid-testnet.xyz";
     return "api.hyperliquid.xyz";
+}
+
+fn copyColumnText(stmt: *c.sqlite3_stmt, col: c_int, buf: *[80]u8, len: *usize) void {
+    const raw = c.sqlite3_column_text(stmt, col) orelse return;
+    const span = std.mem.span(@as([*c]const u8, @ptrCast(raw)));
+    const n = @min(span.len, buf.len);
+    @memcpy(buf[0..n], span[0..n]);
+    len.* = n;
+}
+
+fn normalizeRemoteSide(side: []const u8) []const u8 {
+    if (std.mem.eql(u8, side, "B") or std.ascii.eqlIgnoreCase(side, "buy")) return "buy";
+    if (std.mem.eql(u8, side, "A") or std.ascii.eqlIgnoreCase(side, "sell")) return "sell";
+    return "buy";
+}
+
+fn findRemoteOrder(remote: []const RemoteOpenOrder, local: LocalOpenOrder) ?usize {
+    for (remote, 0..) |ro, idx| {
+        if (ro.oid_len > 0 and std.mem.eql(u8, ro.oid(), local.id())) return idx;
+        if (ro.oid_len > 0 and local.client_order_id_len > 0 and std.mem.eql(u8, ro.oid(), local.clientOrderId())) return idx;
+        if (ro.cloid_len > 0 and std.mem.eql(u8, ro.cloid(), local.id())) return idx;
+        if (ro.cloid_len > 0 and local.client_order_id_len > 0 and std.mem.eql(u8, ro.cloid(), local.clientOrderId())) return idx;
+    }
+    return null;
+}
+
+fn parseOpenOrdersResponse(allocator: std.mem.Allocator, body: []const u8, out: []RemoteOpenOrder) !usize {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.InvalidJson;
+    defer parsed.deinit();
+
+    const arr = switch (parsed.value) {
+        .array => |a| a,
+        else => return error.InvalidJson,
+    };
+
+    var count: usize = 0;
+    for (arr.items) |item| {
+        if (count >= out.len) break;
+        const obj = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+
+        var order = RemoteOpenOrder{};
+        if (obj.get("oid")) |v| copyJsonScalar(v, &order.oid_buf, &order.oid_len) catch continue;
+        if (obj.get("cloid")) |v| copyJsonScalar(v, &order.cloid_buf, &order.cloid_len) catch {};
+        if (obj.get("coin")) |v| copyJsonScalar(v, &order.coin_buf, &order.coin_len) catch continue;
+        if (obj.get("side")) |v| copyJsonScalar(v, &order.side_buf, &order.side_len) catch {};
+        if (obj.get("sz")) |v| copyJsonScalar(v, &order.size_buf, &order.size_len) catch {};
+        if (obj.get("limitPx")) |v| copyJsonScalar(v, &order.price_buf, &order.price_len) catch {};
+
+        if (order.oid_len == 0 or order.coin_len == 0) continue;
+        out[count] = order;
+        count += 1;
+    }
+    return count;
+}
+
+fn copyJsonScalar(value: std.json.Value, buf: []u8, len: *usize) !void {
+    len.* = 0;
+    const written = switch (value) {
+        .string => |s| try copySlice(s, buf),
+        .number_string => |s| try copySlice(s, buf),
+        .integer => |i| try std.fmt.bufPrint(buf, "{d}", .{i}),
+        .float => |f| try std.fmt.bufPrint(buf, "{d}", .{f}),
+        .null => return,
+        else => return error.InvalidJson,
+    };
+    len.* = written.len;
+}
+
+fn copySlice(src: []const u8, buf: []u8) ![]const u8 {
+    if (src.len > buf.len) return error.NoSpaceLeft;
+    @memcpy(buf[0..src.len], src);
+    return buf[0..src.len];
 }
 
 /// Extract a string value for a key from a flat JSON object without heap
@@ -689,4 +1031,104 @@ test "fill_poller: duplicate fill does not double-count MM inventory" {
     // the enter threshold → long_skewed.
     try std.testing.expect(h.fp.applyFill(mkFill("77003", "buy", 0.0004, 45000.0, 2)));
     try std.testing.expectEqual(strategy.SkewState.long_skewed, h.se.skewStateFor("BTC"));
+}
+
+test "fill_poller: parseOpenOrdersResponse handles numeric oid and cloid" {
+    const body =
+        \\[
+        \\  {"coin":"BTC","side":"B","limitPx":"45000","sz":"0.01","oid":12345,"cloid":"0xabc"},
+        \\  {"coin":"ETH","side":"A","limitPx":"2500","sz":"0.2","oid":"67890"}
+        \\]
+    ;
+    var orders: [4]RemoteOpenOrder = undefined;
+    const count = try parseOpenOrdersResponse(std.testing.allocator, body, &orders);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqualStrings("12345", orders[0].oid());
+    try std.testing.expectEqualStrings("0xabc", orders[0].cloid());
+    try std.testing.expectEqualStrings("BTC", orders[0].coin());
+    try std.testing.expectEqualStrings("B", orders[0].side());
+    try std.testing.expectEqualStrings("67890", orders[1].oid());
+}
+
+test "fill_poller: reconcileOpenOrdersBody adopts, closes, and preserves orders" {
+    var database = try db_mod.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote,status) VALUES('BTC','BTC','BTC','USDC','active');");
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote,status) VALUES('ETH','ETH','ETH','USDC','active');");
+    try database.execZ(
+        "INSERT INTO orders(id,market_id,client_order_id,type,side,size,price,status,filled_size) " ++
+            "VALUES('local-keep','BTC','111','limit','buy','0.01','45000','placed','0');",
+    );
+    try database.execZ(
+        "INSERT INTO orders(id,market_id,client_order_id,type,side,size,price,status,filled_size) " ++
+            "VALUES('local-close','ETH','222','limit','sell','0.1','2500','placed','0');",
+    );
+
+    var h = try FillHarness.init(&database);
+    defer h.deinit();
+
+    const body =
+        \\[
+        \\  {"coin":"BTC","side":"B","limitPx":"45000","sz":"0.01","oid":111},
+        \\  {"coin":"SOL","side":"A","limitPx":"140","sz":"1.5","oid":333,"cloid":"remote-sol"}
+        \\]
+    ;
+    const result = try h.fp.reconcileOpenOrdersBody(body);
+    try std.testing.expect(result.complete);
+    try std.testing.expect(result.remote_checked);
+    try std.testing.expectEqual(@as(u32, 1), result.unchanged);
+    try std.testing.expectEqual(@as(u32, 1), result.closed);
+    try std.testing.expectEqual(@as(u32, 1), result.adopted);
+
+    try expectOrderStatus(&database, "local-keep", "placed");
+    try expectOrderStatus(&database, "local-close", "cancelled");
+    try expectOrderStatus(&database, "333", "placed");
+}
+
+test "fill_poller: reconcileOpenOrdersBody reopens local order matched by cloid" {
+    var database = try db_mod.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    try database.execZ("INSERT INTO markets(id,symbol,base,quote,status) VALUES('BTC','BTC','BTC','USDC','active');");
+    try database.execZ(
+        "INSERT INTO orders(id,market_id,client_order_id,type,side,size,price,status,filled_size) " ++
+            "VALUES('local-stale','BTC','cloid-1','limit','buy','0.01','45000','cancelled','0');",
+    );
+
+    var h = try FillHarness.init(&database);
+    defer h.deinit();
+
+    const body =
+        \\[
+        \\  {"coin":"BTC","side":"A","limitPx":"45100","sz":"0.02","oid":999,"cloid":"cloid-1"}
+        \\]
+    ;
+    const result = try h.fp.reconcileOpenOrdersBody(body);
+    try std.testing.expect(result.complete);
+    try std.testing.expectEqual(@as(u32, 1), result.adopted);
+    try std.testing.expectEqual(@as(u32, 0), result.closed);
+    try std.testing.expectEqual(@as(u32, 0), result.unchanged);
+
+    try expectOrderStatus(&database, "local-stale", "placed");
+    try expectOrderField(&database, "local-stale", "side", "sell");
+    try expectOrderField(&database, "local-stale", "size", "0.02");
+    try expectOrderField(&database, "local-stale", "price", "45100");
+}
+
+fn expectOrderStatus(database: *db_mod.DB, order_id: []const u8, expected: []const u8) !void {
+    try expectOrderField(database, order_id, "status", expected);
+}
+
+fn expectOrderField(database: *db_mod.DB, order_id: []const u8, comptime field: []const u8, expected: []const u8) !void {
+    const sql = "SELECT " ++ field ++ " FROM orders WHERE id=? LIMIT 1;" ++ &[_:0]u8{};
+    var stmt: ?*c.sqlite3_stmt = null;
+    try std.testing.expect(c.sqlite3_prepare_v2(database.handle, sql.ptr, -1, &stmt, null) == c.SQLITE_OK);
+    defer _ = c.sqlite3_finalize(stmt);
+    try std.testing.expect(c.sqlite3_bind_text(stmt, 1, order_id.ptr, @intCast(order_id.len), null) == c.SQLITE_OK);
+    try std.testing.expect(c.sqlite3_step(stmt) == c.SQLITE_ROW);
+    const raw = c.sqlite3_column_text(stmt, 0) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings(expected, std.mem.span(@as([*c]const u8, @ptrCast(raw))));
 }

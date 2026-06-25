@@ -356,7 +356,7 @@ pub fn main() !void {
         var attempt: u32 = 0;
         while (attempt < 3) : (attempt += 1) {
             const result = fp.reconcileOnStartup();
-            if (result.adopted > 0 or result.closed > 0 or result.unchanged > 0) {
+            if (result.complete) {
                 reconcile_ok = true;
                 break;
             }

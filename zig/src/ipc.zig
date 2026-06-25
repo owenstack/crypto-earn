@@ -12,6 +12,40 @@ const MAX_SUBSCRIBERS = 16;
 
 var subscribers: [MAX_SUBSCRIBERS]?std.net.Stream = .{null} ** MAX_SUBSCRIBERS;
 var subscriber_mutex: std.Thread.Mutex = .{};
+var reconcile_mutex: std.Thread.Mutex = .{};
+var last_reconcile_status: ReconcileStatus = .{};
+
+pub const ReconcileStatus = struct {
+    adopted: u32 = 0,
+    closed: u32 = 0,
+    unchanged: u32 = 0,
+    remote_checked: bool = false,
+    complete: bool = false,
+    error_buf: [96]u8 = [_]u8{0} ** 96,
+    error_len: usize = 0,
+
+    pub fn status(self: *const ReconcileStatus) []const u8 {
+        if (self.complete) return "complete";
+        if (self.error_len > 0) return "error";
+        return "pending";
+    }
+
+    pub fn errorText(self: *const ReconcileStatus) []const u8 {
+        return self.error_buf[0..self.error_len];
+    }
+};
+
+pub fn setReconcileStatus(status: ReconcileStatus) void {
+    reconcile_mutex.lock();
+    defer reconcile_mutex.unlock();
+    last_reconcile_status = status;
+}
+
+pub fn getReconcileStatus() ReconcileStatus {
+    reconcile_mutex.lock();
+    defer reconcile_mutex.unlock();
+    return last_reconcile_status;
+}
 
 /// Register a client stream for event push delivery.
 fn addSubscriber(stream: std.net.Stream) bool {
@@ -593,11 +627,21 @@ fn handlePnlQuery(ctx: *Context, req_id: []const u8, root: std.json.ObjectMap, w
 }
 
 fn handleReconcileStatus(req_id: []const u8, writer: anytype) !void {
-    // The last reconcile result is stored in the fill_poller module.
-    // Since we don't have direct access to it here, return a stub indicating
-    // the reconciliation has completed (the engine wouldn't be accepting
-    // IPC connections if it hadn't).
-    try types.writeResponse(writer, req_id, types.T.reconcile_status_response, "{\"status\":\"complete\"}");
+    const result = getReconcileStatus();
+    var p: [256]u8 = undefined;
+    const payload = if (result.error_len > 0)
+        std.fmt.bufPrint(
+            &p,
+            "{{\"status\":\"{s}\",\"adopted\":{d},\"closed\":{d},\"unchanged\":{d},\"remote_checked\":{},\"error\":\"{s}\"}}",
+            .{ result.status(), result.adopted, result.closed, result.unchanged, result.remote_checked, result.errorText() },
+        ) catch "{}"
+    else
+        std.fmt.bufPrint(
+            &p,
+            "{{\"status\":\"{s}\",\"adopted\":{d},\"closed\":{d},\"unchanged\":{d},\"remote_checked\":{}}}",
+            .{ result.status(), result.adopted, result.closed, result.unchanged, result.remote_checked },
+        ) catch "{}";
+    try types.writeResponse(writer, req_id, types.T.reconcile_status_response, payload);
 }
 
 fn handleConfigValidate(ctx: *Context, req_id: []const u8, writer: anytype) !void {
