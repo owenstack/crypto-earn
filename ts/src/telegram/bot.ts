@@ -25,7 +25,7 @@ import type {
   ConfigPayload,
   ConfigValidateResponsePayload,
   DryRunAnalysisResponsePayload,
-  KalshiMappingsResponsePayload,
+  AssetMappingsResponsePayload,
 } from "../ipc/types";
 
 export function createAllowedIds(raw: string): Set<number> {
@@ -208,7 +208,7 @@ export function createBot(ipc: IPCClient): Bot {
       "/portfolio — open positions\n" +
       "/orders — open orders\n" +
       "/config — get or set config\n" +
-      "/mappings — Kalshi market mappings\n" +
+      "/mappings — asset market mappings\n" +
       "/drystatus — dry-run analysis\n" +
       "/livestatus — live trading status\n" +
       "/trade — place an order\n" +
@@ -272,11 +272,11 @@ export function createBot(ipc: IPCClient): Bot {
 
   bot.command("mappings", guard(async ctx => {
     if (!ipc.connected) { await ctx.reply("🔴 Engine IPC offline."); return; }
-    const res = await ipc.request<KalshiMappingsResponsePayload>("kalshi.mappings");
+    const res = await ipc.request<AssetMappingsResponsePayload>("asset.mappings");
     const rows = res.payload.mappings;
     if (!rows.length) {
       await ctx.reply(
-        "🗺️ *Kalshi Market Mappings*\n\nNo mappings discovered yet. They will appear here after Kalshi REST or WebSocket data matches local markets.",
+        "🗺️ *Asset Market Mappings*\n\nNo mappings discovered yet. They will appear here after external market data matches local assets.",
         { parse_mode: "Markdown" }
       );
       return;
@@ -284,10 +284,10 @@ export function createBot(ipc: IPCClient): Bot {
     const lines = rows.slice(0, 30).map(row => {
       const pct = Number.isFinite(row.confidence) ? (row.confidence * 100).toFixed(0) : "?";
       const method = row.match_method ?? "unknown";
-      return `• \`${row.ticker}\` → \`${row.gamma_id}\` (${pct}%, ${method})`;
+      return `• \`${row.source_id}\` → \`${row.market_id}\` (${pct}%, ${method})`;
     });
     const suffix = rows.length > 30 ? `\n\nShowing 30 of ${rows.length}.` : "";
-    await ctx.reply(`🗺️ *Kalshi Market Mappings*\n\n${lines.join("\n")}${suffix}`, { parse_mode: "Markdown" });
+    await ctx.reply(`🗺️ *Asset Market Mappings*\n\n${lines.join("\n")}${suffix}`, { parse_mode: "Markdown" });
   }));
 
   bot.command("drystatus", guard(async ctx => {
@@ -344,7 +344,7 @@ export function createBot(ipc: IPCClient): Bot {
       ipc.request<StrategyListResponsePayload>("strategy.list"),
       ipc.request<{ window: PnlWindow }, PnlResponsePayload>("pnl.query", { window: "today" }),
       ipc.request("reconcile.status"),
-      ipc.request<KalshiMappingsResponsePayload>("kalshi.mappings"),
+      ipc.request<AssetMappingsResponsePayload>("asset.mappings"),
     ]);
 
     const value = <T,>(result: PromiseSettledResult<Envelope<T>>): T | undefined =>
@@ -367,7 +367,7 @@ export function createBot(ipc: IPCClient): Bot {
 
     const strategyLines = strategies?.strategies?.length
       ? strategies.strategies.map(s => {
-        const name = s.name === "news_repricing" ? "News" : s.name === "liquidity_provision" ? "LP" : s.name;
+        const name = s.name === "market_making" ? "MM" : s.name === "cex_dex_arb" ? "Arb" : s.name;
         return `${name.padEnd(6)} ${s.enabled ? "on " : "off"} sig=${s.stats.signals_emitted} ok=${s.stats.orders_accepted} rej=${s.stats.orders_rejected}`;
       })
       : ["Strategies unavailable"];
@@ -555,16 +555,16 @@ export function createBot(ipc: IPCClient): Bot {
       await ctx.reply(`📊 Strategies\n\n${lines.join("\n")}`);
     } else if (subcommand === "enable") {
       const name = (args[1] ?? "").trim();
-      if (name !== "news_repricing" && name !== "liquidity_provision") {
-        await ctx.reply("Usage: /strategy enable <news_repricing|liquidity_provision>");
+      if (name !== "market_making" && name !== "cex_dex_arb") {
+        await ctx.reply("Usage: /strategy enable <market_making|cex_dex_arb>");
         return;
       }
       const res = await ipc.strategyEnable(name);
       await ctx.reply(`✅ Strategy \`${res.payload.name}\` enabled.`, { parse_mode: "Markdown" });
     } else if (subcommand === "disable") {
       const name = (args[1] ?? "").trim();
-      if (name !== "news_repricing" && name !== "liquidity_provision") {
-        await ctx.reply("Usage: /strategy disable <news_repricing|liquidity_provision>");
+      if (name !== "market_making" && name !== "cex_dex_arb") {
+        await ctx.reply("Usage: /strategy disable <market_making|cex_dex_arb>");
         return;
       }
       const res = await ipc.strategyDisable(name);

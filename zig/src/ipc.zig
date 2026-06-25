@@ -7,6 +7,7 @@ const db = @import("db.zig");
 const order_mgr = @import("order_manager.zig");
 const portfolio = @import("portfolio_tracker.zig");
 const strategy = @import("strategy_engine.zig");
+const cex_dex_arb = @import("cex_dex_arb.zig");
 
 const MAX_SUBSCRIBERS = 16;
 
@@ -125,10 +126,21 @@ pub const Context = struct {
     order_manager: ?*order_mgr.OrderManager = null,
     portfolio_tracker: ?*portfolio.PortfolioTracker = null,
     strategy_engine: ?*strategy.StrategyEngine = null,
+    arb_runtime: ?*cex_dex_arb.ArbRuntime = null,
+    arb_enabled: ?*std.atomic.Value(bool) = null,
 };
 
 /// Start listening; blocks until an unrecoverable error.
-pub fn serve(allocator: std.mem.Allocator, socket_path: []const u8, database: *db.DB, om: ?*order_mgr.OrderManager, pt: ?*portfolio.PortfolioTracker, se: ?*strategy.StrategyEngine) !void {
+pub fn serve(
+    allocator: std.mem.Allocator,
+    socket_path: []const u8,
+    database: *db.DB,
+    om: ?*order_mgr.OrderManager,
+    pt: ?*portfolio.PortfolioTracker,
+    se: ?*strategy.StrategyEngine,
+    arb_runtime: ?*cex_dex_arb.ArbRuntime,
+    arb_enabled: ?*std.atomic.Value(bool),
+) !void {
     // Remove stale socket file from a prior run.
     std.fs.cwd().deleteFile(socket_path) catch {};
 
@@ -141,7 +153,15 @@ pub fn serve(allocator: std.mem.Allocator, socket_path: []const u8, database: *d
 
     log.info("ipc", "listening on {s}", .{socket_path});
 
-    var ctx = Context{ .allocator = allocator, .database = database, .order_manager = om, .portfolio_tracker = pt, .strategy_engine = se };
+    var ctx = Context{
+        .allocator = allocator,
+        .database = database,
+        .order_manager = om,
+        .portfolio_tracker = pt,
+        .strategy_engine = se,
+        .arb_runtime = arb_runtime,
+        .arb_enabled = arb_enabled,
+    };
 
     while (true) {
         const conn = listener.accept() catch |e| {
@@ -201,7 +221,7 @@ const DispatchKind = enum {
     pause,
     pnl_query,
     config_validate,
-    kalshi_mappings,
+    asset_mappings,
     reconcile_status,
     inventory_snapshot,
     dry_run_analysis,
@@ -236,7 +256,7 @@ const DISPATCH_TABLE = [_]DispatchEntry{
     .{ .msg_type = types.T.pnl_query, .kind = .pnl_query },
     .{ .msg_type = types.T.reconcile_status, .kind = .reconcile_status },
     .{ .msg_type = types.T.config_validate, .kind = .config_validate },
-    .{ .msg_type = types.T.kalshi_mappings, .kind = .kalshi_mappings },
+    .{ .msg_type = types.T.asset_mappings, .kind = .asset_mappings },
     .{ .msg_type = types.T.inventory_snapshot, .kind = .inventory_snapshot },
     .{ .msg_type = types.T.dry_run_analysis, .kind = .dry_run_analysis },
     .{ .msg_type = types.T.funding_snapshot, .kind = .funding_snapshot },
@@ -277,13 +297,8 @@ fn getPayloadObject(root: std.json.ObjectMap) ?std.json.ObjectMap {
     } else null;
 }
 
-fn parseStrategyName(name_str: []const u8) ?strategy.StrategyName {
-    if (std.mem.eql(u8, name_str, "news_repricing")) return .news_repricing;
-    // Phase 6: accept both the legacy `liquidity_provision` wire string and
-    // the new `market_making` name so the dashboard/Telegram rename can
-    // land in a later phase without breaking control commands.
+fn parseMarketMakingStrategyName(name_str: []const u8) ?strategy.StrategyName {
     if (std.mem.eql(u8, name_str, "market_making")) return .market_making;
-    if (std.mem.eql(u8, name_str, "liquidity_provision")) return .market_making;
     return null;
 }
 
@@ -331,7 +346,7 @@ fn dispatch(ctx: *Context, line: []const u8, writer: anytype, stream: std.net.St
         .pnl_query => try handlePnlQuery(ctx, req_id, root, writer),
         .reconcile_status => try handleReconcileStatus(req_id, writer),
         .config_validate => try handleConfigValidate(ctx, req_id, writer),
-        .kalshi_mappings => try handleKalshiMappings(ctx, req_id, writer),
+        .asset_mappings => try handleAssetMappings(ctx, req_id, writer),
         .inventory_snapshot => try handleInventorySnapshot(ctx, req_id, writer),
         .dry_run_analysis => try handleDryRunAnalysis(ctx, req_id, writer),
         .funding_snapshot => try handleFundingSnapshot(ctx, req_id, writer),
@@ -498,20 +513,19 @@ fn handleResume(ctx: *Context, req_id: []const u8, writer: anytype) !void {
 
 fn handleStrategyList(ctx: *Context, req_id: []const u8, writer: anytype) !void {
     if (ctx.strategy_engine) |se| {
-        const news_enabled = se.isEnabled(.news_repricing);
         const lp_enabled = se.isEnabled(.market_making);
-        const ns = se.getStats(.news_repricing);
         const ls = se.getStats(.market_making);
+        const arb_enabled = if (ctx.arb_enabled) |enabled| enabled.load(.seq_cst) else false;
         var p: [1024]u8 = undefined;
         const payload = std.fmt.bufPrint(
             &p,
             "{{\"strategies\":[" ++
-                "{{\"name\":\"news_repricing\",\"enabled\":{},\"stats\":{{\"signals_emitted\":{d},\"orders_accepted\":{d},\"orders_rejected\":{d},\"cancels\":{d},\"active_order_overflow_count\":{d}}}}}," ++
-                "{{\"name\":\"market_making\",\"enabled\":{},\"stats\":{{\"signals_emitted\":{d},\"orders_accepted\":{d},\"orders_rejected\":{d},\"cancels\":{d},\"active_order_overflow_count\":{d}}}}}" ++
+                "{{\"name\":\"market_making\",\"enabled\":{},\"stats\":{{\"signals_emitted\":{d},\"orders_accepted\":{d},\"orders_rejected\":{d},\"cancels\":{d},\"active_order_overflow_count\":{d}}}}}," ++
+                "{{\"name\":\"cex_dex_arb\",\"enabled\":{},\"stats\":{{\"signals_emitted\":0,\"orders_accepted\":0,\"orders_rejected\":0,\"cancels\":0,\"active_order_overflow_count\":0}}}}" ++
                 "]}}",
             .{
-                news_enabled, ns.signals_emitted, ns.orders_accepted, ns.orders_rejected, ns.cancels, ns.active_order_overflow_count,
                 lp_enabled,   ls.signals_emitted, ls.orders_accepted, ls.orders_rejected, ls.cancels, ls.active_order_overflow_count,
+                arb_enabled,
             },
         ) catch "{}";
         try types.writeResponse(writer, req_id, types.T.strategy_list_response, payload);
@@ -529,7 +543,25 @@ fn handleStrategyToggle(ctx: *Context, req_id: []const u8, root: std.json.Object
         };
 
         const name_str = getStringField(payload_obj, "name", "");
-        const strat_name = parseStrategyName(name_str) orelse {
+
+        if (std.mem.eql(u8, name_str, "cex_dex_arb")) {
+            const enabled = ctx.arb_enabled orelse {
+                try types.writeError(writer, req_id, "arb runtime not available");
+                return;
+            };
+            enabled.store(enable, .seq_cst);
+            if (enable) {
+                if (ctx.arb_runtime) |arb| arb.reenable();
+            }
+
+            var p: [128]u8 = undefined;
+            const resp = std.fmt.bufPrint(&p, "{{\"name\":\"cex_dex_arb\",\"enabled\":{}}}", .{enable}) catch "{}";
+            const resp_type = if (enable) types.T.strategy_enable_response else types.T.strategy_disable_response;
+            try types.writeResponse(writer, req_id, resp_type, resp);
+            return;
+        }
+
+        const strat_name = parseMarketMakingStrategyName(name_str) orelse {
             try types.writeError(writer, req_id, "unknown strategy name");
             return;
         };
@@ -707,9 +739,9 @@ fn handleConfigValidate(ctx: *Context, req_id: []const u8, writer: anytype) !voi
     try types.writeResponse(writer, req_id, types.T.config_validate_response, result);
 }
 
-fn handleKalshiMappings(ctx: *Context, req_id: []const u8, writer: anytype) !void {
+fn handleAssetMappings(ctx: *Context, req_id: []const u8, writer: anytype) !void {
     const rows = ctx.database.getAllKalshiMappings(ctx.allocator) catch {
-        try types.writeError(writer, req_id, "kalshi mappings query failed");
+        try types.writeError(writer, req_id, "asset mappings query failed");
         return;
     };
     defer ctx.allocator.free(rows);
@@ -721,13 +753,13 @@ fn handleKalshiMappings(ctx: *Context, req_id: []const u8, writer: anytype) !voi
     for (rows, 0..) |row, i| {
         if (i > 0) try w.writeByte(',');
         const row_json = std.json.Stringify.valueAlloc(ctx.allocator, .{
-            .ticker = row.ticker_buf[0..row.ticker_len],
-            .gamma_id = row.gamma_id_buf[0..row.gamma_id_len],
+            .source_id = row.ticker_buf[0..row.ticker_len],
+            .market_id = row.gamma_id_buf[0..row.gamma_id_len],
             .confidence = row.confidence,
             .match_method = row.match_method_buf[0..row.match_method_len],
             .updated_at = row.updated_at,
         }, .{}) catch {
-            try types.writeError(writer, req_id, "kalshi mappings serialization failed");
+            try types.writeError(writer, req_id, "asset mappings serialization failed");
             return;
         };
         defer ctx.allocator.free(row_json);
@@ -735,7 +767,7 @@ fn handleKalshiMappings(ctx: *Context, req_id: []const u8, writer: anytype) !voi
     }
     try w.writeAll("]}");
 
-    try types.writeResponse(writer, req_id, types.T.kalshi_mappings_response, payload.items);
+    try types.writeResponse(writer, req_id, types.T.asset_mappings_response, payload.items);
 }
 
 fn handleInventorySnapshot(ctx: *Context, req_id: []const u8, writer: anytype) !void {

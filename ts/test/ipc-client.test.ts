@@ -254,7 +254,7 @@ describe("IPCClient", () => {
       });
       await client.connect();
 
-      const res = await client.request("strategy.enable", { name: "news_repricing" });
+      const res = await client.request("strategy.enable", { name: "cex_dex_arb" });
       expect(res.v).toBe(1);
       expect(res.type).toBe("strategy.enable.response");
 
@@ -268,7 +268,7 @@ describe("IPCClient", () => {
       });
       await client.connect();
 
-      const res = await client.request("strategy.disable", { name: "liquidity_provision" });
+      const res = await client.request("strategy.disable", { name: "market_making" });
       expect(res.v).toBe(1);
       expect(res.type).toBe("strategy.disable.response");
 
@@ -296,7 +296,7 @@ describe("IPCClient", () => {
       });
       await client.connect();
 
-      const res = await client.strategyEnable("news_repricing");
+      const res = await client.strategyEnable("cex_dex_arb");
       expect(res.v).toBe(1);
       expect(res.type).toBe("strategy.enable.response");
 
@@ -310,7 +310,7 @@ describe("IPCClient", () => {
       });
       await client.connect();
 
-      const res = await client.strategyDisable("liquidity_provision");
+      const res = await client.strategyDisable("market_making");
       expect(res.v).toBe(1);
       expect(res.type).toBe("strategy.disable.response");
 

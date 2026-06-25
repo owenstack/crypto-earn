@@ -427,15 +427,16 @@ pub fn main() !void {
     // Phase 6: CEX↔DEX arb. ENABLE_CEX_DEX_ARB turns the evaluator on.
     // ARB_SUBMIT_ORDERS additionally enables HL taker submission through the
     // same risk-gated OrderManager path used by every other strategy.
-    const arb_enabled = if (std.posix.getenv("ENABLE_CEX_DEX_ARB")) |v|
+    const arb_enabled_initial = if (std.posix.getenv("ENABLE_CEX_DEX_ARB")) |v|
         (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true"))
     else
         false;
+    var arb_enabled = std.atomic.Value(bool).init(arb_enabled_initial);
     const arb_submit_orders = if (std.posix.getenv("ARB_SUBMIT_ORDERS")) |v|
         (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true"))
     else
         false;
-    if (arb_enabled) {
+    if (arb_enabled_initial) {
         log.info("engine", "CEX↔DEX arb evaluator enabled (submit_orders={any})", .{arb_submit_orders});
     }
 
@@ -481,7 +482,7 @@ pub fn main() !void {
         .binance_feed = if (binance_started) &binance_feed else null,
         .binance_symbols = binance_symbols,
         .arb = &arb_runtime,
-        .arb_enabled = arb_enabled,
+        .arb_enabled = &arb_enabled,
         .arb_submit_orders = arb_submit_orders,
     };
     const strategy_thread = try std.Thread.spawn(.{}, strategyWorker, .{&strategy_ctx});
@@ -503,7 +504,7 @@ pub fn main() !void {
     log.info("engine", "db retention ticker started", .{});
 
     // Start IPC server (blocks)
-    try ipc.serve(allocator, socket_path, &database, &om, &pt, &se);
+    try ipc.serve(allocator, socket_path, &database, &om, &pt, &se, &arb_runtime, &arb_enabled);
 }
 
 const StrategyWorkerCtx = struct {
@@ -544,7 +545,7 @@ const StrategyWorkerCtx = struct {
     /// signals, while fill ingestion reports realized P&L.
     arb: *cex_dex_arb.ArbRuntime,
     /// Whether the arb evaluator runs at all (ENABLE_CEX_DEX_ARB).
-    arb_enabled: bool = false,
+    arb_enabled: *std.atomic.Value(bool),
     /// Whether confirmed arb signals are submitted as HL taker orders.
     /// Defaults false so operators must explicitly opt in, but when enabled
     /// confirmed signals place IOC-style orders through OrderManager.
@@ -580,7 +581,7 @@ fn strategyWorker(ctx: *StrategyWorkerCtx) void {
         }
 
         // Phase 6: CEX↔DEX arb evaluation and optional taker submission.
-        if (ctx.arb_enabled) {
+        if (ctx.arb_enabled.load(.seq_cst)) {
             evaluateArbSignals(ctx);
         }
 

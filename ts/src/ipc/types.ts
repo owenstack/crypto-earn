@@ -27,7 +27,7 @@ export type RequestMessageType =
   | "dry_run.analysis"
   | "reconcile.status"
   | "config.validate"
-  | "kalshi.mappings"
+  | "asset.mappings"
   | "funding.snapshot"
   | "arb.events";
 
@@ -63,7 +63,7 @@ export type ResponseMessageType =
   | "dry_run.analysis.response"
   | "reconcile.status.response"
   | "config.validate.response"
-  | "kalshi.mappings.response"
+  | "asset.mappings.response"
   | "funding.snapshot.response"
   | "arb.events.response";
 
@@ -333,7 +333,7 @@ export interface ResumeResponsePayload {
 }
 
 // Phase 3: Strategy payloads
-export type StrategyName = "news_repricing" | "liquidity_provision";
+export type StrategyName = "market_making" | "cex_dex_arb";
 
 export interface StrategyEnableDisablePayload {
   name: StrategyName;
@@ -513,16 +513,16 @@ export interface ConfigValidateResponsePayload {
   prob_source_probability_field: { valid: boolean; value: string };
 }
 
-export interface KalshiMappingInfo {
-  ticker: string;
-  gamma_id: string;
+export interface AssetMappingInfo {
+  source_id: string;
+  market_id: string;
   confidence: number;
   match_method: string;
   updated_at: number;
 }
 
-export interface KalshiMappingsResponsePayload {
-  mappings: KalshiMappingInfo[];
+export interface AssetMappingsResponsePayload {
+  mappings: AssetMappingInfo[];
 }
 
 /** Build a request envelope with a random correlation ID. */

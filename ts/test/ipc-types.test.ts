@@ -62,4 +62,10 @@ describe("Phase 5 message types", () => {
     expect(env.type).toBe("pnl.query");
     expect(env.payload).toEqual({ window: "7d" });
   });
+
+  test("asset.mappings request envelope", () => {
+    const env = makeRequest("asset.mappings");
+    expect(env.type).toBe("asset.mappings");
+    expect(env.payload).toEqual({});
+  });
 });

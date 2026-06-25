@@ -226,6 +226,8 @@ test "db: insertArbEvent + queryArbEvents round-trip" {
 }
 
 test "ipc_types: Phase 5 message type strings are correct" {
+    try testing.expectEqualStrings("asset.mappings", ipc_types.T.asset_mappings);
+    try testing.expectEqualStrings("asset.mappings.response", ipc_types.T.asset_mappings_response);
     try testing.expectEqualStrings("funding.snapshot", ipc_types.T.funding_snapshot);
     try testing.expectEqualStrings("funding.snapshot.response", ipc_types.T.funding_snapshot_response);
     try testing.expectEqualStrings("arb.events", ipc_types.T.arb_events);
