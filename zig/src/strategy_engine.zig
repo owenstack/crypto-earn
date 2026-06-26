@@ -34,9 +34,9 @@ pub const StrategyConfig = struct {
     /// News order notional as fraction of USDC balance. Interpreted as
     /// dollars-of-collateral, then divided by quote price to derive the
     /// share count submitted to the CLOB.
-    news_order_size_pct: f64 = 0.12,
+    news_order_size_pct: f64 = 1.20,
     /// Dollar notional fallback when balance is unknown (cold start).
-    news_order_fallback_usd: f64 = 1.20,
+    news_order_fallback_usd: f64 = 12.0,
 
     // Market making (formerly liquidity_provision). Phase 6 tightens the
     // spread defaults to better fit Hyperliquid perp books, which trade at
@@ -52,9 +52,9 @@ pub const StrategyConfig = struct {
     /// LP TOTAL pair notional as fraction of USDC balance (covers BOTH legs
     /// combined). Interpreted as dollars-of-collateral, then split per leg
     /// and divided by leg price to derive shares.
-    lp_order_size_pct: f64 = 0.07,
+    lp_order_size_pct: f64 = 2.40,
     /// Dollar notional fallback (per-pair-total) when balance is unknown.
-    lp_order_fallback_usd: f64 = 0.70,
+    lp_order_fallback_usd: f64 = 24.0,
 
     /// Phase 6: inventory-skew thresholds, expressed as a fraction of
     /// `lp_max_position_usd`. After a long fill pushes the per-market
@@ -75,7 +75,7 @@ pub const StrategyConfig = struct {
 /// keep this tiny so the notional floor drives sizing for small accounts.
 pub const MIN_ORDER_SIZE: f64 = 0.000001;
 /// Minimum order notional (USD) used by the strategy sizing fallback.
-pub const MIN_ORDER_NOTIONAL_USD: f64 = 1.0;
+pub const MIN_ORDER_NOTIONAL_USD: f64 = 11.0;
 
 /// Resolve a strategy order size (in shares) from a balance-scaled DOLLAR
 /// fraction at a given quote price.
@@ -109,10 +109,10 @@ test "resolveOrderSize uses perp-scale prices without prediction-market cap" {
     );
 }
 
-test "resolveOrderSize keeps small perp orders near target notional" {
+test "resolveOrderSize floors small perp orders above HL minimum notional" {
     const size = resolveOrderSize(10.0, 0.12, 50_000.0, 1.20);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.000024), size, 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.20), size * 50_000.0, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.00022), size, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 11.0), size * 50_000.0, 1e-9);
 }
 
 pub const StrategyStats = struct {

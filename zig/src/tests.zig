@@ -1154,8 +1154,8 @@ test "strategy_engine: news repricing triggers on sufficient delta" {
     try testing.expectEqual(strategy_engine.StrategyName.news_repricing, s.strategy);
     try testing.expectEqual(strategy_engine.SignalDirection.buy, s.direction);
     try testing.expectEqual(@as(f64, 0.70), s.price);
-    // Size = $10/$0.70 = ~14.2857 asset units.
-    try testing.expectApproxEqAbs(@as(f64, 14.285714285714286), s.size, 1e-9);
+    // Size is floored to $11 notional: $11/$0.70 = ~15.7143 asset units.
+    try testing.expectApproxEqAbs(@as(f64, 15.714285714285714), s.size, 1e-9);
     try testing.expect(s.confidence >= 0.3);
     try testing.expect(s.confidence <= 1.0);
     try testing.expectEqual(@as(u64, 1), se.news_stats.signals_emitted);
@@ -1274,12 +1274,12 @@ test "strategy_engine: LP emits paired signals when spread wide and inventory ex
     try testing.expectEqual(@as(usize, 2), result.count);
     try testing.expectEqual(strategy_engine.SignalDirection.buy, result.signals[0].direction);
     try testing.expectEqual(strategy_engine.SignalDirection.sell, result.signals[1].direction);
-    // bid = 0.40 + 0.20 * 0.25 = 0.45 → buy size = max($2.50/$0.45, 5) = ~5.555
+    // bid = 0.40 + 0.20 * 0.25 = 0.45; the $11 notional floor drives sizing.
     try testing.expectApproxEqAbs(@as(f64, 0.45), result.signals[0].price, 1e-9);
-    try testing.expectApproxEqAbs(@as(f64, 2.5 / 0.45), result.signals[0].size, 1e-9);
-    // ask = 0.60 - 0.20 * 0.25 = 0.55 → sell size = $2.50/$0.55
+    try testing.expectApproxEqAbs(@as(f64, 11.0 / 0.45), result.signals[0].size, 1e-9);
+    // ask = 0.60 - 0.20 * 0.25 = 0.55; the $11 notional floor drives sizing.
     try testing.expectApproxEqAbs(@as(f64, 0.55), result.signals[1].price, 1e-9);
-    try testing.expectApproxEqAbs(@as(f64, 2.5 / 0.55), result.signals[1].size, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 11.0 / 0.55), result.signals[1].size, 1e-9);
     try testing.expectEqual(@as(u64, 2), se.lp_stats.signals_emitted);
 }
 
@@ -1951,7 +1951,7 @@ test "order_manager: reconciliation gate blocks orders until set" {
             try testing.expect(s.order_id.len > 0);
             om.allocator.free(s.order_id);
         },
-        .failed => |f| try testing.expectEqualStrings("clob_submission_failed", f.reason),
+        .failed => |f| try testing.expectEqualStrings("hl_submission_failed", f.reason),
         .rejected => |r| try testing.expect(!std.mem.eql(u8, r.reason, "reconciliation_pending")),
     }
 }
@@ -2471,10 +2471,10 @@ test "phase4: dry-run shares the live risk gate (oversized order rejected)" {
     var om = order_manager.OrderManager.init(testing.allocator, &database, .{}, om_cfg);
     try dryRunFixture(&om, &database);
 
-    // 100 @ 0.50 = $50 notional. With a $100 balance and default 15%
-    // max_position_pct the cap is $15, so this MUST be rejected by the
+    // 400 @ 0.50 = $200 notional. With a $100 balance and default 150%
+    // max_position_pct the cap is $150, so this MUST be rejected by the
     // shared risk gate before ever hitting the dry-run interception.
-    const result = om.placeOrder("m1", "buy", "100", "0.50", "limit", null);
+    const result = om.placeOrder("m1", "buy", "400", "0.50", "limit", null);
     switch (result) {
         .rejected => |r| {
             try testing.expectEqualStrings("MaxPositionExceeded", r.reason);

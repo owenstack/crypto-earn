@@ -10,20 +10,21 @@ pub const RiskConfig = struct {
     // --- Ratio-based limits (scale automatically with balance) ---
 
     /// Max notional for a single order as a fraction of balance.
-    /// 0.15 on $10 = $1.50 order. On $100 = $15. On $500 = $75.
-    max_position_pct: f64 = 0.15,
+    /// 1.50 on $10 = $15 order, allowing small accounts to clear HL's
+    /// minimum notional while still staying bounded by the leverage cap.
+    max_position_pct: f64 = 1.50,
 
     /// Max total open exposure as fraction of balance.
-    /// 0.80 leaves 20% undeployed as buffer for fees and drawdown.
-    max_portfolio_exposure_pct: f64 = 0.80,
+    /// 5.00 allows up to 5x notional exposure for micro-account trading.
+    max_portfolio_exposure_pct: f64 = 5.00,
 
     /// Daily loss kill-switch as fraction of balance.
     /// 0.30 on $10 = halt at -$3. On $100 = halt at -$30.
     max_daily_drawdown_pct: f64 = 0.30,
 
     // --- Absolute fallbacks (used only before first balance snapshot) ---
-    max_position_usd_fallback: f64 = 1.50,
-    max_portfolio_exposure_usd_fallback: f64 = 8.0,
+    max_position_usd_fallback: f64 = 15.0,
+    max_portfolio_exposure_usd_fallback: f64 = 50.0,
     max_daily_drawdown_usd_fallback: f64 = 3.0,
 
     // --- Unchanged fields ---
@@ -35,12 +36,12 @@ pub const RiskConfig = struct {
     allow_duplicate_positions: bool = false,
     /// Fraction of the user's USDC balance the bot is allowed to commit to
     /// open orders at any given time.
-    max_balance_commitment_ratio: f64 = 0.70,
+    max_balance_commitment_ratio: f64 = 5.00,
     balance_snapshot_max_age_seconds: i64 = 600,
     /// Nominal per-order notional in USD used to compute dynamicMaxOpenOrders
-    /// from balance. Intentionally small (matches default order sizes) so the
-    /// dynamic cap scales sensibly with account size.
-    nominal_order_notional_usd: f64 = 0.75,
+    /// from balance. Set above HL's minimum order notional so the dynamic cap
+    /// tracks executable micro-account order sizes.
+    nominal_order_notional_usd: f64 = 11.0,
 
     // --- Phase 6: margin-aware account-leverage cap. ---
     /// Maximum (open_position_notional + new_order_notional) / equity
@@ -48,10 +49,8 @@ pub const RiskConfig = struct {
     /// snapshot. Replaces the Polymarket duplicate-position guard for HL
     /// margin trading where stacking longs/shorts on the same instrument is
     /// allowed as long as the aggregate leverage stays within bounds.
-    /// 3.0 = the bot may keep up to 3x equity in open notional. With the
-    /// existing `max_balance_commitment_ratio` of 0.70 also gating new
-    /// orders, this is a conservative ceiling for low-leverage HL perps.
-    max_account_leverage: f64 = 3.0,
+    /// 5.0 = the bot may keep up to 5x equity in open notional.
+    max_account_leverage: f64 = 5.0,
 };
 
 /// Resolved (absolute USD) limits. Computed from the current balance snapshot.

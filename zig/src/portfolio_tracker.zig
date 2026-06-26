@@ -36,8 +36,8 @@ pub const PortfolioSnapshot = struct {
 };
 
 pub const FeeConfig = struct {
-    maker_fee_bps: f64 = 0.0, // maker fee in basis points (e.g., 0 bps)
-    taker_fee_bps: f64 = 2.0, // taker fee in basis points (e.g., 2 bps)
+    maker_fee_bps: f64 = 1.5, // Hyperliquid maker fee in basis points
+    taker_fee_bps: f64 = 4.5, // Hyperliquid taker fee in basis points
 };
 
 pub const PortfolioTracker = struct {

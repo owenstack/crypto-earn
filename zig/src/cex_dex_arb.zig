@@ -38,7 +38,7 @@ pub const ArbConfig = struct {
     /// Cooldown (seconds) after the breaker trips before signals resume.
     cooldown_seconds: i64 = 300,
     /// Per-trade USD notional submitted through the order pipeline.
-    order_size_usd: f64 = 10.0,
+    order_size_usd: f64 = 12.0,
 
     pub fn validate(self: ArbConfig) !void {
         if (self.delta_threshold_bps < 0 or !std.math.isFinite(self.delta_threshold_bps))

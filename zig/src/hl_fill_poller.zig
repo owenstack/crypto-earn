@@ -371,7 +371,7 @@ pub const SimResult = struct {
 /// Phase 5 dry-run fill model: an order crosses the book when the resting
 /// limit price is on the wrong side of the opposite top-of-book quote. Buys
 /// fill at best_ask if signal_price >= best_ask; sells fill at best_bid if
-/// signal_price <= best_bid. Taker fee is fixed at 3.5 bps per the plan.
+/// signal_price <= best_bid. Taker fee is fixed at the default HL taker tier.
 pub fn simulateDryRunFill(
     is_buy: bool,
     signal_price: f64,
@@ -379,7 +379,7 @@ pub fn simulateDryRunFill(
     best_ask: f64,
     size: f64,
 ) SimResult {
-    const taker_fee_bps: f64 = 3.5;
+    const taker_fee_bps: f64 = 4.5;
     const crosses = if (is_buy)
         (best_ask > 0 and signal_price >= best_ask)
     else
@@ -452,8 +452,8 @@ test "hl_fill_poller: simulateDryRunFill — buy crosses ask" {
     const r = simulateDryRunFill(true, 0.55, 0.50, 0.52, 10.0);
     try std.testing.expect(r.would_fill);
     try std.testing.expectApproxEqAbs(@as(f64, 0.52), r.fill_price, 1e-9);
-    // notional = 5.20, fee = 5.20 * 3.5 / 10000 = 0.00182
-    try std.testing.expectApproxEqAbs(@as(f64, 0.00182), r.fee, 1e-6);
+    // notional = 5.20, fee = 5.20 * 4.5 / 10000 = 0.00234
+    try std.testing.expectApproxEqAbs(@as(f64, 0.00234), r.fee, 1e-6);
 }
 
 test "hl_fill_poller: simulateDryRunFill — sell crosses bid" {

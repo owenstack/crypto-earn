@@ -940,7 +940,7 @@ fn simulateDryRunFills(ctx: *StrategyWorkerCtx) void {
     if (count == 0) return;
 
     const now = std.time.timestamp();
-    const fee_bps: f64 = 2.0; // 2bps per side, matches taker fee config
+    const fee_bps: f64 = 4.5; // HL taker fee bps per side
 
     var any_settled = false;
 
