@@ -364,7 +364,12 @@ pub fn main() !void {
             std.Thread.sleep(2 * std.time.ns_per_s);
         }
         if (!reconcile_ok) {
-            log.warn("engine", "reconciliation failed after 3 retries, proceeding anyway", .{});
+            if (!dry_run_env and hl_config.enabled) {
+                log.err("engine", "reconciliation failed after 3 retries; live order gate remains closed", .{});
+                om.halted.store(true, .seq_cst);
+                return error.StartupReconciliationFailed;
+            }
+            log.warn("engine", "reconciliation failed after 3 retries in dry-run/offline mode, proceeding anyway", .{});
         }
         om.reconciliation_complete.store(true, .seq_cst);
         log.info("engine", "reconciliation gate open — orders unblocked", .{});

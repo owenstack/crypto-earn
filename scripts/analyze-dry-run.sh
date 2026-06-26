@@ -55,7 +55,7 @@ GROUP BY strategy;
 SQL
 echo "" >> "$REPORT"
 
-echo "── 4. LP SPREAD ANALYSIS ─────────────────────────────────────" >> "$REPORT"
+echo "── 4. MARKET-MAKING SPREAD ANALYSIS ──────────────────────────" >> "$REPORT"
 sqlite3 "$DB" <<'SQL' >> "$REPORT"
 .mode column
 .headers on
@@ -66,13 +66,13 @@ SELECT
   ROUND(AVG((best_ask - best_bid) / NULLIF((best_bid + best_ask) / 2.0, 0) * 100), 2) as avg_spread_pct,
   COUNT(*) as samples
 FROM dry_run_signals
-WHERE strategy IN ('market_making','liquidity_provision')
+WHERE strategy = 'market_making'
   AND direction = 'buy'
   AND best_bid > 0 AND best_ask > 0;
 SQL
 echo "" >> "$REPORT"
 
-echo "── 5. LP PROFITABILITY ESTIMATE ──────────────────────────────" >> "$REPORT"
+echo "── 5. MARKET-MAKING PROFITABILITY ESTIMATE ───────────────────" >> "$REPORT"
 echo "(Per distinct market, with fill-rate sensitivity)" >> "$REPORT"
 sqlite3 "$DB" <<'SQL' >> "$REPORT"
 .mode column
@@ -89,7 +89,7 @@ WITH lp_pairs AS (
     direction,
     ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY signal_ts) as rn
   FROM dry_run_signals
-  WHERE strategy IN ('market_making','liquidity_provision')
+  WHERE strategy = 'market_making'
     AND direction = 'buy'
     AND best_bid > 0 AND best_ask > 0
 ),
@@ -120,7 +120,7 @@ SELECT * FROM summary;
 SQL
 echo "" >> "$REPORT"
 
-echo "── 6. NEWS REPRICING SIGNALS ─────────────────────────────────" >> "$REPORT"
+echo "── 6. CEX/DEX ARB SIGNALS ────────────────────────────────────" >> "$REPORT"
 sqlite3 "$DB" <<'SQL' >> "$REPORT"
 .mode column
 .headers on
@@ -134,7 +134,7 @@ SELECT
   ROUND(best_ask, 4) as ask,
   datetime(signal_ts, 'unixepoch', 'localtime') as time
 FROM dry_run_signals
-WHERE strategy = 'news_repricing'
+WHERE strategy = 'cex_dex_arb'
 ORDER BY signal_ts DESC
 LIMIT 20;
 SQL
@@ -197,18 +197,18 @@ sqlite3 "$DB" <<'SQL' >> "$REPORT"
 WITH stats AS (
   SELECT
     COUNT(*) as total,
-    COUNT(DISTINCT CASE WHEN strategy IN ('market_making','liquidity_provision') THEN market_id END) as lp_distinct_markets,
-    SUM(CASE WHEN strategy IN ('market_making','liquidity_provision') THEN 1 ELSE 0 END) as lp_raw_signals,
-    SUM(CASE WHEN strategy='news_repricing' THEN 1 ELSE 0 END) as nr_total,
-    AVG(CASE WHEN strategy IN ('market_making','liquidity_provision') AND direction='buy' AND best_bid > 0 AND best_ask > 0
+    COUNT(DISTINCT CASE WHEN strategy = 'market_making' THEN market_id END) as mm_distinct_markets,
+    SUM(CASE WHEN strategy = 'market_making' THEN 1 ELSE 0 END) as mm_raw_signals,
+    SUM(CASE WHEN strategy='cex_dex_arb' THEN 1 ELSE 0 END) as arb_total,
+    AVG(CASE WHEN strategy = 'market_making' AND direction='buy' AND best_bid > 0 AND best_ask > 0
          THEN (best_ask - best_bid) * size * 0.5 END) as avg_lp_profit_per_pair,
     ROUND((MAX(signal_ts) - MIN(signal_ts)) / 3600.0, 2) as hours
   FROM dry_run_signals
 )
 SELECT
   'Total raw signals: ' || total,
-  'LP distinct markets: ' || lp_distinct_markets || ' (raw signals: ' || lp_raw_signals || ', ' || COALESCE(ROUND(lp_raw_signals * 1.0 / NULLIF(lp_distinct_markets, 0), 0), 0) || 'x oversample)',
-  'News signals: ' || nr_total,
+  'Market-making distinct markets: ' || mm_distinct_markets || ' (raw signals: ' || mm_raw_signals || ', ' || COALESCE(ROUND(mm_raw_signals * 1.0 / NULLIF(mm_distinct_markets, 0), 0), 0) || 'x oversample)',
+  'CEX/DEX arb signals: ' || arb_total,
   'Duration: ' || hours || ' hours',
   'Avg LP profit/pair (if filled): $' || ROUND(COALESCE(avg_lp_profit_per_pair, 0), 4),
   'Per-market profit @ 10% fill: $' || (
@@ -216,7 +216,7 @@ SELECT
     FROM (
       SELECT AVG((best_ask - best_bid) * size * 0.5) as avg_profit_per_fill
       FROM dry_run_signals
-      WHERE strategy IN ('market_making','liquidity_provision')
+      WHERE strategy = 'market_making'
         AND direction = 'buy'
         AND best_bid > 0 AND best_ask > 0
       GROUP BY market_id

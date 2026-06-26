@@ -194,6 +194,13 @@ const MIGRATION_014 =
     \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(14);
 ;
 
+/// Embedded migration: remote HL order id correlation.
+const MIGRATION_015 =
+    \\ALTER TABLE orders ADD COLUMN exchange_order_id TEXT DEFAULT NULL;
+    \\CREATE INDEX IF NOT EXISTS idx_orders_exchange_order_id ON orders(exchange_order_id);
+    \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(15);
+;
+
 /// Embedded Phase-3 migration: HL market metadata + Binance feed persistence.
 /// ALTER TABLE on markets/orderbooks runs separately (column-exists checks).
 /// orderbooks is created here when missing (legacy code constructed it at
@@ -575,6 +582,21 @@ pub const DB = struct {
                 return err;
             };
         }
+        if (!self.migrationApplied(15)) {
+            log.info("db", "applying migration 015", .{});
+            self.execZ("ALTER TABLE orders ADD COLUMN exchange_order_id TEXT DEFAULT NULL;" ++ &[_:0]u8{}) catch |err| {
+                const sqlite_err = std.mem.span(c.sqlite3_errmsg(self.handle));
+                const duplicate_col = std.mem.indexOf(u8, sqlite_err, "duplicate column name") != null;
+                if (err == error.DBExecFailed and duplicate_col) {
+                    log.info("db", "orders.exchange_order_id already exists; skipping ALTER TABLE", .{});
+                } else {
+                    log.err("db", "migration 015 ALTER TABLE failed: zig_err={s} sqlite_err={s}", .{ @errorName(err), sqlite_err });
+                    return err;
+                }
+            };
+            try self.execZ("CREATE INDEX IF NOT EXISTS idx_orders_exchange_order_id ON orders(exchange_order_id);" ++ &[_:0]u8{});
+            try self.execZ("INSERT OR IGNORE INTO schema_migrations(version)VALUES(15);" ++ &[_:0]u8{});
+        }
         log.info("db", "migrations complete", .{});
     }
 
@@ -666,6 +688,19 @@ pub const DB = struct {
             log.err("db", "failed to execute updateOrderStatus", .{});
             return error.DBExecFailed;
         }
+    }
+
+    pub fn updateOrderExchangeOrderId(self: DB, order_id: []const u8, exchange_order_id: []const u8) !void {
+        const sql = "UPDATE orders SET exchange_order_id=?, updated_at=unixepoch() WHERE id=?;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_text(stmt, 1, exchange_order_id.ptr, @intCast(exchange_order_id.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 2, order_id.ptr, @intCast(order_id.len), null) != c.SQLITE_OK)
+        {
+            return error.DBExecFailed;
+        }
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DBExecFailed;
     }
 
     pub fn insertFill(self: DB, id: []const u8, order_id: []const u8, size: []const u8, price: []const u8, fee: []const u8) !void {

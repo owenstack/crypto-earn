@@ -199,8 +199,15 @@ Telegram for the go/no-go summary before live deployment.
 
 ## Verification
 
-Run the unified verification script to check the build, typecheck, tests, and service health:
+Run the unified verification script to check the build, typecheck, tests, and migrations:
 
 ```sh
 scripts/verify.sh
+```
+
+On a deployed host with `cex-engine.service`, `cex-control.service`, and the
+dashboard running, include the service/dashboard smoke test:
+
+```sh
+RUN_E2E=1 scripts/verify.sh
 ```

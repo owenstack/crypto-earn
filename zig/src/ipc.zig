@@ -677,59 +677,46 @@ fn handleReconcileStatus(req_id: []const u8, writer: anytype) !void {
 }
 
 fn handleConfigValidate(ctx: *Context, req_id: []const u8, writer: anytype) !void {
-    // Validate prob_source_url
-    var url_buf: [512]u8 = undefined;
-    const url = ctx.database.getConfig("prob_source_url", &url_buf);
-    const url_valid = if (url) |u| u.len > 0 and (std.mem.startsWith(u8, u, "http://") or std.mem.startsWith(u8, u, "https://")) else false;
-
-    // Validate prob_source_poll_seconds
-    var poll_buf: [16]u8 = undefined;
-    const poll_str = ctx.database.getConfig("prob_source_poll_seconds", &poll_buf);
-    var poll_valid = false;
-    if (poll_str) |ps| {
-        if (std.fmt.parseInt(u32, ps, 10)) |v| {
-            poll_valid = v >= 10 and v <= 3600;
-        } else |_| {}
-    }
-
-    // Validate prob_source_market_id_field
-    var mid_field_buf: [64]u8 = undefined;
-    const mid_field = ctx.database.getConfig("prob_source_market_id_field", &mid_field_buf);
-    const mid_field_valid = if (mid_field) |f| f.len > 0 else false;
-
-    // Validate prob_source_probability_field
-    var prob_field_buf: [64]u8 = undefined;
-    const prob_field = ctx.database.getConfig("prob_source_probability_field", &prob_field_buf);
-    const prob_field_valid = if (prob_field) |f| f.len > 0 else false;
-
     const ValidationResult = struct {
         valid: bool,
         value: []const u8,
     };
     const ConfigValidation = struct {
-        prob_source_url: ValidationResult,
-        prob_source_poll_seconds: ValidationResult,
-        prob_source_market_id_field: ValidationResult,
-        prob_source_probability_field: ValidationResult,
+        mode: ValidationResult,
+        hl_api_base: ValidationResult,
+        hl_signer: ValidationResult,
+        hl_symbols: ValidationResult,
+        binance_symbols: ValidationResult,
+        market_data: ValidationResult,
+        cex_dex_arb: ValidationResult,
+        reconciliation: ValidationResult,
     };
+    const reconcile = getReconcileStatus();
+    const om = ctx.order_manager;
+    const hl_enabled = if (om) |mgr| mgr.config.hl.enabled else false;
+    const dry_run = if (om) |mgr| mgr.config.dry_run_enabled else false;
+    const api_base = if (om) |mgr| mgr.config.hl.api_base else "";
+    const hl_symbols = std.posix.getenv("HL_SYMBOLS") orelse "";
+    const binance_symbols = std.posix.getenv("BINANCE_SYMBOLS") orelse "";
+    const disable_market_data = std.posix.getenv("DISABLE_MARKET_DATA") orelse "0";
+    const enable_arb = std.posix.getenv("ENABLE_CEX_DEX_ARB") orelse "0";
+    const arb_submit = std.posix.getenv("ARB_SUBMIT_ORDERS") orelse "0";
 
     const result = std.json.Stringify.valueAlloc(ctx.allocator, ConfigValidation{
-        .prob_source_url = .{
-            .valid = url_valid,
-            .value = if (url) |u| u else "",
+        .mode = .{ .valid = dry_run or hl_enabled, .value = if (dry_run) "dry_run" else if (hl_enabled) "live" else "offline" },
+        .hl_api_base = .{
+            .valid = std.mem.startsWith(u8, api_base, "https://api.hyperliquid"),
+            .value = api_base,
         },
-        .prob_source_poll_seconds = .{
-            .valid = poll_valid,
-            .value = if (poll_str) |ps| ps else "",
+        .hl_signer = .{
+            .valid = dry_run or hl_enabled,
+            .value = if (hl_enabled) "configured" else "disabled",
         },
-        .prob_source_market_id_field = .{
-            .valid = mid_field_valid,
-            .value = if (mid_field) |f| f else "",
-        },
-        .prob_source_probability_field = .{
-            .valid = prob_field_valid,
-            .value = if (prob_field) |f| f else "",
-        },
+        .hl_symbols = .{ .valid = hl_symbols.len > 0, .value = hl_symbols },
+        .binance_symbols = .{ .valid = binance_symbols.len > 0, .value = binance_symbols },
+        .market_data = .{ .valid = !std.mem.eql(u8, disable_market_data, "1"), .value = if (std.mem.eql(u8, disable_market_data, "1")) "disabled" else "enabled" },
+        .cex_dex_arb = .{ .valid = true, .value = if (std.mem.eql(u8, enable_arb, "1")) if (std.mem.eql(u8, arb_submit, "1")) "enabled_submit" else "enabled_telemetry" else "disabled" },
+        .reconciliation = .{ .valid = reconcile.complete, .value = reconcile.status() },
     }, .{}) catch {
         try types.writeError(writer, req_id, "config validation serialization failed");
         return;
@@ -740,24 +727,40 @@ fn handleConfigValidate(ctx: *Context, req_id: []const u8, writer: anytype) !voi
 }
 
 fn handleAssetMappings(ctx: *Context, req_id: []const u8, writer: anytype) !void {
-    const rows = ctx.database.getAllKalshiMappings(ctx.allocator) catch {
+    const sql =
+        "SELECT id,symbol,base,quote,COALESCE(asset_index,-1),COALESCE(base_asset,''),COALESCE(max_leverage,0),created_at " ++
+        "FROM markets WHERE COALESCE(asset_index,-1) >= 0 ORDER BY asset_index ASC, symbol ASC;" ++ &[_:0]u8{};
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    if (db.c.sqlite3_prepare_v2(ctx.database.handle, sql.ptr, -1, &stmt, null) != db.c.SQLITE_OK) {
         try types.writeError(writer, req_id, "asset mappings query failed");
         return;
-    };
-    defer ctx.allocator.free(rows);
+    }
+    defer _ = db.c.sqlite3_finalize(stmt);
 
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(ctx.allocator);
     var w = payload.writer(ctx.allocator);
     try w.writeAll("{\"mappings\":[");
-    for (rows, 0..) |row, i| {
+    var i: usize = 0;
+    while (db.c.sqlite3_step(stmt) == db.c.SQLITE_ROW) : (i += 1) {
         if (i > 0) try w.writeByte(',');
+        const id = if (db.c.sqlite3_column_text(stmt, 0)) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+        const symbol = if (db.c.sqlite3_column_text(stmt, 1)) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+        const base = if (db.c.sqlite3_column_text(stmt, 2)) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+        const quote = if (db.c.sqlite3_column_text(stmt, 3)) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+        const base_asset = if (db.c.sqlite3_column_text(stmt, 5)) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
         const row_json = std.json.Stringify.valueAlloc(ctx.allocator, .{
-            .source_id = row.ticker_buf[0..row.ticker_len],
-            .market_id = row.gamma_id_buf[0..row.gamma_id_len],
-            .confidence = row.confidence,
-            .match_method = row.match_method_buf[0..row.match_method_len],
-            .updated_at = row.updated_at,
+            .source_id = symbol,
+            .market_id = id,
+            .symbol = symbol,
+            .base = base,
+            .quote = quote,
+            .asset_index = db.c.sqlite3_column_int64(stmt, 4),
+            .base_asset = base_asset,
+            .max_leverage = db.c.sqlite3_column_int64(stmt, 6),
+            .confidence = 1.0,
+            .match_method = "hl_asset_index",
+            .updated_at = db.c.sqlite3_column_int64(stmt, 7),
         }, .{}) catch {
             try types.writeError(writer, req_id, "asset mappings serialization failed");
             return;

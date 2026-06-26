@@ -118,6 +118,8 @@ const LocalOpenOrder = struct {
     id_len: usize = 0,
     client_order_id_buf: [80]u8 = [_]u8{0} ** 80,
     client_order_id_len: usize = 0,
+    exchange_order_id_buf: [80]u8 = [_]u8{0} ** 80,
+    exchange_order_id_len: usize = 0,
 
     fn id(self: *const LocalOpenOrder) []const u8 {
         return self.id_buf[0..self.id_len];
@@ -125,6 +127,10 @@ const LocalOpenOrder = struct {
 
     fn clientOrderId(self: *const LocalOpenOrder) []const u8 {
         return self.client_order_id_buf[0..self.client_order_id_len];
+    }
+
+    fn exchangeOrderId(self: *const LocalOpenOrder) []const u8 {
+        return self.exchange_order_id_buf[0..self.exchange_order_id_len];
     }
 };
 
@@ -561,12 +567,13 @@ pub const FillPoller = struct {
 
     fn resolveLocalOrder(self: *FillPoller, oid: []const u8) LocalOrderRef {
         var out = LocalOrderRef{};
-        const sql = "SELECT market_id, side, COALESCE(strategy_origin,'') FROM orders WHERE id=? OR client_order_id=? LIMIT 1;" ++ &[_:0]u8{};
+        const sql = "SELECT market_id, side, COALESCE(strategy_origin,'') FROM orders WHERE id=? OR client_order_id=? OR exchange_order_id=? LIMIT 1;" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return out;
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_text(stmt, 1, oid.ptr, @intCast(oid.len), null);
         _ = c.sqlite3_bind_text(stmt, 2, oid.ptr, @intCast(oid.len), null);
+        _ = c.sqlite3_bind_text(stmt, 3, oid.ptr, @intCast(oid.len), null);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return out;
 
         if (c.sqlite3_column_text(stmt, 0)) |p| {
@@ -601,7 +608,7 @@ pub const FillPoller = struct {
     }
 
     fn loadLocalOpenOrders(self: *FillPoller, out: []LocalOpenOrder) !usize {
-        const sql = "SELECT id, COALESCE(client_order_id,'') FROM orders WHERE status IN ('placed','partially_filled') ORDER BY created_at ASC LIMIT ?;" ++ &[_:0]u8{};
+        const sql = "SELECT id, COALESCE(client_order_id,''), COALESCE(exchange_order_id,'') FROM orders WHERE status IN ('placed','partially_filled') ORDER BY created_at ASC LIMIT ?;" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -612,6 +619,7 @@ pub const FillPoller = struct {
             out[count] = .{};
             copyColumnText(stmt.?, 0, &out[count].id_buf, &out[count].id_len);
             copyColumnText(stmt.?, 1, &out[count].client_order_id_buf, &out[count].client_order_id_len);
+            copyColumnText(stmt.?, 2, &out[count].exchange_order_id_buf, &out[count].exchange_order_id_len);
         }
         return count;
     }
@@ -639,19 +647,20 @@ pub const FillPoller = struct {
         }
 
         const sql =
-            "INSERT INTO orders(id,market_id,client_order_id,type,side,size,price,status,filled_size,last_checked_at,updated_at) " ++
-            "VALUES(?,?,?,?,?,?,?,'placed','0',unixepoch(),unixepoch()) " ++
-            "ON CONFLICT(id) DO UPDATE SET status='placed', last_checked_at=unixepoch(), updated_at=unixepoch();" ++ &[_:0]u8{};
+            "INSERT INTO orders(id,market_id,client_order_id,exchange_order_id,type,side,size,price,status,filled_size,last_checked_at,updated_at) " ++
+            "VALUES(?,?,?,?,?,?,?,?,'placed','0',unixepoch(),unixepoch()) " ++
+            "ON CONFLICT(id) DO UPDATE SET status='placed', exchange_order_id=excluded.exchange_order_id, last_checked_at=unixepoch(), updated_at=unixepoch();" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
         defer _ = c.sqlite3_finalize(stmt);
         if (c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), null) != c.SQLITE_OK or
             c.sqlite3_bind_text(stmt, 2, order.coin().ptr, @intCast(order.coin().len), null) != c.SQLITE_OK or
             c.sqlite3_bind_text(stmt, 3, cloid.ptr, @intCast(cloid.len), null) != c.SQLITE_OK or
-            c.sqlite3_bind_text(stmt, 4, "limit", 5, null) != c.SQLITE_OK or
-            c.sqlite3_bind_text(stmt, 5, side.ptr, @intCast(side.len), null) != c.SQLITE_OK or
-            c.sqlite3_bind_text(stmt, 6, size.ptr, @intCast(size.len), null) != c.SQLITE_OK or
-            c.sqlite3_bind_text(stmt, 7, price.ptr, @intCast(price.len), null) != c.SQLITE_OK)
+            c.sqlite3_bind_text(stmt, 4, order.oid().ptr, @intCast(order.oid().len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 5, "limit", 5, null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 6, side.ptr, @intCast(side.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 7, size.ptr, @intCast(size.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 8, price.ptr, @intCast(price.len), null) != c.SQLITE_OK)
         {
             return error.DBExecFailed;
         }
@@ -666,16 +675,17 @@ pub const FillPoller = struct {
         price: []const u8,
     ) !bool {
         const sql =
-            "UPDATE orders SET market_id=?, type='limit', side=?, size=?, price=?, status='placed', last_checked_at=unixepoch(), updated_at=unixepoch() " ++
+            "UPDATE orders SET market_id=?, exchange_order_id=?, type='limit', side=?, size=?, price=?, status='placed', last_checked_at=unixepoch(), updated_at=unixepoch() " ++
             "WHERE client_order_id=?;" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
         defer _ = c.sqlite3_finalize(stmt);
         if (c.sqlite3_bind_text(stmt, 1, order.coin().ptr, @intCast(order.coin().len), null) != c.SQLITE_OK or
-            c.sqlite3_bind_text(stmt, 2, side.ptr, @intCast(side.len), null) != c.SQLITE_OK or
-            c.sqlite3_bind_text(stmt, 3, size.ptr, @intCast(size.len), null) != c.SQLITE_OK or
-            c.sqlite3_bind_text(stmt, 4, price.ptr, @intCast(price.len), null) != c.SQLITE_OK or
-            c.sqlite3_bind_text(stmt, 5, order.cloid().ptr, @intCast(order.cloid().len), null) != c.SQLITE_OK)
+            c.sqlite3_bind_text(stmt, 2, order.oid().ptr, @intCast(order.oid().len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 3, side.ptr, @intCast(side.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 4, size.ptr, @intCast(size.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 5, price.ptr, @intCast(price.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 6, order.cloid().ptr, @intCast(order.cloid().len), null) != c.SQLITE_OK)
         {
             return error.DBExecFailed;
         }
@@ -768,6 +778,7 @@ fn findRemoteOrder(remote: []const RemoteOpenOrder, local: LocalOpenOrder) ?usiz
     for (remote, 0..) |ro, idx| {
         if (ro.oid_len > 0 and std.mem.eql(u8, ro.oid(), local.id())) return idx;
         if (ro.oid_len > 0 and local.client_order_id_len > 0 and std.mem.eql(u8, ro.oid(), local.clientOrderId())) return idx;
+        if (ro.oid_len > 0 and local.exchange_order_id_len > 0 and std.mem.eql(u8, ro.oid(), local.exchangeOrderId())) return idx;
         if (ro.cloid_len > 0 and std.mem.eql(u8, ro.cloid(), local.id())) return idx;
         if (ro.cloid_len > 0 and local.client_order_id_len > 0 and std.mem.eql(u8, ro.cloid(), local.clientOrderId())) return idx;
     }

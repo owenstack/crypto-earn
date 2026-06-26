@@ -33,6 +33,14 @@ fn applyCancelledUpdate(stmt: *c.sqlite3_stmt, order_id: []const u8) bool {
     return c.sqlite3_step(stmt) == c.SQLITE_DONE;
 }
 
+fn copySqlText(raw: ?[*c]const u8, out: []u8) []const u8 {
+    const p = raw orelse return "";
+    const span = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+    const n = @min(span.len, out.len);
+    @memcpy(out[0..n], span[0..n]);
+    return out[0..n];
+}
+
 fn parseOrderStatus(raw: []const u8) ?OrderStatus {
     if (std.mem.eql(u8, raw, "pending")) return .pending;
     if (std.mem.eql(u8, raw, "placed")) return .placed;
@@ -70,6 +78,7 @@ pub const Order = struct {
 
 const CancelCandidate = struct {
     id: []u8,
+    remote_id: []u8,
     should_cancel_remote: bool,
 };
 
@@ -85,6 +94,80 @@ pub const OrderResult = union(enum) {
         reason: []const u8,
     },
 };
+
+const SubmitResult = struct {
+    ok: bool,
+    oid_buf: [48]u8 = [_]u8{0} ** 48,
+    oid_len: usize = 0,
+
+    fn oid(self: *const SubmitResult) []const u8 {
+        return self.oid_buf[0..self.oid_len];
+    }
+};
+
+fn makeHlCloid(buf: *[34]u8) []const u8 {
+    const ts: u64 = @intCast(@max(std.time.milliTimestamp(), 0));
+    const ns: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
+    return std.fmt.bufPrint(buf, "0x{x:0>16}{x:0>16}", .{ ts, ns }) catch "0x00000000000000000000000000000000";
+}
+
+fn copyJsonScalarTo(value: std.json.Value, out: []u8) usize {
+    var stream = std.io.fixedBufferStream(out);
+    switch (value) {
+        .string => |s| {
+            const n = @min(s.len, out.len);
+            @memcpy(out[0..n], s[0..n]);
+            return n;
+        },
+        .integer => |i| {
+            stream.writer().print("{d}", .{i}) catch return 0;
+            return stream.pos;
+        },
+        .float => |f| {
+            stream.writer().print("{d}", .{f}) catch return 0;
+            return stream.pos;
+        },
+        else => return 0,
+    }
+}
+
+fn parseHlOrderOid(body: []const u8, out: *[48]u8) usize {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, body, .{}) catch return 0;
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return 0,
+    };
+    const response = switch (root.get("response") orelse return 0) {
+        .object => |o| o,
+        else => return 0,
+    };
+    const data = switch (response.get("data") orelse return 0) {
+        .object => |o| o,
+        else => return 0,
+    };
+    const statuses = switch (data.get("statuses") orelse return 0) {
+        .array => |a| a,
+        else => return 0,
+    };
+    if (statuses.items.len == 0) return 0;
+    const status_obj = switch (statuses.items[0]) {
+        .object => |o| o,
+        else => return 0,
+    };
+    if (status_obj.get("resting")) |resting| {
+        if (resting == .object) {
+            if (resting.object.get("oid")) |oid| return copyJsonScalarTo(oid, out);
+        }
+    }
+    if (status_obj.get("filled")) |filled| {
+        if (filled == .object) {
+            if (filled.object.get("oid")) |oid| return copyJsonScalarTo(oid, out);
+        }
+    }
+    return 0;
+}
 
 /// Hyperliquid signing/connection config. Empty by default so existing tests
 /// (which don't exercise the live path) keep working.
@@ -183,11 +266,12 @@ pub const OrderManager = struct {
     /// Resolve the asset index for a cancel by joining orders -> market_id ->
     /// hl_market_meta. Returns null if any link is missing.
     fn resolveCancelAssetIndex(self: *OrderManager, order_id: []const u8) ?i64 {
-        const sql = "SELECT market_id FROM orders WHERE id=? LIMIT 1;" ++ &[_:0]u8{};
+        const sql = "SELECT market_id FROM orders WHERE id=? OR client_order_id=? LIMIT 1;" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return null;
         defer _ = c.sqlite3_finalize(stmt);
         if (c.sqlite3_bind_text(stmt, 1, order_id.ptr, @intCast(order_id.len), null) != c.SQLITE_OK) return null;
+        if (c.sqlite3_bind_text(stmt, 2, order_id.ptr, @intCast(order_id.len), null) != c.SQLITE_OK) return null;
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
         const raw = c.sqlite3_column_text(stmt, 0);
         const market_id = if (raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else return null;
@@ -229,12 +313,15 @@ pub const OrderManager = struct {
             return .{ .rejected = .{ .reason = "engine_paused" } };
         }
 
-        // Generate client order ID
+        // Generate local order ID and an HL-compatible client order ID
+        // (`cloid`). HL expects a 16-byte hex string prefixed with 0x.
         var id_buf: [64]u8 = undefined;
-        const client_order_id = std.fmt.bufPrint(&id_buf, "cex-{d}-{d}", .{
+        const order_id = std.fmt.bufPrint(&id_buf, "cex-{d}-{d}", .{
             std.time.milliTimestamp(),
             std.time.nanoTimestamp() & 0xFFFF,
         }) catch "cex-unknown";
+        var cloid_buf: [34]u8 = undefined;
+        const client_order_id = makeHlCloid(&cloid_buf);
 
         // Build risk gate request
         const order_request = risk.OrderRequest{
@@ -281,7 +368,7 @@ pub const OrderManager = struct {
 
         // Persist order as pending
         self.database.insertOrder(
-            client_order_id,
+            order_id,
             market_id,
             client_order_id,
             order_type,
@@ -294,23 +381,29 @@ pub const OrderManager = struct {
             return .{ .failed = .{ .reason = "db_error" } };
         };
         crash_trace.breadcrumb("order_mgr", "pending persisted id={s}", .{
-            client_order_id[0..@min(client_order_id.len, 32)],
+            order_id[0..@min(order_id.len, 32)],
         });
 
         // Submit to HL with 429 retry
-        const submit_result = self.submitToHL(market_id, side, size, price, order_type);
-        if (!submit_result) {
-            self.database.updateOrderStatus(client_order_id, "rejected") catch {};
+        const submit_result = self.submitToHL(market_id, side, size, price, order_type, client_order_id);
+        if (!submit_result.ok) {
+            self.database.updateOrderStatus(order_id, "rejected") catch {};
             return .{ .failed = .{ .reason = "hl_submission_failed" } };
+        }
+        if (submit_result.oid_len > 0) {
+            self.database.updateOrderExchangeOrderId(order_id, submit_result.oid()) catch |e| {
+                log.warn("order_mgr", "failed to store HL oid for local_id={s}: {s}", .{ order_id, @errorName(e) });
+            };
+            log.info("order_mgr", "HL accepted order: local_id={s} cloid={s} oid={s}", .{ order_id, client_order_id, submit_result.oid() });
         }
 
         // Update status to placed
-        self.database.updateOrderStatus(client_order_id, "placed") catch |e| {
-            log.err("order_mgr", "failed to mark order as placed in DB: order_id={s} err={any}", .{ client_order_id, e });
+        self.database.updateOrderStatus(order_id, "placed") catch |e| {
+            log.err("order_mgr", "failed to mark order as placed in DB: order_id={s} err={any}", .{ order_id, e });
             return .{ .failed = .{ .reason = "db_status_update_failed" } };
         };
         crash_trace.breadcrumb("order_mgr", "placed id={s}", .{
-            client_order_id[0..@min(client_order_id.len, 32)],
+            order_id[0..@min(order_id.len, 32)],
         });
         log.info("order_mgr", "order placed: {s} {s} {s}@{s} on {s}", .{
             order_type, side, size, price, market_id,
@@ -318,6 +411,7 @@ pub const OrderManager = struct {
         // Publish order placed event
         const evt_payload = std.json.Stringify.valueAlloc(self.allocator, .{
             .order_id = client_order_id,
+            .local_order_id = order_id,
             .market_id = market_id,
             .side = side,
             .size = size,
@@ -325,7 +419,7 @@ pub const OrderManager = struct {
             .order_type = order_type,
         }, .{}) catch |e| {
             log.err("order_mgr", "failed to serialize order placed event: {s}", .{@errorName(e)});
-            const order_id_owned = self.allocator.dupe(u8, client_order_id) catch {
+                const order_id_owned = self.allocator.dupe(u8, order_id) catch {
                 log.err("order_mgr", "failed to allocate order_id result", .{});
                 return .{ .failed = .{ .reason = "oom" } };
             };
@@ -334,7 +428,7 @@ pub const OrderManager = struct {
         defer self.allocator.free(evt_payload);
         ipc.publishEvent(ipc_types.T.event_order_placed, evt_payload);
 
-        const order_id_owned = self.allocator.dupe(u8, client_order_id) catch {
+        const order_id_owned = self.allocator.dupe(u8, order_id) catch {
             log.err("order_mgr", "failed to allocate order_id result", .{});
             return .{ .failed = .{ .reason = "oom" } };
         };
@@ -352,7 +446,9 @@ pub const OrderManager = struct {
         }
 
         var should_cancel_remote = true;
-        const status_sql = "SELECT status FROM orders WHERE id=? LIMIT 1;" ++ &[_:0]u8{};
+        var remote_id_buf: [80]u8 = undefined;
+        var remote_id: []const u8 = order_id;
+        const status_sql = "SELECT status, COALESCE(client_order_id,''), COALESCE(exchange_order_id,'') FROM orders WHERE id=? LIMIT 1;" ++ &[_:0]u8{};
         var status_stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.database.handle, status_sql.ptr, -1, &status_stmt, null) == c.SQLITE_OK) {
             defer _ = c.sqlite3_finalize(status_stmt);
@@ -361,6 +457,10 @@ pub const OrderManager = struct {
             {
                 const status_raw = c.sqlite3_column_text(status_stmt, 0);
                 const status_str = if (status_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+                const client_id = copySqlText(c.sqlite3_column_text(status_stmt, 1), &remote_id_buf);
+                if (client_id.len > 0) remote_id = client_id;
+                const exchange_id = copySqlText(c.sqlite3_column_text(status_stmt, 2), &remote_id_buf);
+                if (exchange_id.len > 0) remote_id = exchange_id;
                 if (parseOrderStatus(status_str)) |status| {
                     should_cancel_remote = switch (status) {
                         .placed, .partially_filled => true,
@@ -374,8 +474,8 @@ pub const OrderManager = struct {
             }
         }
 
-        if (should_cancel_remote and !self.cancelOnHL(order_id)) {
-            log.err("order_mgr", "failed to cancel order on HL: {s}", .{order_id});
+        if (should_cancel_remote and !self.cancelOnHL(remote_id)) {
+            log.err("order_mgr", "failed to cancel order on HL: local={s} remote={s}", .{ order_id, remote_id });
             return false;
         }
 
@@ -409,7 +509,7 @@ pub const OrderManager = struct {
             return 0;
         }
 
-        const select_sql = "SELECT id, status FROM orders WHERE status NOT IN ('filled','cancelled','rejected');" ++ &[_:0]u8{};
+        const select_sql = "SELECT id, status, COALESCE(client_order_id,''), COALESCE(exchange_order_id,'') FROM orders WHERE status NOT IN ('filled','cancelled','rejected');" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.database.handle, select_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
             log.err("order_mgr", "cancelAll failed: unable to prepare open-order query", .{});
@@ -419,7 +519,10 @@ pub const OrderManager = struct {
 
         var candidates: std.ArrayList(CancelCandidate) = .empty;
         defer {
-            for (candidates.items) |candidate| self.allocator.free(candidate.id);
+            for (candidates.items) |candidate| {
+                self.allocator.free(candidate.id);
+                self.allocator.free(candidate.remote_id);
+            }
             candidates.deinit(self.allocator);
         }
 
@@ -440,11 +543,23 @@ pub const OrderManager = struct {
                 log.err("order_mgr", "cancelAll failed to allocate order id copy", .{});
                 continue;
             };
+            const client_id_raw = c.sqlite3_column_text(stmt, 2);
+            const client_id = if (client_id_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+            const exchange_id_raw = c.sqlite3_column_text(stmt, 3);
+            const exchange_id = if (exchange_id_raw) |p| std.mem.span(@as([*c]const u8, @ptrCast(p))) else "";
+            const remote_id = if (exchange_id.len > 0) exchange_id else if (client_id.len > 0) client_id else order_id;
+            const owned_remote_id = self.allocator.dupe(u8, remote_id) catch {
+                self.allocator.free(owned_id);
+                log.err("order_mgr", "cancelAll failed to allocate remote order id copy", .{});
+                continue;
+            };
             candidates.append(self.allocator, .{
                 .id = owned_id,
+                .remote_id = owned_remote_id,
                 .should_cancel_remote = should_cancel_remote,
             }) catch {
                 self.allocator.free(owned_id);
+                self.allocator.free(owned_remote_id);
                 log.err("order_mgr", "cancelAll failed to append order candidate", .{});
                 continue;
             };
@@ -461,8 +576,8 @@ pub const OrderManager = struct {
         defer _ = c.sqlite3_finalize(upd_stmt);
 
         for (candidates.items) |candidate| {
-            if (candidate.should_cancel_remote and !self.cancelOnHL(candidate.id)) {
-                log.err("order_mgr", "cancelAll failed HL cancel for order {s}", .{candidate.id});
+            if (candidate.should_cancel_remote and !self.cancelOnHL(candidate.remote_id)) {
+                log.err("order_mgr", "cancelAll failed HL cancel for order local={s} remote={s}", .{ candidate.id, candidate.remote_id });
                 continue;
             }
 
@@ -585,6 +700,7 @@ pub const OrderManager = struct {
         size: []const u8,
         price: []const u8,
         order_type: []const u8,
+        client_order_id: []const u8,
     ) !std.json.Value {
         // Phase 3: asset_index is resolved by the caller via the shared
         // hl_market_meta cache. Strings are encoded as msgpack strings for
@@ -597,6 +713,7 @@ pub const OrderManager = struct {
         try ord.put("p", .{ .string = price });
         try ord.put("s", .{ .string = size });
         try ord.put("r", .{ .bool = false }); // reduce_only
+        try ord.put("c", .{ .string = client_order_id });
         var t = std.json.ObjectMap.init(arena);
         var lim = std.json.ObjectMap.init(arena);
         const tif: []const u8 = if (std.mem.eql(u8, order_type, "limit") or std.mem.eql(u8, order_type, "GTC"))
@@ -615,7 +732,7 @@ pub const OrderManager = struct {
         return .{ .object = action };
     }
 
-    /// Build the cancel action JSON for a single order id.
+    /// Build the cancel action JSON for a single order id or HL cloid.
     fn buildCancelAction(
         arena: std.mem.Allocator,
         asset_index: i64,
@@ -623,12 +740,18 @@ pub const OrderManager = struct {
     ) !std.json.Value {
         var cancels = std.json.Array.init(arena);
         var item = std.json.ObjectMap.init(arena);
-        try item.put("a", .{ .integer = asset_index });
-        try item.put("o", .{ .string = order_id });
+        const is_cloid = std.mem.startsWith(u8, order_id, "0x") and order_id.len == 34;
+        if (is_cloid) {
+            try item.put("asset", .{ .integer = asset_index });
+            try item.put("cloid", .{ .string = order_id });
+        } else {
+            try item.put("a", .{ .integer = asset_index });
+            try item.put("o", .{ .string = order_id });
+        }
         try cancels.append(.{ .object = item });
 
         var action = std.json.ObjectMap.init(arena);
-        try action.put("type", .{ .string = "cancel" });
+        try action.put("type", .{ .string = if (is_cloid) "cancelByCloid" else "cancel" });
         try action.put("cancels", .{ .array = cancels });
         return .{ .object = action };
     }
@@ -851,7 +974,8 @@ pub const OrderManager = struct {
         size: []const u8,
         price: []const u8,
         order_type: []const u8,
-    ) bool {
+        client_order_id: []const u8,
+    ) SubmitResult {
         crash_trace.breadcrumb("order_mgr", "hl submit enter market={s} side={s} size={s} price={s}", .{
             market_id[0..@min(market_id.len, 24)],
             side,
@@ -861,7 +985,7 @@ pub const OrderManager = struct {
 
         if (!self.config.hl.enabled) {
             log.warn("order_mgr", "HL submission skipped: hl.enabled=false (Phase 2 stub)", .{});
-            return false;
+            return .{ .ok = false };
         }
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -869,17 +993,17 @@ pub const OrderManager = struct {
 
         const asset_index = self.resolveAssetIndex(market_id) orelse {
             log.err("order_mgr", "refusing HL submit without asset metadata for {s}", .{market_id});
-            return false;
+            return .{ .ok = false };
         };
-        const action = buildOrderAction(arena.allocator(), asset_index, market_id, side, size, price, order_type) catch |e| {
+        const action = buildOrderAction(arena.allocator(), asset_index, market_id, side, size, price, order_type, client_order_id) catch |e| {
             log.err("order_mgr", "failed to build HL order action: {s}", .{@errorName(e)});
-            return false;
+            return .{ .ok = false };
         };
 
         const nonce: u64 = @intCast(@max(std.time.milliTimestamp(), 1));
         const envelope = self.buildHlEnvelope(action, nonce) catch |e| {
             log.err("order_mgr", "failed to build HL signed envelope: {s}", .{@errorName(e)});
-            return false;
+            return .{ .ok = false };
         };
         defer self.allocator.free(envelope);
 
@@ -894,8 +1018,8 @@ pub const OrderManager = struct {
 
         var url_buf: [256]u8 = undefined;
         const url = std.fmt.bufPrint(&url_buf, "{s}/exchange", .{self.config.hl.api_base}) catch {
-            log.err("order_mgr", "failed to format HL url", .{});
-            return false;
+                log.err("order_mgr", "failed to format HL url", .{});
+            return .{ .ok = false };
         };
 
         var client = http.HttpClient.init(self.allocator);
@@ -920,7 +1044,7 @@ pub const OrderManager = struct {
                     continue;
                 }
                 log.err("order_mgr", "HL submission failed: {s}", .{@errorName(e)});
-                return false;
+                return .{ .ok = false };
             };
             defer response.deinit();
 
@@ -938,17 +1062,19 @@ pub const OrderManager = struct {
                 log.info("order_mgr", "HL order submitted: market={s} side={s} price={s} size={s}", .{
                     market_id, side, price, size,
                 });
-                return true;
+                var result = SubmitResult{ .ok = true };
+                result.oid_len = parseHlOrderOid(response.body, &result.oid_buf);
+                return result;
             }
 
             log.err("order_mgr", "HL rejected: status={d} body={s}", .{
                 @intFromEnum(response.status), response.body,
             });
-            return false;
+            return .{ .ok = false };
         }
 
         log.err("order_mgr", "HL submission failed after {d} retries", .{self.config.max_retry_attempts});
-        return false;
+        return .{ .ok = false };
     }
 
     /// Cancel an order on HL via the `/exchange` endpoint.
@@ -1077,4 +1203,34 @@ test "order_manager: applyCancelledUpdate rejects empty id" {
     defer _ = c.sqlite3_finalize(upd_stmt);
 
     try std.testing.expect(!applyCancelledUpdate(upd_stmt.?, ""));
+}
+
+test "order_manager: parseHlOrderOid extracts resting and filled oid" {
+    var resting_buf: [48]u8 = undefined;
+    const resting_len = parseHlOrderOid(
+        \\{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":12345}}]}}}
+    , &resting_buf);
+    try std.testing.expectEqualStrings("12345", resting_buf[0..resting_len]);
+
+    var filled_buf: [48]u8 = undefined;
+    const filled_len = parseHlOrderOid(
+        \\{"status":"ok","response":{"type":"order","data":{"statuses":[{"filled":{"oid":"67890","totalSz":"0.01"}}]}}}
+    , &filled_buf);
+    try std.testing.expectEqualStrings("67890", filled_buf[0..filled_len]);
+}
+
+test "order_manager: cloid cancel uses cancelByCloid action" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const action = try OrderManager.buildCancelAction(
+        arena.allocator(),
+        1,
+        "0x00000000000000010000000000000002",
+    );
+    const json = try std.json.Stringify.valueAlloc(std.testing.allocator, action, .{});
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"cancelByCloid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"cloid\":\"0x00000000000000010000000000000002\"") != null);
 }

@@ -23,8 +23,8 @@ CREATE TABLE IF NOT EXISTS orderbooks (
   UNIQUE(market, asset_id, timestamp)
 );
 
-ALTER TABLE markets ADD COLUMN IF NOT EXISTS asset_index INTEGER DEFAULT NULL;
-ALTER TABLE orderbooks ADD COLUMN IF NOT EXISTS asset_index INTEGER DEFAULT NULL;
+ALTER TABLE markets ADD COLUMN asset_index INTEGER DEFAULT NULL;
+ALTER TABLE orderbooks ADD COLUMN asset_index INTEGER DEFAULT NULL;
 CREATE TABLE IF NOT EXISTS binance_prices (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   symbol      TEXT NOT NULL,
@@ -34,7 +34,6 @@ CREATE TABLE IF NOT EXISTS binance_prices (
   ts_ns       INTEGER NOT NULL,
   recorded_at INTEGER NOT NULL DEFAULT (unixepoch()),
   UNIQUE(symbol, ts_ns)
-);
 );
 
 CREATE INDEX IF NOT EXISTS idx_binance_prices_symbol_ts ON binance_prices(symbol, ts_ns DESC);

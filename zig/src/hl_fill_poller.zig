@@ -201,7 +201,8 @@ pub const ApplyResult = struct {
 };
 
 /// Update the local `orders` and `fills` tables for an inbound HL fill.
-/// Looks up the parent order by either `id` or `client_order_id == fill.oid`,
+/// Looks up the parent order by `id`, `client_order_id`, or
+/// `exchange_order_id == fill.oid`,
 /// increments `filled_size`, sets `average_fill_price` to a cumulative VWAP,
 /// and toggles status to `filled` / `partially_filled`. Inserts a row in
 /// `fills` keyed by the HL `oid` + ms timestamp so duplicate WS events are
@@ -234,7 +235,7 @@ pub fn applyFillToDb(database: *db_mod.DB, fill: HlFill) !ApplyResult {
 
     const select_sql =
         "SELECT id, size, COALESCE(filled_size, '0'), COALESCE(average_fill_price, '0') " ++
-        "FROM orders WHERE id=? OR client_order_id=? LIMIT 1;" ++ &[_:0]u8{};
+        "FROM orders WHERE id=? OR client_order_id=? OR exchange_order_id=? LIMIT 1;" ++ &[_:0]u8{};
     var stmt: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(database.handle, select_sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
         return error.DbPrepareFailed;
@@ -242,6 +243,7 @@ pub fn applyFillToDb(database: *db_mod.DB, fill: HlFill) !ApplyResult {
     defer _ = c.sqlite3_finalize(stmt);
     _ = c.sqlite3_bind_text(stmt, 1, oid.ptr, @intCast(oid.len), null);
     _ = c.sqlite3_bind_text(stmt, 2, oid.ptr, @intCast(oid.len), null);
+    _ = c.sqlite3_bind_text(stmt, 3, oid.ptr, @intCast(oid.len), null);
 
     var order_id_buf: [128]u8 = undefined;
     var order_id_len: usize = 0;

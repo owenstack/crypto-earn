@@ -26,6 +26,7 @@ export type RequestMessageType =
   | "pnl.query"
   | "dry_run.analysis"
   | "reconcile.status"
+  | "inventory.snapshot"
   | "config.validate"
   | "asset.mappings"
   | "funding.snapshot"
@@ -62,6 +63,7 @@ export type ResponseMessageType =
   | "pnl.response"
   | "dry_run.analysis.response"
   | "reconcile.status.response"
+  | "inventory.snapshot.response"
   | "config.validate.response"
   | "asset.mappings.response"
   | "funding.snapshot.response"
@@ -515,15 +517,25 @@ export interface DryRunAnalysisResponsePayload {
 }
 
 export interface ConfigValidateResponsePayload {
-  prob_source_url: { valid: boolean; value: string };
-  prob_source_poll_seconds: { valid: boolean; value: string };
-  prob_source_market_id_field: { valid: boolean; value: string };
-  prob_source_probability_field: { valid: boolean; value: string };
+  mode: { valid: boolean; value: string };
+  hl_api_base: { valid: boolean; value: string };
+  hl_signer: { valid: boolean; value: string };
+  hl_symbols: { valid: boolean; value: string };
+  binance_symbols: { valid: boolean; value: string };
+  market_data: { valid: boolean; value: string };
+  cex_dex_arb: { valid: boolean; value: string };
+  reconciliation: { valid: boolean; value: string };
 }
 
 export interface AssetMappingInfo {
   source_id: string;
   market_id: string;
+  symbol?: string;
+  base?: string;
+  quote?: string;
+  asset_index?: number;
+  base_asset?: string;
+  max_leverage?: number;
   confidence: number;
   match_method: string;
   updated_at: number;
