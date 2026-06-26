@@ -1250,11 +1250,11 @@ test "strategy_engine: news repricing confidence bounds" {
 
 test "strategy_engine: LP emits paired perp signals without inventory" {
     var se = strategy_engine.StrategyEngine.init(.{
-        .lp_min_spread = 0.04,
+        .lp_min_spread_bps = 500.0,
         .lp_order_fallback_usd = 5.0,
     });
 
-    // Spread = 0.60 - 0.40 = 0.20, well above min_spread
+    // Spread = 0.60 - 0.40 = 0.20 = 4000 bps, well above min_spread_bps.
     const result = se.evaluateLiquidityProvision("test-market", 0.40, 0.60, 0.0);
     try testing.expectEqual(@as(usize, 2), result.count);
     try testing.expectEqual(strategy_engine.SignalDirection.buy, result.signals[0].direction);
@@ -1264,12 +1264,12 @@ test "strategy_engine: LP emits paired perp signals without inventory" {
 
 test "strategy_engine: LP emits paired signals when spread wide and inventory exists" {
     var se = strategy_engine.StrategyEngine.init(.{
-        .lp_min_spread = 0.04,
+        .lp_min_spread_bps = 500.0,
         .lp_order_fallback_usd = 5.0,
     });
     se.updateInventory("test-market", .buy, 10.0);
 
-    // Spread = 0.60 - 0.40 = 0.20, well above min_spread
+    // Spread = 0.60 - 0.40 = 0.20 = 4000 bps, well above min_spread_bps.
     const result = se.evaluateLiquidityProvision("test-market", 0.40, 0.60, 0.0);
     try testing.expectEqual(@as(usize, 2), result.count);
     try testing.expectEqual(strategy_engine.SignalDirection.buy, result.signals[0].direction);
@@ -1285,13 +1285,26 @@ test "strategy_engine: LP emits paired signals when spread wide and inventory ex
 
 test "strategy_engine: LP returns no signals when spread narrow" {
     var se = strategy_engine.StrategyEngine.init(.{
-        .lp_min_spread = 0.04,
+        .lp_min_spread_bps = 500.0,
     });
 
-    // Spread = 0.51 - 0.49 = 0.02, below min_spread
+    // Spread = 0.51 - 0.49 = 0.02 = 400 bps, below min_spread_bps.
     const result = se.evaluateLiquidityProvision("test-market", 0.49, 0.51, 0.0);
     try testing.expectEqual(@as(u8, 0), result.count);
     try testing.expectEqual(@as(u64, 0), se.lp_stats.signals_emitted);
+}
+
+test "strategy_engine: LP min spread is measured in basis points" {
+    var se = strategy_engine.StrategyEngine.init(.{
+        .lp_min_spread_bps = 5.0,
+        .lp_order_fallback_usd = 5.0,
+    });
+
+    const tight_btc = se.evaluateLiquidityProvision("BTC", 65_000.00, 65_000.10, 0.0);
+    try testing.expectEqual(@as(usize, 0), tight_btc.count);
+
+    const wide_doge = se.evaluateLiquidityProvision("DOGE", 0.1501, 0.1502, 0.0);
+    try testing.expectEqual(@as(usize, 2), wide_doge.count);
 }
 
 test "strategy_engine: order tracking and untracking" {
@@ -1330,7 +1343,7 @@ test "strategy_engine: repricing cancel-on-collapse" {
 
 test "strategy_engine: LP pair lifecycle" {
     var se = strategy_engine.StrategyEngine.init(.{
-        .lp_exit_spread = 0.02,
+        .lp_exit_spread_bps = 300.0,
     });
 
     try testing.expect(se.trackOrder("bid-1", "m1", .market_making, .buy, 0.45));
@@ -1354,9 +1367,18 @@ test "strategy_engine: LP pair lifecycle" {
     try testing.expect(paired != null);
     try testing.expectEqualStrings("ask-1", paired.?);
 
-    // Should cancel LP pair when spread narrows
-    try testing.expect(se.shouldCancelLpPair(0.495, 0.505)); // spread = 0.01 < 0.02
-    try testing.expect(!se.shouldCancelLpPair(0.40, 0.60)); // spread = 0.20 > 0.02
+    // Should cancel LP pair when spread narrows.
+    try testing.expect(se.shouldCancelLpPair(0.495, 0.505)); // spread = 200 bps < 300 bps
+    try testing.expect(!se.shouldCancelLpPair(0.40, 0.60)); // spread = 4000 bps > 300 bps
+}
+
+test "strategy_engine: LP pair cancel threshold is measured in basis points" {
+    var se = strategy_engine.StrategyEngine.init(.{
+        .lp_exit_spread_bps = 2.0,
+    });
+
+    try testing.expect(se.shouldCancelLpPair(65_000.00, 65_000.10)); // ~0.015 bps
+    try testing.expect(!se.shouldCancelLpPair(0.1501, 0.1502)); // ~6.66 bps
 }
 
 test "strategy_engine: halt suppresses evaluation gating" {
@@ -1737,7 +1759,7 @@ test "db: queryPnl with all windows" {
 test "strategy_engine: paused state blocks signal generation" {
     var se = strategy_engine.StrategyEngine.init(.{
         .news_delta_threshold = 0.05,
-        .lp_min_spread = 0.04,
+        .lp_min_spread_bps = 500.0,
     });
 
     // Not paused — signals generated
@@ -2667,7 +2689,7 @@ test "risk_gate: rejection reason names include MaxAccountLeverageExceeded" {
 
 test "strategy_engine: MM long fill enters skewed regime and emits ask-only quote" {
     var se = strategy_engine.StrategyEngine.init(.{
-        .lp_min_spread = 0.04,
+        .lp_min_spread_bps = 500.0,
         .lp_order_fallback_usd = 5.0,
     });
 
@@ -2685,7 +2707,7 @@ test "strategy_engine: MM long fill enters skewed regime and emits ask-only quot
 
 test "strategy_engine: MM resumes paired quotes after inventory drains below exit" {
     var se = strategy_engine.StrategyEngine.init(.{
-        .lp_min_spread = 0.04,
+        .lp_min_spread_bps = 500.0,
         .lp_order_fallback_usd = 5.0,
     });
 
@@ -2707,7 +2729,7 @@ test "strategy_engine: MM resumes paired quotes after inventory drains below exi
 
 test "strategy_engine: MM short fill enters short-skewed regime and emits bid-only quote" {
     var se = strategy_engine.StrategyEngine.init(.{
-        .lp_min_spread = 0.04,
+        .lp_min_spread_bps = 500.0,
         .lp_order_fallback_usd = 5.0,
     });
 
@@ -2743,6 +2765,21 @@ test "cex_dex_arb: computeDeltaBps positive negative zero" {
         cex_dex_arb.computeDeltaBps(0.0, 100.0),
         1e-9,
     );
+}
+
+test "cex_dex_arb: default threshold requires fee buffer" {
+    var s = cex_dex_arb.ArbState.init(.{});
+
+    // 15 bps is above typical two-leg taker fees but still below the
+    // default safety buffer, so it must not preload confirmation.
+    try testing.expect(s.evaluate("BTC", 100.0, 100.15, 1000) == null);
+    try testing.expectEqual(@as(u32, 0), s.confirm_streak);
+
+    try testing.expect(s.evaluate("BTC", 100.0, 100.25, 1001) == null);
+    try testing.expect(s.evaluate("BTC", 100.0, 100.25, 1002) == null);
+    const sig = s.evaluate("BTC", 100.0, 100.25, 1003);
+    try testing.expect(sig != null);
+    try testing.expectApproxEqAbs(@as(f64, 25.0), sig.?.delta_bps, 1e-9);
 }
 
 test "cex_dex_arb: confirm window emits signal after N consecutive ticks" {

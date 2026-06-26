@@ -42,8 +42,12 @@ pub const StrategyConfig = struct {
     // spread defaults to better fit Hyperliquid perp books, which trade at
     // tighter spreads than the Polymarket CLOB this strategy was first
     // calibrated against.
-    lp_min_spread: f64 = 0.02,
-    lp_exit_spread: f64 = 0.01,
+    /// Minimum top-of-book spread required before market-making quotes are
+    /// emitted, expressed in basis points of mid price.
+    lp_min_spread_bps: f64 = 5.0,
+    /// Spread threshold for canceling an active paired quote, expressed in
+    /// basis points of mid price.
+    lp_exit_spread_bps: f64 = 2.0,
 
     /// LP TOTAL pair notional as fraction of USDC balance (covers BOTH legs
     /// combined). Interpreted as dollars-of-collateral, then split per leg
@@ -85,6 +89,16 @@ pub fn resolveOrderSize(balance: f64, pct: f64, price: f64, fallback_usd: f64) f
     const target_usd = if (balance <= 0) fallback_usd else balance * pct;
     const notional_usd = @max(target_usd, MIN_ORDER_NOTIONAL_USD);
     return @max(notional_usd / px, MIN_ORDER_SIZE);
+}
+
+fn computeSpreadBps(best_bid: f64, best_ask: f64) ?f64 {
+    if (!std.math.isFinite(best_bid) or !std.math.isFinite(best_ask)) return null;
+    if (best_bid <= 0.0 or best_ask <= best_bid) return null;
+
+    const mid_price = (best_bid + best_ask) / 2.0;
+    if (!std.math.isFinite(mid_price) or mid_price <= 0.0) return null;
+
+    return ((best_ask - best_bid) / mid_price) * 10_000.0;
 }
 
 test "resolveOrderSize uses perp-scale prices without prediction-market cap" {
@@ -304,9 +318,12 @@ pub const StrategyEngine = struct {
         balance: f64,
     ) LpResult {
         if (self.paused.load(.seq_cst)) return .{ .signals = undefined, .count = 0 };
-        const spread = best_ask - best_bid;
-        if (spread < self.config.lp_min_spread) return .{ .signals = undefined, .count = 0 };
+        const spread_bps = computeSpreadBps(best_bid, best_ask) orelse return .{ .signals = undefined, .count = 0 };
+        const min_spread_bps = self.config.lp_min_spread_bps;
+        if (!std.math.isFinite(min_spread_bps) or min_spread_bps < 0.0) return .{ .signals = undefined, .count = 0 };
+        if (spread_bps < min_spread_bps) return .{ .signals = undefined, .count = 0 };
 
+        const spread = best_ask - best_bid;
         const mid_price = (best_bid + best_ask) / 2.0;
         var inventory_shares: f64 = 0.0;
         var skew_state: SkewState = .normal;
@@ -331,7 +348,8 @@ pub const StrategyEngine = struct {
             }
         }
 
-        const confidence = @min(1.0, spread / 0.1);
+        const confidence_denominator = if (min_spread_bps > 0.0) min_spread_bps else 1.0;
+        const confidence = @min(1.0, spread_bps / confidence_denominator);
         const skew_bias = self.config.mm_skew_quote_pct;
 
         var mid_id: [68]u8 = undefined;
@@ -428,8 +446,8 @@ pub const StrategyEngine = struct {
 
                 self.state_mu.lock();
                 defer self.state_mu.unlock();
-                log.info("strategy", "mm signals: market={s} bid={d:.4} ask={d:.4} spread={d:.4}", .{
-                    market_id, bid_price, ask_price, spread,
+                log.info("strategy", "mm signals: market={s} bid={d:.4} ask={d:.4} spread_bps={d:.2}", .{
+                    market_id, bid_price, ask_price, spread_bps,
                 });
                 self.lp_stats.signals_emitted += 2;
                 return .{
@@ -681,8 +699,10 @@ pub const StrategyEngine = struct {
 
     /// Check if LP spread has narrowed below exit threshold.
     pub fn shouldCancelLpPair(self: *StrategyEngine, best_bid: f64, best_ask: f64) bool {
-        const spread = best_ask - best_bid;
-        return spread < self.config.lp_exit_spread;
+        const spread_bps = computeSpreadBps(best_bid, best_ask) orelse return true;
+        const exit_spread_bps = self.config.lp_exit_spread_bps;
+        if (!std.math.isFinite(exit_spread_bps) or exit_spread_bps < 0.0) return true;
+        return spread_bps < exit_spread_bps;
     }
 
     /// Get stats snapshot for a strategy.

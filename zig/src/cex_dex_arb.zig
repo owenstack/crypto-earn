@@ -26,8 +26,10 @@ pub const ArbDirection = enum {
     long_hl_short_cex,
 };
 pub const ArbConfig = struct {
-    /// Minimum absolute |delta_bps| required for a candidate signal.
-    delta_threshold_bps: f64 = 10.0,
+    /// Minimum absolute |delta_bps| required for a candidate signal. This
+    /// default leaves room above two taker fees plus a small slippage/latency
+    /// buffer before the strategy emits a candidate.
+    delta_threshold_bps: f64 = 20.0,
     /// Number of consecutive evaluator ticks the delta must stay above
     /// the threshold (in the same direction) before a signal fires.
     confirm_window_ticks: u32 = 3,

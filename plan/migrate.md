@@ -109,7 +109,7 @@ The migrated `cex-zig` is a self-hosted, low-latency perpetual futures trading e
 | FR-13 | Dry-run mode on testnet: all order actions intercepted, logged to `dry_run_orders`, no real API calls |
 | FR-14 | Testnet/mainnet toggle via `HL_NETWORK=testnet|mainnet` environment variable |
 | FR-15 | Inventory skew check: after a long fill, suppress further bids and lower the ask to exit the position |
-| FR-16 | LP strategy: tighten spread to `lp_min_spread=0.0005` (5 bps) from the previous 6% |
+| FR-16 | LP strategy: tighten spread to `lp_min_spread_bps=5.0` from the previous 6% |
 | FR-17 | Delete all Polymarket-specific source files from the Zig engine |
 | FR-18 | Database schema migration adding HL-specific fields (asset index, mark price, funding rate) |
 | FR-19 | IPC types updated to reflect HL semantics (remove Polymarket/Kalshi/Gamma/CTF references) |
@@ -522,7 +522,7 @@ Deploy to AWS EC2 us-east-1 with `HL_NETWORK=mainnet`, `DRY_RUN=0`. Run both str
   - **Title:** LP strategy with tight spread quoting
   - **Description:** As the engine, I want the LP strategy to quote a 5 bps spread around the HL mid-price for configured assets so I capture the maker rebate thousands of times per day.
   - **Acceptance criteria:**
-    - AC-014-1: `lp_min_spread` defaults to `0.0005` (5 bps).
+    - AC-014-1: `lp_min_spread_bps` defaults to `5.0`.
     - AC-014-2: Bid is placed at `mid × (1 − spread/2)` and ask at `mid × (1 + spread/2)`, rounded to HL tick size.
     - AC-014-3: Quotes are refreshed whenever the mid-price moves by more than `lp_requote_threshold_bps` (default 2 bps).
     - AC-014-4: LP strategy does not place orders if the HL taker fee would exceed the expected rebate (checked against the current order book depth).
@@ -743,7 +743,7 @@ Deploy to AWS EC2 us-east-1 with `HL_NETWORK=mainnet`, `DRY_RUN=0`. Run both str
 
 - [ ] **TASK-6.2** Update `zig/src/strategy_engine.zig`
   - [ ] TASK-6.2.1: Rename `liquidity_provision` strategy to `market_making` in enums and log messages
-  - [ ] TASK-6.2.2: Update LP default config: `lp_min_spread=0.0005`, `lp_order_size_pct=0.05`
+  - [ ] TASK-6.2.2: Update LP default config: `lp_min_spread_bps=5.0`, `lp_order_size_pct=0.05`
   - [ ] TASK-6.2.3: Add `StrategyName.cex_dex_arb` enum variant
   - [ ] TASK-6.2.4: Implement inventory skew check in `evaluateLiquidityProvision()`: after fill, suppress bids and skew ask down
   - [ ] TASK-6.2.5: Add `checkInventorySkew(market_id) → SkewState` returning `{ suppress_bids: bool, ask_offset_bps: f64 }`
