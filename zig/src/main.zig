@@ -16,16 +16,6 @@ const hl_orderbook = @import("hl_orderbook.zig");
 const binance_ws = @import("binance_ws.zig");
 const cex_dex_arb = @import("cex_dex_arb.zig");
 
-fn roundUpToCents(value: f64) f64 {
-    const step = 100.0;
-    return @ceil((value - 1e-9) * step) / step;
-}
-
-test "roundUpToCents rounds fractional cents upward" {
-    try std.testing.expectApproxEqAbs(@as(f64, 6.67), roundUpToCents(6.661), 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f64, 6.67), roundUpToCents(6.67), 1e-9);
-}
-
 const HlEnvError = error{
     HlMissingPrivateKey,
     HlInvalidPrivateKey,
@@ -1098,14 +1088,10 @@ fn dispatchSignal(ctx: *StrategyWorkerCtx, signal: strategy.Signal) void {
         }
     }
 
-    if (signal.direction == .buy) {
-        effective_size = roundUpToCents(effective_size);
-    }
-
     var price_buf: [32]u8 = undefined;
     const price_str = std.fmt.bufPrint(&price_buf, "{d:.6}", .{order_price}) catch "0";
     var size_buf: [32]u8 = undefined;
-    const size_str = std.fmt.bufPrint(&size_buf, "{d:.2}", .{effective_size}) catch "0";
+    const size_str = std.fmt.bufPrint(&size_buf, "{d:.8}", .{effective_size}) catch "0";
 
     const notional = effective_size * order_price;
     if (shouldSkipForMaxPosition(ctx, market_id, side_str, notional)) return;
@@ -1319,8 +1305,8 @@ fn dispatchLpPair(ctx: *StrategyWorkerCtx, buy_signal: strategy.Signal, sell_sig
 
     const buy_price_str = std.fmt.bufPrint(&buy_price_buf, "{d:.6}", .{buy_price}) catch "0";
     const sell_price_str = std.fmt.bufPrint(&sell_price_buf, "{d:.6}", .{sell_price}) catch "0";
-    const buy_size_str = std.fmt.bufPrint(&buy_size_buf, "{d:.2}", .{buy_size}) catch "0";
-    const sell_size_str = std.fmt.bufPrint(&sell_size_buf, "{d:.2}", .{sell_size}) catch "0";
+    const buy_size_str = std.fmt.bufPrint(&buy_size_buf, "{d:.8}", .{buy_size}) catch "0";
+    const sell_size_str = std.fmt.bufPrint(&sell_size_buf, "{d:.8}", .{sell_size}) catch "0";
 
     const origin = "market_making";
 

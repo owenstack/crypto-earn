@@ -67,7 +67,9 @@ pub const StrategyConfig = struct {
 };
 
 /// Minimum order quantity used by the strategy sizing fallback.
-pub const MIN_ORDER_SHARES: f64 = 5.0;
+/// Hyperliquid perp sizes are asset quantities, not prediction-market shares;
+/// keep this tiny so the notional floor drives sizing for small accounts.
+pub const MIN_ORDER_SIZE: f64 = 0.000001;
 /// Minimum order notional (USD) used by the strategy sizing fallback.
 pub const MIN_ORDER_NOTIONAL_USD: f64 = 1.0;
 
@@ -77,12 +79,12 @@ pub const MIN_ORDER_NOTIONAL_USD: f64 = 1.0;
 /// Semantics:
 ///   target_usd = balance > 0 ? balance * pct : fallback_usd
 ///   notional   = max(target_usd, MIN_ORDER_NOTIONAL_USD)
-///   shares     = max(notional / price, MIN_ORDER_SHARES)
+///   size       = max(notional / price, MIN_ORDER_SIZE)
 pub fn resolveOrderSize(balance: f64, pct: f64, price: f64, fallback_usd: f64) f64 {
     const px = if (std.math.isFinite(price) and price > 0) price else 0.01;
     const target_usd = if (balance <= 0) fallback_usd else balance * pct;
     const notional_usd = @max(target_usd, MIN_ORDER_NOTIONAL_USD);
-    return @max(notional_usd / px, MIN_ORDER_SHARES);
+    return @max(notional_usd / px, MIN_ORDER_SIZE);
 }
 
 test "resolveOrderSize uses perp-scale prices without prediction-market cap" {
@@ -91,6 +93,12 @@ test "resolveOrderSize uses perp-scale prices without prediction-market cap" {
         resolveOrderSize(0.0, 0.1, 50_000.0, 1_000_000.0),
         1e-9,
     );
+}
+
+test "resolveOrderSize keeps small perp orders near target notional" {
+    const size = resolveOrderSize(10.0, 0.12, 50_000.0, 1.20);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.000024), size, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.20), size * 50_000.0, 1e-9);
 }
 
 pub const StrategyStats = struct {
@@ -341,7 +349,7 @@ pub const StrategyEngine = struct {
                 const ask_price = best_bid + spread * (0.5 + skew_bias);
                 const ask_leg_size = resolveOrderSize(balance, per_leg_pct, ask_price, per_leg_fallback_usd);
                 const sell_size = @min(ask_leg_size, @abs(inventory_shares));
-                if (sell_size < MIN_ORDER_SHARES) {
+                if (sell_size < MIN_ORDER_SIZE) {
                     log.info("strategy", "MM long-skewed quote skipped: ask leg below minimum on {s} (size={d:.4})", .{
                         market_id, sell_size,
                     });
@@ -375,7 +383,7 @@ pub const StrategyEngine = struct {
                 const bid_price = best_ask - spread * (0.5 + skew_bias);
                 const buy_size = resolveOrderSize(balance, per_leg_pct, bid_price, per_leg_fallback_usd);
                 const cover_size = @min(buy_size, @abs(inventory_shares));
-                if (cover_size < MIN_ORDER_SHARES) {
+                if (cover_size < MIN_ORDER_SIZE) {
                     log.info("strategy", "MM short-skewed quote skipped: bid leg below minimum on {s} (size={d:.4})", .{
                         market_id, cover_size,
                     });
@@ -410,19 +418,8 @@ pub const StrategyEngine = struct {
                 const buy_size = resolveOrderSize(balance, per_leg_pct, bid_price, per_leg_fallback_usd);
                 const ask_leg_size = resolveOrderSize(balance, per_leg_pct, ask_price, per_leg_fallback_usd);
 
-                // Normal regime still requires inventory to back the sell
-                // leg of the pair (HL spot pairs would otherwise emit a
-                // naked sell). For perp markets this guard is a no-op once
-                // a long fill seeds inventory.
-                if (inventory_shares < MIN_ORDER_SHARES) {
-                    log.info("strategy", "MM skipped: insufficient inventory for paired quote on {s} (inventory={d:.4})", .{
-                        market_id, inventory_shares,
-                    });
-                    return .{ .signals = undefined, .count = 0 };
-                }
-
-                const sell_size = @min(ask_leg_size, inventory_shares);
-                if (sell_size < MIN_ORDER_SHARES) {
+                const sell_size = ask_leg_size;
+                if (sell_size < MIN_ORDER_SIZE) {
                     log.info("strategy", "MM skipped: sell leg below minimum size on {s} (size={d:.4})", .{
                         market_id, sell_size,
                     });

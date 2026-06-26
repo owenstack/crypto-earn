@@ -1154,7 +1154,7 @@ test "strategy_engine: news repricing triggers on sufficient delta" {
     try testing.expectEqual(strategy_engine.StrategyName.news_repricing, s.strategy);
     try testing.expectEqual(strategy_engine.SignalDirection.buy, s.direction);
     try testing.expectEqual(@as(f64, 0.70), s.price);
-    // Size = max($10/$0.70, 5 shares) = ~14.2857 shares
+    // Size = $10/$0.70 = ~14.2857 asset units.
     try testing.expectApproxEqAbs(@as(f64, 14.285714285714286), s.size, 1e-9);
     try testing.expect(s.confidence >= 0.3);
     try testing.expect(s.confidence <= 1.0);
@@ -1248,7 +1248,7 @@ test "strategy_engine: news repricing confidence bounds" {
     try testing.expectApproxEqAbs(@as(f64, 0.25), sig2.?.confidence, 1e-9);
 }
 
-test "strategy_engine: LP emits no signals without inventory" {
+test "strategy_engine: LP emits paired perp signals without inventory" {
     var se = strategy_engine.StrategyEngine.init(.{
         .lp_min_spread = 0.04,
         .lp_order_fallback_usd = 5.0,
@@ -1256,8 +1256,10 @@ test "strategy_engine: LP emits no signals without inventory" {
 
     // Spread = 0.60 - 0.40 = 0.20, well above min_spread
     const result = se.evaluateLiquidityProvision("test-market", 0.40, 0.60, 0.0);
-    try testing.expectEqual(@as(usize, 0), result.count);
-    try testing.expectEqual(@as(u64, 0), se.lp_stats.signals_emitted);
+    try testing.expectEqual(@as(usize, 2), result.count);
+    try testing.expectEqual(strategy_engine.SignalDirection.buy, result.signals[0].direction);
+    try testing.expectEqual(strategy_engine.SignalDirection.sell, result.signals[1].direction);
+    try testing.expectEqual(@as(u64, 2), se.lp_stats.signals_emitted);
 }
 
 test "strategy_engine: LP emits paired signals when spread wide and inventory exists" {
@@ -1275,9 +1277,9 @@ test "strategy_engine: LP emits paired signals when spread wide and inventory ex
     // bid = 0.40 + 0.20 * 0.25 = 0.45 → buy size = max($2.50/$0.45, 5) = ~5.555
     try testing.expectApproxEqAbs(@as(f64, 0.45), result.signals[0].price, 1e-9);
     try testing.expectApproxEqAbs(@as(f64, 2.5 / 0.45), result.signals[0].size, 1e-9);
-    // ask = 0.60 - 0.20 * 0.25 = 0.55 → sell size = max($2.50/$0.55, 5) = ~5.0
+    // ask = 0.60 - 0.20 * 0.25 = 0.55 → sell size = $2.50/$0.55
     try testing.expectApproxEqAbs(@as(f64, 0.55), result.signals[1].price, 1e-9);
-    try testing.expectApproxEqAbs(@max(@as(f64, 2.5 / 0.55), @as(f64, 5.0)), result.signals[1].size, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 2.5 / 0.55), result.signals[1].size, 1e-9);
     try testing.expectEqual(@as(u64, 2), se.lp_stats.signals_emitted);
 }
 
