@@ -466,6 +466,10 @@ pub const FillPoller = struct {
                     const dir: strategy.SignalDirection =
                         if (std.mem.eql(u8, local.side(), "buy")) .buy else .sell;
                     se.recordMarketMakingFill(local.marketId(), dir, fill.sz, fill.px);
+                    if (std.mem.eql(u8, result.new_status, "filled")) {
+                        self.cancelPairedMarketMakingOrder(se, local.id());
+                        se.untrackOrder(local.id());
+                    }
                 }
             }
 
@@ -499,12 +503,18 @@ pub const FillPoller = struct {
     }
 
     const LocalOrderRef = struct {
+        id_buf: [128]u8 = [_]u8{0} ** 128,
+        id_len: usize = 0,
         market_id_buf: [128]u8 = [_]u8{0} ** 128,
         market_id_len: usize = 0,
         side_buf: [8]u8 = [_]u8{0} ** 8,
         side_len: usize = 0,
         origin_buf: [32]u8 = [_]u8{0} ** 32,
         origin_len: usize = 0,
+
+        fn id(self: *const LocalOrderRef) []const u8 {
+            return self.id_buf[0..self.id_len];
+        }
 
         fn marketId(self: *const LocalOrderRef) []const u8 {
             return self.market_id_buf[0..self.market_id_len];
@@ -531,6 +541,32 @@ pub const FillPoller = struct {
             return std.mem.eql(u8, self.origin(), "cex_dex_arb");
         }
     };
+
+    fn cancelPairedMarketMakingOrder(
+        self: *FillPoller,
+        se: *strategy.StrategyEngine,
+        filled_order_id: []const u8,
+    ) void {
+        const paired = se.findPairedOrder(filled_order_id) orelse return;
+        var paired_buf: [68]u8 = undefined;
+        const paired_len = @min(paired.len, paired_buf.len);
+        @memcpy(paired_buf[0..paired_len], paired[0..paired_len]);
+        const paired_id = paired_buf[0..paired_len];
+
+        if (self.om.cancelOrder(paired_id)) {
+            se.untrackOrder(paired_id);
+            se.incrementCancels(.market_making);
+            log.info("fill_poller", "cancelled paired LP order after fill: filled={s} paired={s}", .{
+                filled_order_id,
+                paired_id,
+            });
+        } else {
+            log.warn("fill_poller", "failed to cancel paired LP order after fill: filled={s} paired={s}", .{
+                filled_order_id,
+                paired_id,
+            });
+        }
+    }
 
     fn computeRealizedPnl(
         self: *FillPoller,
@@ -567,7 +603,7 @@ pub const FillPoller = struct {
 
     fn resolveLocalOrder(self: *FillPoller, oid: []const u8) LocalOrderRef {
         var out = LocalOrderRef{};
-        const sql = "SELECT market_id, side, COALESCE(strategy_origin,'') FROM orders WHERE id=? OR client_order_id=? OR exchange_order_id=? LIMIT 1;" ++ &[_:0]u8{};
+        const sql = "SELECT id, market_id, side, COALESCE(strategy_origin,'') FROM orders WHERE id=? OR client_order_id=? OR exchange_order_id=? LIMIT 1;" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.database.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return out;
         defer _ = c.sqlite3_finalize(stmt);
@@ -578,17 +614,23 @@ pub const FillPoller = struct {
 
         if (c.sqlite3_column_text(stmt, 0)) |p| {
             const span = std.mem.span(@as([*c]const u8, @ptrCast(p)));
+            const n = @min(span.len, out.id_buf.len);
+            @memcpy(out.id_buf[0..n], span[0..n]);
+            out.id_len = n;
+        }
+        if (c.sqlite3_column_text(stmt, 1)) |p| {
+            const span = std.mem.span(@as([*c]const u8, @ptrCast(p)));
             const n = @min(span.len, out.market_id_buf.len);
             @memcpy(out.market_id_buf[0..n], span[0..n]);
             out.market_id_len = n;
         }
-        if (c.sqlite3_column_text(stmt, 1)) |p| {
+        if (c.sqlite3_column_text(stmt, 2)) |p| {
             const span = std.mem.span(@as([*c]const u8, @ptrCast(p)));
             const n = @min(span.len, out.side_buf.len);
             @memcpy(out.side_buf[0..n], span[0..n]);
             out.side_len = n;
         }
-        if (c.sqlite3_column_text(stmt, 2)) |p| {
+        if (c.sqlite3_column_text(stmt, 3)) |p| {
             const span = std.mem.span(@as([*c]const u8, @ptrCast(p)));
             const n = @min(span.len, out.origin_buf.len);
             @memcpy(out.origin_buf[0..n], span[0..n]);

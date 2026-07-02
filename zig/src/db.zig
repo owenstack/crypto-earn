@@ -773,12 +773,28 @@ pub const DB = struct {
         return @intCast(c.sqlite3_column_int(stmt, 0));
     }
 
-    /// Count live (placed/partially_filled) AND locally pending orders for a
-    /// specific market. Used by the risk gate to block stacking duplicate
-    /// resting orders on the same market while the previous one waits to
-    /// fill or be acknowledged.
-    pub fn queryOpenOrderCountByMarket(self: DB, market_id: []const u8) !u32 {
-        const sql = "SELECT count(*) FROM orders WHERE market_id=? AND status IN ('pending','placed','partially_filled');" ++ &[_:0]u8{};
+    /// Count currently open paper orders for dry-run risk checks.
+    pub fn queryOpenDryRunOrderCount(self: DB) !u32 {
+        const sql = "SELECT count(*) FROM dry_run_orders WHERE status='open';" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare queryOpenDryRunOrderCount", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) {
+            log.err("db", "failed to execute queryOpenDryRunOrderCount", .{});
+            return error.DBExecFailed;
+        }
+        return @intCast(c.sqlite3_column_int(stmt, 0));
+    }
+
+    /// Count live/pending orders for the same market and side. Used by the
+    /// risk gate to block stacking identical resting orders while still
+    /// allowing intentional buy/sell market-making pairs.
+    pub fn queryOpenOrderCountByMarket(self: DB, market_id: []const u8, side: []const u8) !u32 {
+        const sql = "SELECT count(*) FROM orders WHERE market_id=? AND side=? AND status IN ('pending','placed','partially_filled');" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
             log.err("db", "failed to prepare queryOpenOrderCountByMarket", .{});
@@ -786,13 +802,39 @@ pub const DB = struct {
         }
         defer _ = c.sqlite3_finalize(stmt);
 
-        if (c.sqlite3_bind_text(stmt, 1, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK) {
+        if (c.sqlite3_bind_text(stmt, 1, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 2, side.ptr, @intCast(side.len), null) != c.SQLITE_OK)
+        {
             log.err("db", "failed to bind queryOpenOrderCountByMarket parameters", .{});
             return error.DBExecFailed;
         }
 
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) {
             log.err("db", "failed to execute queryOpenOrderCountByMarket", .{});
+            return error.DBExecFailed;
+        }
+        return @intCast(c.sqlite3_column_int(stmt, 0));
+    }
+
+    /// Count currently open paper orders for one market and direction.
+    pub fn queryOpenDryRunOrderCountByMarket(self: DB, market_id: []const u8, direction: []const u8) !u32 {
+        const sql = "SELECT count(*) FROM dry_run_orders WHERE market_id=? AND direction=? AND status='open';" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare queryOpenDryRunOrderCountByMarket", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, market_id.ptr, @intCast(market_id.len), null) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 2, direction.ptr, @intCast(direction.len), null) != c.SQLITE_OK)
+        {
+            log.err("db", "failed to bind queryOpenDryRunOrderCountByMarket parameters", .{});
+            return error.DBExecFailed;
+        }
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) {
+            log.err("db", "failed to execute queryOpenDryRunOrderCountByMarket", .{});
             return error.DBExecFailed;
         }
         return @intCast(c.sqlite3_column_int(stmt, 0));
@@ -833,6 +875,23 @@ pub const DB = struct {
 
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) {
             log.err("db", "failed to execute queryOpenExposureUsd", .{});
+            return error.DBExecFailed;
+        }
+        return c.sqlite3_column_double(stmt, 0);
+    }
+
+    /// Sum currently open paper-order notional for dry-run risk checks.
+    pub fn queryOpenDryRunExposureUsd(self: DB) !f64 {
+        const sql = "SELECT COALESCE(SUM(size * signal_price), 0.0) FROM dry_run_orders WHERE status='open';" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            log.err("db", "failed to prepare queryOpenDryRunExposureUsd", .{});
+            return error.DBExecFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) {
+            log.err("db", "failed to execute queryOpenDryRunExposureUsd", .{});
             return error.DBExecFailed;
         }
         return c.sqlite3_column_double(stmt, 0);

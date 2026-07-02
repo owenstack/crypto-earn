@@ -7,6 +7,10 @@ const ipc = @import("ipc.zig");
 const ipc_types = @import("ipc_types.zig");
 
 pub const RiskConfig = struct {
+    /// When true, exposure and open-order checks use dry_run_orders instead
+    /// of live orders so paper trading exercises the same risk limits.
+    dry_run_enabled: bool = false,
+
     // --- Ratio-based limits (scale automatically with balance) ---
 
     /// Max notional for a single order as a fraction of balance.
@@ -194,7 +198,10 @@ pub fn validateOrder(request: OrderRequest, database: *db.DB, config: RiskConfig
     }
 
     // Check 2: Max portfolio exposure
-    const current_exposure = database.queryOpenExposureUsd() catch {
+    const current_exposure = (if (config.dry_run_enabled)
+        database.queryOpenDryRunExposureUsd()
+    else
+        database.queryOpenExposureUsd()) catch {
         const rejection = Rejection{
             .reason = .db_error,
             .check_name = "db_query_open_exposure_failed",
@@ -288,7 +295,10 @@ pub fn validateOrder(request: OrderRequest, database: *db.DB, config: RiskConfig
     // Check 4: Max open orders (balance-derived; falls back to static cap
     // when no balance snapshot is available so the engine still works on
     // cold start and in unit tests).
-    const open_orders = database.queryOpenOrderCount() catch {
+    const open_orders = (if (config.dry_run_enabled)
+        database.queryOpenDryRunOrderCount()
+    else
+        database.queryOpenOrderCount()) catch {
         const rejection = Rejection{
             .reason = .db_error,
             .check_name = "db_query_open_orders_failed",
@@ -337,7 +347,10 @@ pub fn validateOrder(request: OrderRequest, database: *db.DB, config: RiskConfig
     // check the strategy can stack identical resting orders on the same
     // market every evaluation tick while the first one waits to fill.
     if (!config.allow_duplicate_positions) {
-        const open_orders_on_market = database.queryOpenOrderCountByMarket(request.market_id) catch blk: {
+        const open_orders_on_market = (if (config.dry_run_enabled)
+            database.queryOpenDryRunOrderCountByMarket(request.market_id, request.side)
+        else
+            database.queryOpenOrderCountByMarket(request.market_id, request.side)) catch blk: {
             log.warn("risk_gate", "queryOpenOrderCountByMarket failed; treating as 0", .{});
             break :blk @as(u32, 0);
         };
@@ -430,7 +443,10 @@ pub fn validatePairPreflight(
         } };
     }
 
-    const current_exposure = database.queryOpenExposureUsd() catch {
+    const current_exposure = (if (config.dry_run_enabled)
+        database.queryOpenDryRunExposureUsd()
+    else
+        database.queryOpenExposureUsd()) catch {
         return .{ .reject = .{
             .reason = .db_error,
             .check_name = "pair_preflight_open_exposure_query_failed",
@@ -485,7 +501,10 @@ pub fn validatePairPreflight(
         }
     }
 
-    const open_orders = database.queryOpenOrderCount() catch {
+    const open_orders = (if (config.dry_run_enabled)
+        database.queryOpenDryRunOrderCount()
+    else
+        database.queryOpenOrderCount()) catch {
         return .{ .reject = .{
             .reason = .db_error,
             .check_name = "pair_preflight_open_orders_query_failed",

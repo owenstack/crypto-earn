@@ -38,13 +38,12 @@ pub const StrategyConfig = struct {
     /// Dollar notional fallback when balance is unknown (cold start).
     news_order_fallback_usd: f64 = 12.0,
 
-    // Market making (formerly liquidity_provision). Phase 6 tightens the
-    // spread defaults to better fit Hyperliquid perp books, which trade at
-    // tighter spreads than the Polymarket CLOB this strategy was first
-    // calibrated against.
+    // Market making (formerly liquidity_provision). Keep the default above
+    // modeled round-trip maker fees plus adverse-selection noise observed in
+    // dry-run fills.
     /// Minimum top-of-book spread required before market-making quotes are
     /// emitted, expressed in basis points of mid price.
-    lp_min_spread_bps: f64 = 5.0,
+    lp_min_spread_bps: f64 = 18.0,
     /// Spread threshold for canceling an active paired quote, expressed in
     /// basis points of mid price.
     lp_exit_spread_bps: f64 = 2.0,

@@ -790,6 +790,98 @@ test "risk_gate: rejects when max open orders reached" {
     }
 }
 
+test "risk_gate: dry-run exposure counts open paper orders" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.insertBalanceSnapshot(10.0, 0.0, 0.0, 0.0);
+    try database.insertDryRunOrder("dr-open-1", "m1", "market_making", "buy", 120.0, 0.20);
+    try database.insertDryRunOrder("dr-open-2", "m2", "market_making", "sell", 120.0, 0.20);
+    try database.insertDryRunOrder("dr-filled", "m3", "market_making", "buy", 120.0, 0.20);
+    try database.updateDryRunOrderStatus("dr-filled", "filled");
+
+    try testing.expectEqual(@as(u32, 2), try database.queryOpenDryRunOrderCount());
+    try testing.expectEqual(@as(u32, 1), try database.queryOpenDryRunOrderCountByMarket("m1", "buy"));
+    try testing.expectEqual(@as(u32, 0), try database.queryOpenDryRunOrderCountByMarket("m1", "sell"));
+    try testing.expectApproxEqAbs(@as(f64, 48.0), try database.queryOpenDryRunExposureUsd(), 1e-9);
+
+    const config = risk_gate.RiskConfig{
+        .dry_run_enabled = true,
+        .max_position_pct = 1.50,
+        .max_portfolio_exposure_pct = 5.00,
+        .max_daily_drawdown_pct = 0.30,
+        .max_open_orders = 10,
+        .allow_duplicate_positions = true,
+        .max_balance_commitment_ratio = 5.00,
+        .nominal_order_notional_usd = 11.0,
+    };
+
+    const request = risk_gate.OrderRequest{
+        .market_id = "m4",
+        .side = "buy",
+        .size = "1",
+        .price = "5.00",
+        .order_type = "limit",
+        .client_order_id = "test-dry-run-exposure",
+    };
+
+    const result = risk_gate.validateOrder(request, &database, config);
+    switch (result) {
+        .reject => |r| {
+            try testing.expectEqual(risk_gate.RejectionReason.max_portfolio_exposure_exceeded, r.reason);
+            try testing.expectEqualStrings("max_portfolio_exposure_usd", r.check_name);
+        },
+        .pass => try testing.expect(false),
+    }
+}
+
+test "risk_gate: dry-run allows opposite-side pair on same market" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.insertBalanceSnapshot(10.0, 0.0, 0.0, 0.0);
+    try database.insertDryRunOrder("dr-buy", "m1", "market_making", "buy", 120.0, 0.10);
+
+    const config = risk_gate.RiskConfig{
+        .dry_run_enabled = true,
+        .max_position_pct = 1.50,
+        .max_portfolio_exposure_pct = 5.00,
+        .max_daily_drawdown_pct = 0.30,
+        .max_open_orders = 10,
+        .allow_duplicate_positions = false,
+        .max_balance_commitment_ratio = 5.00,
+        .nominal_order_notional_usd = 11.0,
+    };
+
+    const sell_request = risk_gate.OrderRequest{
+        .market_id = "m1",
+        .side = "sell",
+        .size = "0.10",
+        .price = "120.00",
+        .order_type = "limit",
+        .client_order_id = "test-dry-run-pair-sell",
+    };
+
+    try testing.expect(risk_gate.validateOrder(sell_request, &database, config) == .pass);
+
+    const buy_request = risk_gate.OrderRequest{
+        .market_id = "m1",
+        .side = "buy",
+        .size = "0.10",
+        .price = "120.00",
+        .order_type = "limit",
+        .client_order_id = "test-dry-run-dup-buy",
+    };
+
+    const result = risk_gate.validateOrder(buy_request, &database, config);
+    switch (result) {
+        .reject => |r| try testing.expectEqual(risk_gate.RejectionReason.duplicate_open_order, r.reason),
+        .pass => try testing.expect(false),
+    }
+}
+
 test "risk_gate: pair preflight rejects when only one open-order slot remains" {
     var database = try openTempDb();
     defer database.close();

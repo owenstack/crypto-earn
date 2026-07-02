@@ -121,15 +121,18 @@ pub fn main() !void {
     try database.runMigrations();
     log.info("engine", "db ready", .{});
 
-    // Initialize risk config
-    const risk_config = risk.RiskConfig{};
-
     // Phase 2: parse Hyperliquid config from env. dry_run can run with
     // defaults; live mode requires a valid private key + network.
     const dry_run_env = if (std.posix.getenv("DRY_RUN")) |v|
         (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true"))
     else
         false;
+
+    // Initialize risk config after DRY_RUN is known so dry-run validation
+    // counts paper orders/exposure instead of live exchange rows.
+    const risk_config = risk.RiskConfig{
+        .dry_run_enabled = dry_run_env,
+    };
 
     const hl_config = loadHlConfig(dry_run_env) catch |e| {
         log.err("engine", "Hyperliquid config invalid: {s}", .{@errorName(e)});
@@ -179,16 +182,20 @@ pub fn main() !void {
 
     // Phase 5: live HL equity/margin polling. This feeds `/portfolio` with
     // clearinghouseState semantics while preserving the legacy balance cache
-    // used by existing risk/strategy paths. Dry-run without a signer skips it.
+    // used by existing risk/strategy paths. In dry-run, simulated balances are
+    // authoritative; live/testnet account equity can be zero and must not
+    // overwrite the paper balance snapshots used by risk and sizing.
     var hl_portfolio_user_addr = hl_auth.formatAddressEip55(hl_config.signer_address);
     var hl_portfolio_thread: ?std.Thread = null;
-    if (hl_config.enabled) {
+    if (hl_config.enabled and !dry_run_env) {
         hl_portfolio_thread = try std.Thread.spawn(.{}, portfolio.PortfolioTracker.hlPollingLoop, .{
             &pt,
             hl_config.api_base,
             hl_portfolio_user_addr[0..],
         });
         log.info("engine", "HL portfolio polling thread started", .{});
+    } else if (dry_run_env) {
+        log.info("engine", "HL portfolio polling skipped in dry-run mode", .{});
     }
     defer {
         pt.stop();
@@ -443,6 +450,7 @@ pub fn main() !void {
         (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true"))
     else
         false;
+    const dry_run_session_start = std.time.timestamp();
     if (dry_run) {
         log.info("engine", "DRY-RUN mode enabled -- no orders will be placed", .{});
 
@@ -473,6 +481,7 @@ pub fn main() !void {
         .database = &database,
         .should_stop = std.atomic.Value(bool).init(false),
         .dry_run = dry_run,
+        .dry_run_session_start = dry_run_session_start,
         // Phase 6: live market-data sources for arb (and future MM source
         // switch). Only wired when the corresponding feed thread started.
         .hl_ob = if (hl_ob_started) &hl_ob else null,
@@ -512,6 +521,7 @@ const StrategyWorkerCtx = struct {
     database: *db.DB,
     should_stop: std.atomic.Value(bool),
     dry_run: bool,
+    dry_run_session_start: i64,
     /// True when the engine has reached max_open_orders or balance commitment
     /// cap. While set, dispatchSignal silently skips submission so we focus on
     /// managing existing orders. Cleared when capacity frees (a fill closes
@@ -940,7 +950,6 @@ fn simulateDryRunFills(ctx: *StrategyWorkerCtx) void {
     if (count == 0) return;
 
     const now = std.time.timestamp();
-    const fee_bps: f64 = 4.5; // HL taker fee bps per side
 
     var any_settled = false;
 
@@ -968,6 +977,7 @@ fn simulateDryRunFills(ctx: *StrategyWorkerCtx) void {
 
         const fill_price = if (is_buy) ob.best_ask else ob.best_bid;
         const notional = fill_price * order.size;
+        const fee_bps = dryRunFeeBpsPerSide(order.strategy());
         // Fees: entry + exit, charged at fee_bps each side.
         const fees = notional * (fee_bps / 10000.0) * 2.0;
 
@@ -984,6 +994,11 @@ fn simulateDryRunFills(ctx: *StrategyWorkerCtx) void {
         log.info("dry_run", "FILL [{s}] {s} {d:.4} -> pnl={d:.4} fees={d:.4}", .{
             oid[0..@min(oid.len, 24)], dir, fill_price, pnl_net, fees,
         });
+
+        if (isMarketMakingStrategy(order.strategy())) {
+            cancelDryRunPairedOrder(ctx, oid);
+        }
+        ctx.se.untrackOrder(oid);
     }
 
     if (any_settled) {
@@ -991,14 +1006,55 @@ fn simulateDryRunFills(ctx: *StrategyWorkerCtx) void {
     }
 }
 
+fn cancelDryRunPairedOrder(ctx: *StrategyWorkerCtx, filled_order_id: []const u8) void {
+    const paired = ctx.se.findPairedOrder(filled_order_id) orelse return;
+    var paired_buf: [68]u8 = undefined;
+    const paired_len = @min(paired.len, paired_buf.len);
+    @memcpy(paired_buf[0..paired_len], paired[0..paired_len]);
+    const paired_id = paired_buf[0..paired_len];
+
+    if (ctx.om.cancelOrder(paired_id)) {
+        ctx.se.untrackOrder(paired_id);
+        ctx.se.incrementCancels(.market_making);
+        log.info("dry_run", "cancelled paired LP order after fill: filled={s} paired={s}", .{
+            filled_order_id,
+            paired_id,
+        });
+    } else {
+        log.warn("dry_run", "failed to cancel paired LP order after fill: filled={s} paired={s}", .{
+            filled_order_id,
+            paired_id,
+        });
+    }
+}
+
+fn isMarketMakingStrategy(strategy_name: []const u8) bool {
+    return std.mem.eql(u8, strategy_name, "market_making") or
+        std.mem.eql(u8, strategy_name, "liquidity_provision");
+}
+
+fn dryRunFeeBpsPerSide(strategy_name: []const u8) f64 {
+    if (isMarketMakingStrategy(strategy_name)) {
+        return 1.5; // HL maker fee bps per side for resting quotes.
+    }
+    return 4.5; // HL taker fee bps per side for taker-style simulations.
+}
+
+test "dry-run fee model uses maker fees for market making" {
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), dryRunFeeBpsPerSide("market_making"), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), dryRunFeeBpsPerSide("liquidity_provision"), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.5), dryRunFeeBpsPerSide("cex_dex_arb"), 1e-9);
+}
+
 /// After dry-run fills settle, sum filled-order P&L and write a fresh balance
 /// snapshot. This makes /balance, the risk gate, and dynamic order-size
 /// limits all reflect simulated profitability so dry-run mirrors live exactly.
 fn updateDryRunBalance(ctx: *StrategyWorkerCtx) void {
-    const sql = "SELECT COALESCE(SUM(pnl), 0.0), COALESCE(SUM(fees), 0.0) FROM dry_run_orders WHERE status='filled';" ++ &[_:0]u8{};
+    const sql = "SELECT COALESCE(SUM(pnl), 0.0), COALESCE(SUM(fees), 0.0) FROM dry_run_orders WHERE status='filled' AND created_at >= ?;" ++ &[_:0]u8{};
     var stmt: ?*db.c.sqlite3_stmt = null;
     if (db.c.sqlite3_prepare_v2(ctx.database.handle, sql.ptr, -1, &stmt, null) != db.c.SQLITE_OK) return;
     defer _ = db.c.sqlite3_finalize(stmt);
+    if (db.c.sqlite3_bind_int64(stmt, 1, ctx.dry_run_session_start) != db.c.SQLITE_OK) return;
     if (db.c.sqlite3_step(stmt) != db.c.SQLITE_ROW) return;
 
     const cumulative_pnl = db.c.sqlite3_column_double(stmt, 0);
@@ -1427,8 +1483,11 @@ fn dispatchLpPair(ctx: *StrategyWorkerCtx, buy_signal: strategy.Signal, sell_sig
 /// Emits exactly one IPC event on transition into saturation, and one on
 /// transition back out — never per-signal.
 fn checkSaturation(ctx: *StrategyWorkerCtx) bool {
-    const open_count = ctx.database.queryOpenOrderCount() catch 0;
     const cfg = &ctx.om.risk_config;
+    const open_count = (if (cfg.dry_run_enabled)
+        ctx.database.queryOpenDryRunOrderCount()
+    else
+        ctx.database.queryOpenOrderCount()) catch 0;
 
     // Resolve current USDC balance (may be null if no recent snapshot).
     const max_age = cfg.balance_snapshot_max_age_seconds;
@@ -1453,7 +1512,10 @@ fn checkSaturation(ctx: *StrategyWorkerCtx) bool {
         // Also treat the 70% balance-commitment ratio as a saturation
         // condition. The risk gate would reject these too, but checking
         // up-front avoids spamming risk_events / event_risk_rejection.
-        const exposure = ctx.database.queryOpenExposureUsd() catch 0.0;
+        const exposure = (if (cfg.dry_run_enabled)
+            ctx.database.queryOpenDryRunExposureUsd()
+        else
+            ctx.database.queryOpenExposureUsd()) catch 0.0;
         if (balance_opt) |bal| {
             if (bal > 0) {
                 balance_limit = bal * cfg.max_balance_commitment_ratio;
@@ -1547,6 +1609,11 @@ fn persistStrategyStats(ctx: *StrategyWorkerCtx) void {
 }
 
 fn persistBalanceSnapshot(ctx: *StrategyWorkerCtx) void {
+    if (ctx.dry_run) {
+        updateDryRunBalance(ctx);
+        return;
+    }
+
     const snap = ctx.pt.getSnapshot();
     ctx.database.insertBalanceSnapshot(
         snap.usdc_balance,
