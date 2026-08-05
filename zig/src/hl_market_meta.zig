@@ -38,6 +38,7 @@ pub const FetchError = error{
 pub const AssetMeta = struct {
     allocator: std.mem.Allocator,
     api_base: []const u8,
+    http_client: http.HttpClient,
     mu: std.Thread.Mutex,
     assets: std.ArrayList(Asset),
     last_refresh_unix: std.atomic.Value(i64),
@@ -49,6 +50,7 @@ pub const AssetMeta = struct {
         return .{
             .allocator = allocator,
             .api_base = api_base,
+            .http_client = http.HttpClient.init(allocator),
             .mu = .{},
             .assets = .empty,
             .last_refresh_unix = std.atomic.Value(i64).init(0),
@@ -59,6 +61,7 @@ pub const AssetMeta = struct {
     }
 
     pub fn deinit(self: *AssetMeta) void {
+        self.http_client.deinit();
         self.assets.deinit(self.allocator);
     }
 
@@ -109,10 +112,7 @@ pub const AssetMeta = struct {
 
         var attempt: u32 = 0;
         while (attempt < 3) : (attempt += 1) {
-            var client = http.HttpClient.init(self.allocator);
-            defer client.deinit();
-
-            var response = client.postJson(url, body) catch |e| {
+            var response = self.http_client.postJson(url, body) catch |e| {
                 log.warn("hl_meta", "fetch attempt {d}/3 http err: {s}", .{ attempt + 1, @errorName(e) });
                 if (attempt + 1 < 3) std.Thread.sleep(2 * std.time.ns_per_s);
                 continue;

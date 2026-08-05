@@ -83,6 +83,7 @@ pub const FundingRate = struct {
 pub const HlPortfolioTracker = struct {
     allocator: std.mem.Allocator,
     database: *db_mod.DB,
+    http_client: http.HttpClient,
     snapshot: HlSnapshot,
     funding_rates: [MAX_FUNDING_RATES]FundingRate,
     funding_count: usize,
@@ -95,6 +96,7 @@ pub const HlPortfolioTracker = struct {
         return .{
             .allocator = allocator,
             .database = database,
+            .http_client = http.HttpClient.init(allocator),
             .snapshot = emptySnapshot(),
             .funding_rates = undefined,
             .funding_count = 0,
@@ -102,6 +104,10 @@ pub const HlPortfolioTracker = struct {
             .should_stop = std.atomic.Value(bool).init(false),
             .stale = std.atomic.Value(bool).init(false),
         };
+    }
+
+    pub fn deinit(self: *HlPortfolioTracker) void {
+        self.http_client.deinit();
     }
 
     pub fn stop(self: *HlPortfolioTracker) void {
@@ -195,10 +201,7 @@ pub const HlPortfolioTracker = struct {
             .{user},
         ) catch return error.HttpFailed;
 
-        var client = http.HttpClient.init(self.allocator);
-        defer client.deinit();
-
-        var response = client.postJson(url, body) catch |e| {
+        var response = self.http_client.postJson(url, body) catch |e| {
             log.warn("hl_portfolio", "clearinghouseState http failed: {s}", .{@errorName(e)});
             return error.HttpFailed;
         };
@@ -223,10 +226,7 @@ pub const HlPortfolioTracker = struct {
         var url_buf: [256]u8 = undefined;
         const url = std.fmt.bufPrint(&url_buf, "{s}/info", .{api_base}) catch return error.HttpFailed;
 
-        var client = http.HttpClient.init(self.allocator);
-        defer client.deinit();
-
-        var response = client.postJson(url, "{\"type\":\"predictedFundings\"}") catch |e| {
+        var response = self.http_client.postJson(url, "{\"type\":\"predictedFundings\"}") catch |e| {
             log.warn("hl_portfolio", "predictedFundings http failed: {s}", .{@errorName(e)});
             return error.HttpFailed;
         };

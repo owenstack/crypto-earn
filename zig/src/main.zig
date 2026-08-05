@@ -178,6 +178,7 @@ pub fn main() !void {
 
     // Initialize portfolio tracker
     var pt = portfolio.PortfolioTracker.init(allocator, &database, .{});
+    defer pt.deinit();
     log.info("engine", "portfolio tracker ready", .{});
 
     // Phase 5: live HL equity/margin polling. This feeds `/portfolio` with

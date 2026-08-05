@@ -88,6 +88,10 @@ pub const PortfolioTracker = struct {
         self.hl_tracker.stop();
     }
 
+    pub fn deinit(self: *PortfolioTracker) void {
+        self.hl_tracker.deinit();
+    }
+
     /// Phase 5 HL portfolio polling loop. Keeps the new HL snapshot fresh for
     /// IPC while the legacy fields remain available for risk/strategy code.
     pub fn hlPollingLoop(self: *PortfolioTracker, api_base: []const u8, user: []const u8) void {
@@ -160,8 +164,14 @@ pub const PortfolioTracker = struct {
                     setPositionSide(pos, fill_side);
                 }
             } else {
-                pos.size = @max(pos.size - fill_size, 0.0);
-                if (pos.size == 0.0) {
+                if (fill_size > pos.size) {
+                    pos.size = fill_size - pos.size;
+                    pos.entry_price = fill_price;
+                    setPositionSide(pos, fill_side);
+                } else {
+                    pos.size -= fill_size;
+                }
+                if (pos.size <= 0.0) {
                     pos.side = [_]u8{0} ** 8;
                     pos.side_len = 0;
                     pos.entry_price = 0.0;

@@ -38,6 +38,11 @@ function pnlColor(val: string | number | undefined | null): string {
 // Polling hook
 // ---------------------------------------------------------------------------
 
+function dashboardToken(): string {
+  if (typeof window === "undefined") return "";
+  return window.localStorage.getItem("dashboard_token") ?? "";
+}
+
 function useApi<T>(path: string, intervalMs = 2000) {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -46,7 +51,8 @@ function useApi<T>(path: string, intervalMs = 2000) {
     let mounted = true;
     const fetcher = async () => {
       try {
-        const res = await fetch(path);
+        const token = dashboardToken();
+        const res = await fetch(path, token ? { headers: { Authorization: `Bearer ${token}` } } : undefined);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const json = await res.json();
         if (mounted) {
@@ -184,6 +190,17 @@ function levelBadge(level: string) {
 // ---------------------------------------------------------------------------
 
 export function Dashboard() {
+  const [token, setToken] = useState("");
+
+  useEffect(() => {
+    setToken(dashboardToken());
+  }, []);
+
+  const updateToken = (value: string) => {
+    setToken(value);
+    if (typeof window !== "undefined") window.localStorage.setItem("dashboard_token", value);
+  };
+
   const { data: status } = useApi<StatusData>("/api/status", 2000);
   const { data: portfolio } = useApi<PortfolioData>("/api/portfolio", 2000);
   const { data: orders } = useApi<OrdersData>("/api/orders", 2000);
@@ -226,6 +243,18 @@ export function Dashboard() {
     <div className="container mx-auto p-6 space-y-6">
       {/* Header */}
       <h1 className="text-3xl font-bold tracking-tight">CEX Engine Dashboard</h1>
+      <div className="flex items-center gap-2 text-sm">
+        <label htmlFor="dashboard-token" className="text-muted-foreground">Dashboard token</label>
+        <input
+          id="dashboard-token"
+          type="password"
+          value={token}
+          onChange={(e) => updateToken(e.target.value)}
+          placeholder="Paste DASHBOARD_SECRET"
+          className="rounded border bg-background px-2 py-1"
+          autoComplete="off"
+        />
+      </div>
 
       {/* FR-64: KPI Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
