@@ -110,6 +110,26 @@ test "migration 013: schema_migrations records version 13" {
     try testing.expectEqual(db.c.SQLITE_ROW, db.c.sqlite3_step(stmt));
 }
 
+test "migration 016: dry-run orders have millisecond lifecycle timestamps" {
+    var database = try db.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    try testing.expect(migration013HasColumn(&database, "dry_run_orders", "submitted_at_ms"));
+    try testing.expect(migration013HasColumn(&database, "dry_run_orders", "fill_ts_ms"));
+
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expectEqual(db.c.SQLITE_OK, db.c.sqlite3_prepare_v2(
+        database.handle,
+        "SELECT 1 FROM schema_migrations WHERE version=16;",
+        -1,
+        &stmt,
+        null,
+    ));
+    defer _ = db.c.sqlite3_finalize(stmt);
+    try testing.expectEqual(db.c.SQLITE_ROW, db.c.sqlite3_step(stmt));
+}
+
 // ─── Phase 7: migration 014 schema verification ─────────────────────────────
 
 test "migration 014: markets table dropped Polymarket columns" {
@@ -1800,6 +1820,15 @@ test "db: analyzeDryRunSignals reports paper trade metrics" {
     try database.insertDryRunSignal("m2", "liquidity_provision", "sell", 0.62, 10.0, 0.05, 0.70, 240, 0.61, 0.63);
     try database.insertDryRunSignal("m2", "liquidity_provision", "sell", 0.67, 10.0, 0.03, 0.65, 500, 0.61, 0.73);
 
+    // The paper report uses orders settled by the live dry-run simulator,
+    // rather than trying to infer fills from sparse strategy-signal rows.
+    try database.insertDryRunOrderAt("dry-win", "m1", "news_repricing", "buy", 0.50, 10.0, 100_100);
+    try database.settleDryRunOrderAt("dry-win", "filled", 0.49, 0.60, 0.00147, 110_125);
+    try database.insertDryRunOrderAt("dry-loss", "m2", "liquidity_provision", "sell", 0.60, 10.0, 200_200);
+    try database.settleDryRunOrderAt("dry-loss", "filled", 0.61, -0.20, 0.00549, 230_250);
+    try database.insertDryRunOrder("dry-expired", "m1", "news_repricing", "buy", 0.45, 10.0);
+    try database.updateDryRunOrderStatus("dry-expired", "expired");
+
     var buf: [4096]u8 = undefined;
     const json = try database.analyzeDryRunSignals(&buf);
 
@@ -1810,14 +1839,39 @@ test "db: analyzeDryRunSignals reports paper trade metrics" {
     const obj = parsed.value.object;
 
     try testing.expectEqual(@as(i64, 6), obj.get("total_signals").?.integer);
+    try testing.expectEqual(@as(i64, 3), obj.get("paper_submitted_orders").?.integer);
     try testing.expectEqual(@as(i64, 2), obj.get("paper_filled_trades").?.integer);
-    try testing.expectEqual(@as(i64, 4), obj.get("paper_unfilled_signals").?.integer);
+    try testing.expectEqual(@as(i64, 1), obj.get("paper_unfilled_signals").?.integer);
     try testing.expectEqual(@as(i64, 1), obj.get("paper_winning_trades").?.integer);
     try testing.expectEqual(@as(i64, 1), obj.get("paper_losing_trades").?.integer);
-    try testing.expect(obj.get("paper_fill_rate_pct").?.float > 30.0);
+    try testing.expect(obj.get("paper_fill_rate_pct").?.float > 60.0);
     try testing.expect(obj.get("paper_win_rate_pct").?.float > 40.0);
-    try testing.expect(obj.get("paper_net_pnl").?.float > 0.4);
-    try testing.expect(obj.get("paper_max_drawdown").?.float > 0.5);
+    try testing.expect(obj.get("paper_net_pnl").?.float > 0.39);
+    try testing.expectApproxEqAbs(@as(f64, 0.1333), obj.get("paper_expectancy_per_order").?.float, 0.0001);
+    try testing.expectApproxEqAbs(@as(f64, 3.16), obj.get("paper_fee_bps_per_side").?.float, 0.01);
+    try testing.expectApproxEqAbs(@as(f64, 0.0), obj.get("paper_avg_hold_seconds").?.float, 0.01);
+    try testing.expectApproxEqAbs(@as(f64, 20.0375), obj.get("paper_avg_fill_latency_seconds").?.float, 0.1);
+    try testing.expect(obj.get("paper_max_drawdown").?.float >= 0.2);
+    try testing.expectEqualStrings("paper_viable", obj.get("diagnosis").?.string);
+}
+
+test "db: dry-run expectancy includes manual orders in its denominator" {
+    var database = try openTempDb();
+    defer database.close();
+    try database.runMigrations();
+
+    try database.insertDryRunOrderAt("dry-manual", "m1", "manual", "buy", 1.0, 1.0, 1_000);
+    try database.settleDryRunOrderAt("dry-manual", "filled", 1.0, 0.25, 0.0, 1_010);
+
+    var buf: [4096]u8 = undefined;
+    const json = try database.analyzeDryRunSignals(&buf);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    try testing.expectEqual(@as(i64, 0), obj.get("total_signals").?.integer);
+    try testing.expectEqual(@as(i64, 1), obj.get("paper_submitted_orders").?.integer);
+    try testing.expectApproxEqAbs(@as(f64, 0.25), obj.get("paper_expectancy_per_order").?.float, 0.0001);
     try testing.expectEqualStrings("paper_viable", obj.get("diagnosis").?.string);
 }
 

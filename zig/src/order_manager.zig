@@ -419,7 +419,7 @@ pub const OrderManager = struct {
             .order_type = order_type,
         }, .{}) catch |e| {
             log.err("order_mgr", "failed to serialize order placed event: {s}", .{@errorName(e)});
-                const order_id_owned = self.allocator.dupe(u8, order_id) catch {
+            const order_id_owned = self.allocator.dupe(u8, order_id) catch {
                 log.err("order_mgr", "failed to allocate order_id result", .{});
                 return .{ .failed = .{ .reason = "oom" } };
             };
@@ -827,6 +827,7 @@ pub const OrderManager = struct {
         order_type: []const u8,
         strategy_origin: ?[]const u8,
     ) OrderResult {
+        const submit_ts_ms = std.time.milliTimestamp();
         const submit_ts_ns = std.time.nanoTimestamp();
 
         // Synthetic order id: `dry-<ms>-<rand>`. The `dry-` prefix is the
@@ -851,13 +852,14 @@ pub const OrderManager = struct {
 
         const strategy_name: []const u8 = strategy_origin orelse "manual";
 
-        self.database.insertDryRunOrder(
+        self.database.insertDryRunOrderAt(
             dry_id,
             market_id,
             strategy_name,
             side,
             price_f64,
             size_f64,
+            submit_ts_ms,
         ) catch |e| {
             log.err("order_mgr", "dry-run insert failed for {s}: {s}", .{ dry_id, @errorName(e) });
             return .{ .failed = .{ .reason = "db_error" } };
@@ -1018,7 +1020,7 @@ pub const OrderManager = struct {
 
         var url_buf: [256]u8 = undefined;
         const url = std.fmt.bufPrint(&url_buf, "{s}/exchange", .{self.config.hl.api_base}) catch {
-                log.err("order_mgr", "failed to format HL url", .{});
+            log.err("order_mgr", "failed to format HL url", .{});
             return .{ .ok = false };
         };
 

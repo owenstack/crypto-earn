@@ -389,17 +389,18 @@ export function createBot(ipc: IPCClient): Bot {
       "```\n" +
       `Total Signals:    ${p.total_signals ?? 0}\n` +
       `Persistent:       ${p.persistent_signals ?? 0} (${fmtMetric(p.persistence_pct, 1)}%)\n` +
+      `Paper Orders:     ${p.paper_submitted_orders ?? 0} submitted\n` +
       `Paper Trades:     ${p.paper_filled_trades ?? 0} filled\n` +
-      `Missed Fills:     ${p.paper_unfilled_signals ?? 0}\n` +
+      `Not Filled:       ${p.paper_unfilled_signals ?? 0}\n` +
       `Fill Rate:        ${fmtMetric(p.paper_fill_rate_pct, 1)}%\n` +
       `Wins / Losses:    ${p.paper_winning_trades ?? 0} / ${p.paper_losing_trades ?? 0}\n` +
       `Win Rate:         ${fmtMetric(p.paper_win_rate_pct, 1)}%\n` +
       `Net P&L:          $${fmtMetric(p.paper_net_pnl, 4)}\n` +
       `Avg per Trade:    $${fmtMetric(p.paper_avg_pnl_per_trade, 4)}\n` +
-      `Expectancy/Sig:   $${fmtMetric(p.paper_expectancy_per_signal, 4)}\n` +
+      `Expectancy/Order: $${fmtMetric(p.paper_expectancy_per_order, 4)}\n` +
       `Profit Factor:    ${fmtMetric(p.paper_profit_factor, 2)}\n` +
       `Max Drawdown:     $${fmtMetric(p.paper_max_drawdown, 4)}\n` +
-      `Avg Hold:         ${fmtMetric(p.paper_avg_hold_seconds, 0)}s\n` +
+      `Avg Fill Latency: ${fmtMetric(p.paper_avg_fill_latency_seconds, 3)}s\n` +
       "```",
       { parse_mode: "Markdown" }
     );

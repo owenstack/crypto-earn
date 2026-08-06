@@ -500,6 +500,7 @@ export interface DryRunAnalysisResponsePayload {
   paper_entry_lookahead_seconds: number;
   paper_max_hold_seconds: number;
   paper_fee_bps_per_side: number;
+  paper_submitted_orders: number;
   paper_filled_trades: number;
   paper_unfilled_signals: number;
   paper_fill_rate_pct: number;
@@ -508,10 +509,11 @@ export interface DryRunAnalysisResponsePayload {
   paper_win_rate_pct: number;
   paper_net_pnl: number;
   paper_avg_pnl_per_trade: number;
-  paper_expectancy_per_signal: number;
+  paper_expectancy_per_order: number;
   paper_profit_factor: number;
   paper_max_drawdown: number;
   paper_avg_hold_seconds: number;
+  paper_avg_fill_latency_seconds: number;
   paper_fallback_exit_marks: number;
   diagnosis: "no_data" | "no_fills_detected" | "paper_loss" | "fill_rate_too_low" | "paper_viable";
 }

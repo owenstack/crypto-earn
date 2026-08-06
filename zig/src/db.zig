@@ -201,6 +201,13 @@ const MIGRATION_015 =
     \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(15);
 ;
 
+/// Embedded migration: millisecond dry-run order lifecycle timestamps.
+const MIGRATION_016 =
+    \\ALTER TABLE dry_run_orders ADD COLUMN submitted_at_ms INTEGER DEFAULT NULL;
+    \\ALTER TABLE dry_run_orders ADD COLUMN fill_ts_ms INTEGER DEFAULT NULL;
+    \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(16);
+;
+
 /// Embedded Phase-3 migration: HL market metadata + Binance feed persistence.
 /// ALTER TABLE on markets/orderbooks runs separately (column-exists checks).
 /// orderbooks is created here when missing (legacy code constructed it at
@@ -596,6 +603,26 @@ pub const DB = struct {
             };
             try self.execZ("CREATE INDEX IF NOT EXISTS idx_orders_exchange_order_id ON orders(exchange_order_id);" ++ &[_:0]u8{});
             try self.execZ("INSERT OR IGNORE INTO schema_migrations(version)VALUES(15);" ++ &[_:0]u8{});
+        }
+        if (!self.migrationApplied(16)) {
+            log.info("db", "applying migration 016", .{});
+            const m016_alters = [_][:0]const u8{
+                "ALTER TABLE dry_run_orders ADD COLUMN submitted_at_ms INTEGER DEFAULT NULL;",
+                "ALTER TABLE dry_run_orders ADD COLUMN fill_ts_ms INTEGER DEFAULT NULL;",
+            };
+            for (m016_alters) |sql| {
+                self.execZ(sql) catch |err| {
+                    const sqlite_err = std.mem.span(c.sqlite3_errmsg(self.handle));
+                    const duplicate_col = std.mem.indexOf(u8, sqlite_err, "duplicate column name") != null;
+                    if (err == error.DBExecFailed and duplicate_col) {
+                        log.info("db", "migration 016: column already exists; skipping ALTER TABLE", .{});
+                        continue;
+                    }
+                    log.err("db", "migration 016 ALTER TABLE failed: zig_err={s} sqlite_err={s}", .{ @errorName(err), sqlite_err });
+                    return err;
+                };
+            }
+            try self.execZ("INSERT OR IGNORE INTO schema_migrations(version)VALUES(16);" ++ &[_:0]u8{});
         }
         log.info("db", "migrations complete", .{});
     }
@@ -1579,6 +1606,7 @@ pub const DB = struct {
 
     const DryRunPaperMetrics = struct {
         considered_signals: i64 = 0,
+        submitted_orders: i64 = 0,
         filled_trades: i64 = 0,
         unfilled_signals: i64 = 0,
         fallback_exit_marks: i64 = 0,
@@ -1589,6 +1617,8 @@ pub const DB = struct {
         gross_loss: f64 = 0.0,
         max_drawdown: f64 = 0.0,
         avg_hold_seconds: f64 = 0.0,
+        avg_fill_latency_seconds: f64 = 0.0,
+        fee_bps_per_side: f64 = 0.0,
     };
 
     const DryRunSignalRow = struct {
@@ -1612,8 +1642,10 @@ pub const DB = struct {
     const DRY_RUN_MAX_HOLD_SECONDS: i64 = 30 * 60;
     const DRY_RUN_FEE_BPS_PER_SIDE: f64 = 2.0;
 
-    /// Analyze dry-run signals: persistence rate, coarse mark-to-market P&L,
-    /// and a conservative paper-trading simulation.
+    /// Analyze dry-run signals and the authoritative simulated-order lifecycle.
+    /// Signal rows provide persistence and coarse mark-to-market estimates;
+    /// fills and realized paper P&L come from dry_run_orders, which is settled
+    /// against the live orderbook by the strategy worker.
     /// Writes a JSON report to the provided buffer.
     /// Persistence check: a signal is "persistent" if another signal for the same
     /// market+direction exists >= 15 seconds after it.
@@ -1705,7 +1737,7 @@ pub const DB = struct {
             }
         }
 
-        const paper = try self.simulateDryRunPaperTrades(signals.items, markets.items, &market_to_index);
+        const paper = try self.queryDryRunOrderMetrics();
 
         const persistence_pct: f64 = if (total > 0) @as(f64, @floatFromInt(persistent)) / @as(f64, @floatFromInt(total)) * 100.0 else 0.0;
         const paper_fill_rate_pct: f64 = if (paper.considered_signals > 0)
@@ -1720,8 +1752,8 @@ pub const DB = struct {
             paper.net_pnl / @as(f64, @floatFromInt(paper.filled_trades))
         else
             0.0;
-        const paper_expectancy_per_signal: f64 = if (paper.considered_signals > 0)
-            paper.net_pnl / @as(f64, @floatFromInt(paper.considered_signals))
+        const paper_expectancy_per_order: f64 = if (paper.submitted_orders > 0)
+            paper.net_pnl / @as(f64, @floatFromInt(paper.submitted_orders))
         else
             0.0;
         const paper_profit_factor: f64 = if (paper.gross_loss > 0.0)
@@ -1731,16 +1763,16 @@ pub const DB = struct {
         else
             0.0;
         const diagnosis =
-            if (total == 0) "no_data" else if (paper.filled_trades == 0) "no_fills_detected" else if (paper.net_pnl <= 0.0) "paper_loss" else if (paper_fill_rate_pct < 10.0) "fill_rate_too_low" else "paper_viable";
+            if (paper.submitted_orders == 0) "no_data" else if (paper.filled_trades == 0) "no_fills_detected" else if (paper.net_pnl <= 0.0) "paper_loss" else if (paper_fill_rate_pct < 10.0) "fill_rate_too_low" else "paper_viable";
 
         try writer.print(
             "{{\"total_signals\":{d},\"persistent_signals\":{d},\"persistence_pct\":{d:.1}," ++
                 "\"optimistic_pnl\":{d:.4},\"pessimistic_pnl\":{d:.4}," ++
                 "\"paper_entry_lookahead_seconds\":{d},\"paper_max_hold_seconds\":{d},\"paper_fee_bps_per_side\":{d:.2}," ++
-                "\"paper_filled_trades\":{d},\"paper_unfilled_signals\":{d},\"paper_fill_rate_pct\":{d:.1}," ++
+                "\"paper_submitted_orders\":{d},\"paper_filled_trades\":{d},\"paper_unfilled_signals\":{d},\"paper_fill_rate_pct\":{d:.1}," ++
                 "\"paper_winning_trades\":{d},\"paper_losing_trades\":{d},\"paper_win_rate_pct\":{d:.1}," ++
-                "\"paper_net_pnl\":{d:.4},\"paper_avg_pnl_per_trade\":{d:.4},\"paper_expectancy_per_signal\":{d:.4}," ++
-                "\"paper_profit_factor\":{d:.4},\"paper_max_drawdown\":{d:.4},\"paper_avg_hold_seconds\":{d:.1}," ++
+                "\"paper_net_pnl\":{d:.4},\"paper_avg_pnl_per_trade\":{d:.4},\"paper_expectancy_per_order\":{d:.4}," ++
+                "\"paper_profit_factor\":{d:.4},\"paper_max_drawdown\":{d:.4},\"paper_avg_hold_seconds\":{d:.1},\"paper_avg_fill_latency_seconds\":{d:.3}," ++
                 "\"paper_fallback_exit_marks\":{d},\"diagnosis\":\"{s}\"}}",
             .{
                 total,
@@ -1750,7 +1782,8 @@ pub const DB = struct {
                 pessimistic_pnl,
                 DRY_RUN_ENTRY_LOOKAHEAD_SECONDS,
                 DRY_RUN_MAX_HOLD_SECONDS,
-                DRY_RUN_FEE_BPS_PER_SIDE,
+                paper.fee_bps_per_side,
+                paper.submitted_orders,
                 paper.filled_trades,
                 paper.unfilled_signals,
                 paper_fill_rate_pct,
@@ -1759,15 +1792,87 @@ pub const DB = struct {
                 paper_win_rate_pct,
                 paper.net_pnl,
                 paper_avg_pnl_per_trade,
-                paper_expectancy_per_signal,
+                paper_expectancy_per_order,
                 paper_profit_factor,
                 paper.max_drawdown,
                 paper.avg_hold_seconds,
+                paper.avg_fill_latency_seconds,
                 paper.fallback_exit_marks,
                 diagnosis,
             },
         );
         return fbs.getWritten();
+    }
+
+    fn queryDryRunOrderMetrics(self: DB) !DryRunPaperMetrics {
+        const sql =
+            \\SELECT status, COALESCE(pnl, 0.0),
+            \\       COALESCE(submitted_at_ms, created_at * 1000),
+            \\       COALESCE(fill_ts_ms, fill_ts * 1000, updated_at * 1000),
+            \\       COALESCE(fill_price, 0.0), size, COALESCE(fees, 0.0)
+            \\FROM dry_run_orders
+            \\ORDER BY COALESCE(fill_ts_ms, fill_ts * 1000, updated_at * 1000) ASC,
+            \\         COALESCE(submitted_at_ms, created_at * 1000) ASC, id ASC;
+        ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        var metrics = DryRunPaperMetrics{};
+        var equity: f64 = 0.0;
+        var peak_equity: f64 = 0.0;
+        var total_fill_latency_seconds: f64 = 0.0;
+        var total_filled_notional: f64 = 0.0;
+        var total_fees: f64 = 0.0;
+
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            metrics.submitted_orders += 1;
+            metrics.considered_signals += 1;
+
+            const status_raw = c.sqlite3_column_text(stmt, 0) orelse {
+                metrics.unfilled_signals += 1;
+                continue;
+            };
+            const status = std.mem.span(@as([*c]const u8, @ptrCast(status_raw)));
+            if (!std.mem.eql(u8, status, "filled")) {
+                metrics.unfilled_signals += 1;
+                continue;
+            }
+
+            const pnl = c.sqlite3_column_double(stmt, 1);
+            const submitted_at_ms = c.sqlite3_column_int64(stmt, 2);
+            const fill_ts_ms = c.sqlite3_column_int64(stmt, 3);
+            const fill_price = c.sqlite3_column_double(stmt, 4);
+            const size = c.sqlite3_column_double(stmt, 5);
+            const fees = c.sqlite3_column_double(stmt, 6);
+            metrics.filled_trades += 1;
+            const fill_latency_ms = @max(@as(i64, 0), fill_ts_ms - submitted_at_ms);
+            total_fill_latency_seconds += @as(f64, @floatFromInt(fill_latency_ms)) / 1000.0;
+            total_filled_notional += fill_price * size;
+            total_fees += fees;
+            metrics.net_pnl += pnl;
+
+            if (pnl >= 0.0) {
+                metrics.winning_trades += 1;
+                metrics.gross_profit += pnl;
+            } else {
+                metrics.losing_trades += 1;
+                metrics.gross_loss += @abs(pnl);
+            }
+
+            equity += pnl;
+            if (equity > peak_equity) peak_equity = equity;
+            const drawdown = peak_equity - equity;
+            if (drawdown > metrics.max_drawdown) metrics.max_drawdown = drawdown;
+        }
+
+        if (metrics.filled_trades > 0) {
+            metrics.avg_fill_latency_seconds = total_fill_latency_seconds / @as(f64, @floatFromInt(metrics.filled_trades));
+        }
+        if (total_filled_notional > 0.0) {
+            metrics.fee_bps_per_side = total_fees / (total_filled_notional * 2.0) * 10000.0;
+        }
+        return metrics;
     }
 
     fn simulateDryRunPaperTrades(
@@ -2053,9 +2158,22 @@ pub const DB = struct {
         signal_price: f64,
         size: f64,
     ) !void {
+        return self.insertDryRunOrderAt(id, market_id, strategy_name, direction, signal_price, size, std.time.milliTimestamp());
+    }
+
+    pub fn insertDryRunOrderAt(
+        self: DB,
+        id: []const u8,
+        market_id: []const u8,
+        strategy_name: []const u8,
+        direction: []const u8,
+        signal_price: f64,
+        size: f64,
+        submitted_at_ms: i64,
+    ) !void {
         const sql =
-            "INSERT INTO dry_run_orders(id,market_id,strategy,direction,signal_price,size) " ++
-            "VALUES(?,?,?,?,?,?);" ++ &[_:0]u8{};
+            "INSERT INTO dry_run_orders(id,market_id,strategy,direction,signal_price,size,submitted_at_ms) " ++
+            "VALUES(?,?,?,?,?,?,?);" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -2065,7 +2183,8 @@ pub const DB = struct {
             c.sqlite3_bind_text(stmt, 3, strategy_name.ptr, @intCast(strategy_name.len), null) != c.SQLITE_OK or
             c.sqlite3_bind_text(stmt, 4, direction.ptr, @intCast(direction.len), null) != c.SQLITE_OK or
             c.sqlite3_bind_double(stmt, 5, signal_price) != c.SQLITE_OK or
-            c.sqlite3_bind_double(stmt, 6, size) != c.SQLITE_OK)
+            c.sqlite3_bind_double(stmt, 6, size) != c.SQLITE_OK or
+            c.sqlite3_bind_int64(stmt, 7, submitted_at_ms) != c.SQLITE_OK)
         {
             return error.DBExecFailed;
         }
@@ -2103,17 +2222,30 @@ pub const DB = struct {
         pnl: f64,
         fees: f64,
     ) !void {
+        return self.settleDryRunOrderAt(id, status, fill_price, pnl, fees, std.time.milliTimestamp());
+    }
+
+    pub fn settleDryRunOrderAt(
+        self: DB,
+        id: []const u8,
+        status: []const u8,
+        fill_price: f64,
+        pnl: f64,
+        fees: f64,
+        fill_ts_ms: i64,
+    ) !void {
         const sql =
-            "UPDATE dry_run_orders SET status=?,fill_price=?,fill_ts=unixepoch(),pnl=?,fees=?,updated_at=unixepoch() WHERE id=?;" ++ &[_:0]u8{};
+            "UPDATE dry_run_orders SET status=?,fill_price=?,fill_ts=unixepoch(),fill_ts_ms=?,pnl=?,fees=?,updated_at=unixepoch() WHERE id=?;" ++ &[_:0]u8{};
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return error.DBExecFailed;
         defer _ = c.sqlite3_finalize(stmt);
 
         if (c.sqlite3_bind_text(stmt, 1, status.ptr, @intCast(status.len), null) != c.SQLITE_OK or
             c.sqlite3_bind_double(stmt, 2, fill_price) != c.SQLITE_OK or
-            c.sqlite3_bind_double(stmt, 3, pnl) != c.SQLITE_OK or
-            c.sqlite3_bind_double(stmt, 4, fees) != c.SQLITE_OK or
-            c.sqlite3_bind_text(stmt, 5, id.ptr, @intCast(id.len), null) != c.SQLITE_OK)
+            c.sqlite3_bind_int64(stmt, 3, fill_ts_ms) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 4, pnl) != c.SQLITE_OK or
+            c.sqlite3_bind_double(stmt, 5, fees) != c.SQLITE_OK or
+            c.sqlite3_bind_text(stmt, 6, id.ptr, @intCast(id.len), null) != c.SQLITE_OK)
         {
             return error.DBExecFailed;
         }

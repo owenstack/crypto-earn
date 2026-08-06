@@ -37,8 +37,12 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Finder (MacOS) folder config
 .DS_Store
 
-#sqlite
+# SQLite databases and sidecar files
 *.db
-*.db-journal
-*.db-shm
-*.db-wal
+*.db3
+*.sqlite
+*.sqlite3
+*.db-*
+*.db3-*
+*.sqlite-*
+*.sqlite3-*
