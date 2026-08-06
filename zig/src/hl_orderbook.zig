@@ -303,7 +303,19 @@ pub const Orderbook = struct {
         log.info("hl_ob", "subscribed to {d} HL l2Book channels", .{self.n_entries});
 
         try client.readTimeout(5_000);
+        const app_ping = "{\"method\":\"ping\"}";
+        var ping_buf: [32]u8 = undefined;
+        @memcpy(ping_buf[0..app_ping.len], app_ping);
+        try client.write(ping_buf[0..app_ping.len]);
+        var last_app_ping_ns: i128 = std.time.nanoTimestamp();
         while (!self.should_stop.load(.seq_cst)) {
+            const now_ns: i128 = std.time.nanoTimestamp();
+            if (now_ns - last_app_ping_ns >= 30 * std.time.ns_per_s) {
+                @memcpy(ping_buf[0..app_ping.len], app_ping);
+                try client.write(ping_buf[0..app_ping.len]);
+                last_app_ping_ns = now_ns;
+            }
+
             const message = client.read() catch |err| switch (err) {
                 // Zig 0.15 TLS surfaces socket read timeouts as ReadFailed
                 // here. An idle HL book is not a broken connection.
@@ -316,8 +328,12 @@ pub const Orderbook = struct {
 
             switch (message.type) {
                 .text, .binary => self.handleMessage(message.data),
-                .close => return,
-                .ping, .pong => {},
+                .close => {
+                    log.warn("hl_ob", "server close frame received (bytes={d})", .{message.data.len});
+                    return;
+                },
+                .ping => try client.writePong(message.data),
+                .pong => {},
             }
         }
     }

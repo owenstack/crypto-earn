@@ -219,7 +219,8 @@ pub const BinanceFeed = struct {
             switch (message.type) {
                 .text, .binary => self.handleMessage(message.data),
                 .close => return,
-                .ping, .pong => {},
+                .ping => try client.writePong(message.data),
+                .pong => {},
             }
         }
     }
