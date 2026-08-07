@@ -2320,17 +2320,32 @@ test "db: migration 008 adds lp_pair_order_id and net_position_usd columns" {
     try testing.expectEqual(@as(f64, 0.0), net_pos);
 }
 
-// -- TASK-4.5: lp_max_position_usd runtime config seed exists after migration 008
+// -- Phase 8: fixed-dollar LP cap removed in favor of balance-scaled sizing
 
-test "db: migration 008 seeds lp_max_position_usd in runtime_config" {
+test "db: migration 017 removes fixed LP cap and retains percentage sizing" {
     var database = try openTempDb();
     defer database.close();
     try database.runMigrations();
 
     var buf: [32]u8 = undefined;
     const val = database.getConfig("lp_max_position_usd", &buf);
-    try testing.expect(val != null);
-    try testing.expectEqualStrings("50.0", val.?);
+    try testing.expect(val == null);
+
+    var pct_buf: [32]u8 = undefined;
+    const pct = database.getConfig("lp_max_position_usd_pct", &pct_buf);
+    try testing.expect(pct != null);
+    try testing.expectEqualStrings("0.20", pct.?);
+
+    var stmt: ?*db.c.sqlite3_stmt = null;
+    try testing.expectEqual(db.c.SQLITE_OK, db.c.sqlite3_prepare_v2(
+        database.handle,
+        "SELECT 1 FROM schema_migrations WHERE version=17;",
+        -1,
+        &stmt,
+        null,
+    ));
+    defer _ = db.c.sqlite3_finalize(stmt);
+    try testing.expectEqual(db.c.SQLITE_ROW, db.c.sqlite3_step(stmt));
 }
 
 // ─── Phase 3: HL market data + Binance feed integration tests ───────────────

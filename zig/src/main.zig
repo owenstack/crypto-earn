@@ -179,6 +179,16 @@ pub fn main() !void {
     // Initialize portfolio tracker
     var pt = portfolio.PortfolioTracker.init(allocator, &database, .{});
     defer pt.deinit();
+    if (dry_run_env) {
+        // Seed and load paper equity before strategy sizing is resolved below.
+        // Otherwise lp_max_position_usd derives from the previous snapshot.
+        database.insertBalanceSnapshot(dry_run_initial_balance_env, 0.0, 0.0, 0.0) catch |e| {
+            log.warn("engine", "failed to seed dry-run initial balance: {s}", .{@errorName(e)});
+        };
+        pt.markBalanceDirty();
+        pt.syncFromDB();
+        log.info("engine", "dry-run initial balance: ${d:.2}", .{dry_run_initial_balance_env});
+    }
     log.info("engine", "portfolio tracker ready", .{});
 
     // Phase 5: live HL equity/margin polling. This feeds `/portfolio` with
@@ -454,21 +464,6 @@ pub fn main() !void {
     const dry_run_session_start = std.time.timestamp();
     if (dry_run) {
         log.info("engine", "DRY-RUN mode enabled -- no orders will be placed", .{});
-
-        // Seed initial simulated balance for dry-run profitability analysis
-        const dry_run_initial_balance = if (std.posix.getenv("DRY_RUN_INITIAL_BALANCE")) |v|
-            std.fmt.parseFloat(f64, v) catch 10.0
-        else
-            10.0; // Default $10
-
-        // Insert initial balance snapshot so risk gate and P&L calculations work
-        database.insertBalanceSnapshot(dry_run_initial_balance, 0.0, 0.0, 0.0) catch |e| {
-            log.warn("engine", "failed to seed dry-run initial balance: {s}", .{@errorName(e)});
-        };
-        // Re-sync portfolio tracker so in-memory usdc_balance reflects the
-        // freshly-seeded snapshot (init ran earlier when no snapshot existed).
-        pt.syncFromDB();
-        log.info("engine", "dry-run initial balance: ${d:.2}", .{dry_run_initial_balance});
     }
 
     // USDC balance refresh ticker removed in Phase 1 (Polymarket-specific).

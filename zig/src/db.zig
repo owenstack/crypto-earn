@@ -208,6 +208,12 @@ const MIGRATION_016 =
     \\INSERT OR IGNORE INTO schema_migrations(version)VALUES(16);
 ;
 
+/// Remove the legacy fixed-dollar LP cap so sizing derives from balance.
+const MIGRATION_017 =
+    \\DELETE FROM runtime_config WHERE key = 'lp_max_position_usd';
+    \\INSERT OR IGNORE INTO schema_migrations(version) VALUES (17);
+;
+
 /// Embedded Phase-3 migration: HL market metadata + Binance feed persistence.
 /// ALTER TABLE on markets/orderbooks runs separately (column-exists checks).
 /// orderbooks is created here when missing (legacy code constructed it at
@@ -494,10 +500,6 @@ pub const DB = struct {
                     }
                 };
             }
-            // Seed default max_net_position_usd into runtime_config
-            self.execZ("INSERT OR IGNORE INTO runtime_config(key,value) VALUES('lp_max_position_usd','50.0');" ++ &[_:0]u8{}) catch |err| {
-                log.info("db", "migration 008: runtime_config seed skipped or failed: {s}", .{@errorName(err)});
-            };
             try self.execZ("INSERT OR IGNORE INTO schema_migrations(version)VALUES(8);");
         }
         if (!self.migrationApplied(9)) {
@@ -623,6 +625,10 @@ pub const DB = struct {
                 };
             }
             try self.execZ("INSERT OR IGNORE INTO schema_migrations(version)VALUES(16);" ++ &[_:0]u8{});
+        }
+        if (!self.migrationApplied(17)) {
+            log.info("db", "applying migration 017", .{});
+            try self.execZ(MIGRATION_017 ++ &[_:0]u8{});
         }
         log.info("db", "migrations complete", .{});
     }
