@@ -159,7 +159,9 @@ pub const Client = struct {
         try sendHandshake(path, key, buf, &opts, self._compression_opts != null, stream);
 
         const res = try HandShakeReply.read(buf, key, &opts, self._compression_opts != null, stream);
-        errdefer self.close(.{ .code = 1001 }) catch unreachable;
+        // A failed handshake can race with a peer-side close/reset. Cleanup
+        // must never turn that ordinary network failure into a safety panic.
+        errdefer self.close(.{ .code = 1001 }) catch {};
 
         // Set up compression with agreed-on parameters
         if (res.compression) {
@@ -201,7 +203,7 @@ pub const Client = struct {
             const message = self.read() catch |err| switch (err) {
                 error.Closed => return,
                 else => return err,
-            } orelse unreachable;
+            } orelse continue;
 
             const message_type = message.type;
             defer reader.done(message_type);
@@ -252,7 +254,10 @@ pub const Client = struct {
             // try to read a message from our buffer first, before trying to
             // get more data from the socket.
             const has_more, const message = reader.read() catch |err| {
-                self.close(.{ .code = 1002 }) catch unreachable;
+                // Protocol errors commonly coincide with a peer reset. Best-
+                // effort close is sufficient; the original parse error is
+                // returned to the caller so the feed can reconnect.
+                self.close(.{ .code = 1002 }) catch {};
                 return err;
             } orelse {
                 reader.fill(stream) catch |err| switch (err) {
@@ -262,7 +267,10 @@ pub const Client = struct {
                         return error.Closed;
                     },
                     else => {
-                        self.close(.{ .code = 1002 }) catch unreachable;
+                        // TLS/socket read failures can happen after the peer
+                        // has already closed the connection. Never assume a
+                        // close frame can be sent successfully here.
+                        self.close(.{ .code = 1002 }) catch {};
                         return err;
                     },
                 };

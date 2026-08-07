@@ -8,6 +8,8 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$REPO_ROOT" || exit 1
 set -a; . "$REPO_ROOT/.env"; set +a
 
+cycle_status=0
+
 HISTORY_FILE="${CEX_HEALTH_HISTORY:-$HOME/.cex-earn-health.jsonl}"
 DASH="http://localhost:${DASHBOARD_PORT:-3000}"
 AUTH=(-H "Authorization: Bearer $DASHBOARD_SECRET")
@@ -23,6 +25,10 @@ portfolio_http=$(curl -sS --max-time 5 -o /tmp/cex-portfolio-now -w '%{http_code
 printf 'health=%s DRY_RUN=%s ARB=%s SUBMIT=%s analysis_http=%s portfolio_http=%s\n' \
   "$health" "$DRY_RUN" "${ENABLE_CEX_DEX_ARB:-0}" "${ARB_SUBMIT_ORDERS:-0}" \
   "$analysis_http" "$portfolio_http"
+
+[[ "$health" == "healthy" ]] || cycle_status=1
+[[ "$analysis_http" == "200" ]] || cycle_status=1
+[[ "$portfolio_http" == "200" ]] || cycle_status=1
 
 if [[ "$analysis_http" != "200" ]]; then
   echo "⚠️  dry-run-analysis endpoint not healthy, skipping metric analysis"
@@ -93,9 +99,13 @@ fi
 # ── 7. Resource + error log checks (unchanged from your original) ────
 docker stats --no-stream --format '{{.MemUsage}}' crypto-earn-engine-1
 
-docker compose logs --tail=200 engine 2>&1 |
+error_lines=$(docker compose logs --tail=200 engine 2>&1 |
   grep -E '"level":"ERROR"|panic|segfault|oom|out of memory|fatal|corrupt' |
-  tail -10 || true
+  tail -10 || true)
+if [[ -n "$error_lines" ]]; then
+  printf '%s\n' "$error_lines"
+  cycle_status=1
+fi
 
 # ── 8. Monitoring-loop / watchdog check ───────────────────────────────
 # Status only: the separately-owned loop must never be started, restarted, or
@@ -107,3 +117,5 @@ if [[ -n "${MONITORING_LOOP_SYSTEMD_UNIT:-}" ]]; then
 else
   echo "monitoring_loop_status=unknown (MONITORING_LOOP_SYSTEMD_UNIT not configured)"
 fi
+
+exit "$cycle_status"
