@@ -24,6 +24,8 @@ pub const MAX_LEVELS: usize = 20;
 pub const MAX_SYMBOLS: usize = 64;
 pub const MAX_SYMBOL_LEN: usize = 24;
 const STABLE_CONNECTION_NS: i128 = 60 * std.time.ns_per_s;
+const READ_TIMEOUT_MS: u32 = 5_000;
+const APP_PING_INTERVAL_NS: i128 = 30 * std.time.ns_per_s;
 
 pub const Level = struct {
     price: f64 = 0.0,
@@ -273,22 +275,44 @@ pub const Orderbook = struct {
     }
 
     fn runConnection(self: *Orderbook) !void {
-        var client = try ws_lib.Client.init(self.allocator, .{
+        const session_start_ns = std.time.nanoTimestamp();
+        var message_count: u64 = 0;
+        var disconnect_kind: []const u8 = "local-stop";
+        defer {
+            const duration_ms = @divTrunc(std.time.nanoTimestamp() - session_start_ns, std.time.ns_per_ms);
+            log.info("hl_ob", "session ended duration_ms={d} messages={d} disconnect={s}", .{
+                duration_ms, message_count, disconnect_kind,
+            });
+        }
+
+        var client = ws_lib.Client.init(self.allocator, .{
             .host = self.host,
             .port = 443,
             .tls = true,
             .max_size = 8 * 1024 * 1024,
-        });
-        defer client.deinit();
+        }) catch |e| {
+            disconnect_kind = "transport-init";
+            log.err("hl_ob", "websocket stage=init error={s}", .{@errorName(e)});
+            return e;
+        };
+        defer {
+            log.debug("hl_ob", "websocket stage=deinit begin", .{});
+            client.deinit();
+            log.debug("hl_ob", "websocket stage=deinit complete", .{});
+        }
 
         // The websocket library expects "Host:" in headers; format on stack.
         var host_buf: [128]u8 = undefined;
         const host_hdr = std.fmt.bufPrint(&host_buf, "Host: {s}\r\n", .{self.host}) catch unreachable;
 
-        try client.handshake(HL_WS_PATH, .{
+        client.handshake(HL_WS_PATH, .{
             .timeout_ms = 10_000,
             .headers = host_hdr,
-        });
+        }) catch |e| {
+            disconnect_kind = "handshake";
+            log.err("hl_ob", "websocket stage=handshake error={s}", .{@errorName(e)});
+            return e;
+        };
 
         // Subscribe to each configured symbol.
         var i: u8 = 0;
@@ -304,49 +328,84 @@ pub const Orderbook = struct {
             var send_buf: [256]u8 = undefined;
             @memcpy(send_buf[0..sub_msg.len], sub_msg);
             client.write(send_buf[0..sub_msg.len]) catch |e| {
-                log.err("hl_ob", "subscribe write failed for {s}: {s}", .{ sym, @errorName(e) });
+                disconnect_kind = "subscription-write";
+                log.err("hl_ob", "websocket stage=subscription_write symbol={s} error={s}", .{ sym, @errorName(e) });
                 return e;
             };
         }
         log.info("hl_ob", "subscribed to {d} HL l2Book channels", .{self.n_entries});
 
-        client.readTimeout(5_000) catch |e| {
-            log.warn("hl_ob", "read timeout setup failed after subscribe: {s}", .{@errorName(e)});
+        client.readTimeout(READ_TIMEOUT_MS) catch |e| {
+            disconnect_kind = "timeout-setup";
+            log.warn("hl_ob", "websocket stage=timeout_setup timeout_ms={d} error={s}", .{ READ_TIMEOUT_MS, @errorName(e) });
             return e;
         };
         const app_ping = "{\"method\":\"ping\"}";
         var ping_buf: [32]u8 = undefined;
         @memcpy(ping_buf[0..app_ping.len], app_ping);
-        try client.write(ping_buf[0..app_ping.len]);
+        client.write(ping_buf[0..app_ping.len]) catch |e| {
+            disconnect_kind = "initial-ping-write";
+            log.err("hl_ob", "websocket stage=initial_ping_write error={s}", .{@errorName(e)});
+            return e;
+        };
         var last_app_ping_ns: i128 = std.time.nanoTimestamp();
         while (!self.should_stop.load(.seq_cst)) {
             const now_ns: i128 = std.time.nanoTimestamp();
-            if (now_ns - last_app_ping_ns >= 30 * std.time.ns_per_s) {
+            if (now_ns - last_app_ping_ns >= APP_PING_INTERVAL_NS) {
                 @memcpy(ping_buf[0..app_ping.len], app_ping);
-                try client.write(ping_buf[0..app_ping.len]);
+                client.write(ping_buf[0..app_ping.len]) catch |e| {
+                    disconnect_kind = "ping-write";
+                    log.err("hl_ob", "websocket stage=ping_write error={s}", .{@errorName(e)});
+                    return e;
+                };
                 last_app_ping_ns = now_ns;
             }
 
             const message = client.read() catch |err| switch (err) {
-                // Zig 0.15 TLS surfaces socket read timeouts as ReadFailed
-                // here. An idle HL book is not a broken connection.
-                error.ReadFailed => continue,
                 error.Closed => {
-                    log.warn("hl_ob", "peer closed WebSocket connection", .{});
+                    disconnect_kind = "transport-close";
+                    log.warn("hl_ob", "websocket stage=read clean=false error=Closed detail=peer_eof", .{});
                     return error.ConnectionClosed;
                 },
-                else => return err,
+                else => {
+                    disconnect_kind = "read-error";
+                    if (client.readFailureDetail()) |detail| {
+                        log.err("hl_ob", "websocket stage=read clean=false error={s} detail={s}", .{
+                            @errorName(err), @errorName(detail),
+                        });
+                    } else {
+                        log.err("hl_ob", "websocket stage=read clean=false error={s} detail=unavailable", .{@errorName(err)});
+                    }
+                    return err;
+                },
             } orelse continue;
 
             defer client.done(message);
+            message_count += 1;
 
             switch (message.type) {
                 .text, .binary => self.handleMessage(message.data),
                 .close => {
-                    log.warn("hl_ob", "server close frame received (bytes={d})", .{message.data.len});
+                    disconnect_kind = "server-close-frame";
+                    const close = parseClosePayload(message.data);
+                    var reason_buf: [123]u8 = undefined;
+                    const reason = sanitizeCloseReason(close.reason, &reason_buf);
+                    var payload_hex_buf: [250]u8 = undefined;
+                    const payload_hex = encodeHex(message.data[0..@min(message.data.len, 125)], &payload_hex_buf);
+                    log.warn("hl_ob", "websocket stage=frame_parse clean=true type=close valid={any} code={?d} reason=\"{s}\" payload_len={d} payload_hex={s}", .{
+                        close.valid,
+                        close.code,
+                        reason,
+                        message.data.len,
+                        payload_hex,
+                    });
                     return error.ServerClose;
                 },
-                .ping => try client.writePong(message.data),
+                .ping => client.writePong(message.data) catch |e| {
+                    disconnect_kind = "pong-write";
+                    log.err("hl_ob", "websocket stage=pong_write error={s}", .{@errorName(e)});
+                    return e;
+                },
                 .pong => {},
             }
         }
@@ -497,6 +556,42 @@ fn connectionWasStable(session_ns: i128) bool {
     return session_ns >= STABLE_CONNECTION_NS;
 }
 
+const ClosePayload = struct {
+    code: ?u16,
+    reason: []const u8,
+    valid: bool,
+};
+
+fn parseClosePayload(payload: []const u8) ClosePayload {
+    if (payload.len == 0) return .{ .code = null, .reason = "", .valid = true };
+    if (payload.len == 1) return .{ .code = null, .reason = payload, .valid = false };
+    const code = std.mem.readInt(u16, payload[0..2], .big);
+    const reason = payload[2..];
+    return .{
+        .code = code,
+        .reason = reason,
+        .valid = std.unicode.utf8ValidateSlice(reason),
+    };
+}
+
+fn sanitizeCloseReason(reason: []const u8, out: []u8) []const u8 {
+    const n = @min(reason.len, out.len);
+    for (reason[0..n], 0..) |byte, i| {
+        out[i] = if (byte >= 0x20 and byte <= 0x7e) byte else '.';
+    }
+    return out[0..n];
+}
+
+fn encodeHex(bytes: []const u8, out: []u8) []const u8 {
+    const alphabet = "0123456789abcdef";
+    const n = @min(bytes.len, @divTrunc(out.len, 2));
+    for (bytes[0..n], 0..) |byte, i| {
+        out[i * 2] = alphabet[byte >> 4];
+        out[i * 2 + 1] = alphabet[byte & 0x0f];
+    }
+    return out[0 .. n * 2];
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -613,4 +708,19 @@ test "hl_orderbook: parseLevels handles string and number prices" {
 test "hl_orderbook: short sessions preserve reconnect backoff" {
     try testing.expect(!connectionWasStable(59 * std.time.ns_per_s));
     try testing.expect(connectionWasStable(60 * std.time.ns_per_s));
+}
+
+test "hl_orderbook: parses close frame code and bounded reason" {
+    const payload = [_]u8{ 0x03, 0xe8, 'g', 'o', 'i', 'n', 'g', ' ', 'a', 'w', 'a', 'y' };
+    const close = parseClosePayload(&payload);
+    try testing.expect(close.valid);
+    try testing.expectEqual(@as(?u16, 1000), close.code);
+    try testing.expectEqualStrings("going away", close.reason);
+
+    const empty = parseClosePayload("");
+    try testing.expect(empty.valid);
+    try testing.expectEqual(@as(?u16, null), empty.code);
+
+    const malformed = parseClosePayload(&.{0x03});
+    try testing.expect(!malformed.valid);
 }

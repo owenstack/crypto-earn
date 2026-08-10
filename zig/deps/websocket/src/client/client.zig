@@ -38,6 +38,9 @@ pub const Client = struct {
     stream: Stream,
     _reader: Reader,
     _closed: bool,
+    _deinitialized: bool,
+    // Preserve the underlying read failure before close() tears down TLS.
+    _read_failure_detail: ?anyerror = null,
     _compression_opts: ?CompressionOpts,
     _compression: ?Client.Compression = null,
 
@@ -87,9 +90,13 @@ pub const Client = struct {
 
         var tls_client: ?*TLSClient = null;
         if (config.tls) {
-            tls_client = try TLSClient.init(allocator, net_stream, &config);
+            tls_client = TLSClient.init(allocator, net_stream, &config) catch |err| {
+                net_stream.close();
+                return err;
+            };
         }
-        const stream = Stream.init(net_stream, tls_client);
+        var stream = Stream.init(net_stream, tls_client);
+        errdefer stream.close();
 
         var own_bp = false;
         var buffer_provider: *buffer.Provider = undefined;
@@ -121,6 +128,7 @@ pub const Client = struct {
         return .{
             .stream = stream,
             ._closed = false,
+            ._deinitialized = false,
             ._own_bp = own_bp,
             ._mask_fn = config.mask_fn,
             ._compression_opts = null, //TODO: ZIG 0.15
@@ -129,6 +137,7 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
+        if (@atomicRmw(bool, &self._deinitialized, .Xchg, true, .monotonic)) return;
         self.closeStream();
 
         const larger_buffer_provider = self._reader.large_buffer_provider;
@@ -239,6 +248,7 @@ pub const Client = struct {
     }
 
     pub fn read(self: *Client) !?proto.Message {
+        self._read_failure_detail = null;
         if (@atomicLoad(bool, &self._closed, .monotonic)) {
             return error.Closed;
         }
@@ -257,12 +267,14 @@ pub const Client = struct {
                 // Protocol errors commonly coincide with a peer reset. Best-
                 // effort close is sufficient; the original parse error is
                 // returned to the caller so the feed can reconnect.
+                self._read_failure_detail = self.stream.readFailureDetail();
                 self.close(.{ .code = 1002 }) catch {};
                 return err;
             } orelse {
                 reader.fill(stream) catch |err| switch (err) {
                     error.WouldBlock => return null,
                     error.Closed, error.ConnectionResetByPeer, error.BrokenPipe, error.NotOpenForReading => {
+                        self._read_failure_detail = self.stream.readFailureDetail();
                         @atomicStore(bool, &self._closed, true, .monotonic);
                         return error.Closed;
                     },
@@ -270,6 +282,7 @@ pub const Client = struct {
                         // TLS/socket read failures can happen after the peer
                         // has already closed the connection. Never assume a
                         // close frame can be sent successfully here.
+                        self._read_failure_detail = self.stream.readFailureDetail();
                         self.close(.{ .code = 1002 }) catch {};
                         return err;
                     },
@@ -300,6 +313,12 @@ pub const Client = struct {
 
     pub fn readTimeout(self: *const Client, ms: u32) !void {
         return self.stream.readTimeout(ms);
+    }
+
+    /// Detailed cause behind Zig 0.15's generic `error.ReadFailed`, when one
+    /// is available from the TLS or socket reader.
+    pub fn readFailureDetail(self: *const Client) ?anyerror {
+        return self._read_failure_detail orelse self.stream.readFailureDetail();
     }
 
     pub fn write(self: *Client, data: []u8) !void {
@@ -458,7 +477,17 @@ pub const Stream = struct {
         if (self.tls_client) |tls_client| {
             const reader = &tls_client.client.reader;
             while (reader.bufferedLen() == 0) {
-                try reader.fillMore();
+                tls_client.clearSocketReadError();
+                reader.fillMore() catch |err| switch (err) {
+                    error.EndOfStream => return 0,
+                    error.ReadFailed => {
+                        // std.crypto.tls intentionally erases the underlying
+                        // socket error. Recover it so SO_RCVTIMEO remains a
+                        // non-fatal WouldBlock rather than closing the client.
+                        if (tls_client.socketReadError()) |socket_err| return socket_err;
+                        return error.ReadFailed;
+                    },
+                };
             }
             const available = reader.buffered();
             const n = @min(buf.len, available.len);
@@ -467,6 +496,12 @@ pub const Stream = struct {
             return n;
         }
         return self.stream.read(buf);
+    }
+
+    pub fn readFailureDetail(self: *const Stream) ?anyerror {
+        const tls_client = self.tls_client orelse return null;
+        if (tls_client.socketReadError()) |err| return err;
+        return tls_client.client.read_err;
     }
 
     pub fn writeAll(self: *Stream, data: []const u8) !void {
@@ -513,6 +548,19 @@ const TLSClient = struct {
     stream_writer: net.Stream.Writer,
     stream_reader: net.Stream.Reader,
     arena: std.heap.ArenaAllocator,
+
+    fn socketReadError(self: *const TLSClient) ?net.Stream.Reader.Error {
+        return self.stream_reader.getError();
+    }
+
+    fn clearSocketReadError(self: *TLSClient) void {
+        const builtin = @import("builtin");
+        if (builtin.os.tag == .windows) {
+            self.stream_reader.error_state = null;
+        } else {
+            self.stream_reader.file_reader.err = null;
+        }
+    }
 
     fn init(allocator: Allocator, stream: net.Stream, config: *const Client.Config) !*TLSClient {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -1006,12 +1054,55 @@ fn testClient(stream: net.Stream) Client {
 
     return .{
         ._closed = false,
+        ._deinitialized = false,
         ._own_bp = true,
         ._mask_fn = generateMask,
         ._compression_opts = null,
         .stream = .{ .stream = stream },
         ._reader = Reader.init(reader_buf, bp, null),
     };
+}
+
+test "Client: peer TCP close is reported without panic" {
+    var pair = t.SocketPair.init(.{});
+    defer pair.writer.deinit();
+    var client = testClient(pair.server);
+    pair.client.close();
+
+    try t.expectError(error.Closed, client.read());
+    client.deinit();
+}
+
+test "Client: read timeout is non-fatal" {
+    var pair = t.SocketPair.init(.{});
+    defer pair.deinit();
+    var client = testClient(pair.server);
+    defer client.deinit();
+
+    try client.readTimeout(10);
+    try t.expectEqual(null, try client.read());
+    try t.expectEqual(false, @atomicLoad(bool, &client._closed, .monotonic));
+}
+
+test "Client: read failure detail survives stream close" {
+    var pair = t.SocketPair.init(.{});
+    defer pair.deinit();
+    var client = testClient(pair.server);
+    defer client.deinit();
+
+    client._read_failure_detail = error.ConnectionResetByPeer;
+    try t.expect(client.readFailureDetail() != null);
+}
+
+test "Client: close and deinit are idempotent" {
+    var pair = t.SocketPair.init(.{});
+    defer pair.deinit();
+    var client = testClient(pair.server);
+
+    try client.close(.{});
+    try client.close(.{});
+    client.deinit();
+    client.deinit();
 }
 
 const ClientHandler = struct {
