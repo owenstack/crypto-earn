@@ -30,11 +30,13 @@ sudo systemctl daemon-reload
 echo "==> Enabling services"
 sudo systemctl enable cex-engine.service
 sudo systemctl enable cex-control.service
+sudo systemctl enable cex-dry-run-monitor.service
 
 if [[ "$RESTART" == true ]]; then
   echo "==> Restarting services"
   sudo systemctl restart cex-engine.service
   sudo systemctl restart cex-control.service
+  sudo systemctl restart cex-dry-run-monitor.service
 fi
 
 echo "==> Service install complete."

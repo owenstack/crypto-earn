@@ -1,0 +1,24 @@
+[Unit]
+Description=CEX Dry-Run Monitor
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/cex-zig
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=CEX_MONITOR_INTERVAL_SECONDS=600
+ExecStart=/opt/cex-zig/scripts/monitor-dry-run.sh
+Restart=on-failure
+RestartSec=15
+# Exit 75 means the monitor intentionally halted the stack after an incident;
+# keep it stopped for human review. Unexpected monitor failures still restart.
+SuccessExitStatus=75
+RestartPreventExitStatus=75
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

@@ -23,6 +23,7 @@ pub const HL_WS_PATH = "/ws";
 pub const MAX_LEVELS: usize = 20;
 pub const MAX_SYMBOLS: usize = 64;
 pub const MAX_SYMBOL_LEN: usize = 24;
+const STABLE_CONNECTION_NS: i128 = 60 * std.time.ns_per_s;
 
 pub const Level = struct {
     price: f64 = 0.0,
@@ -245,6 +246,7 @@ pub const Orderbook = struct {
     /// to all configured symbols on every successful connect.
     pub fn run(self: *Orderbook) void {
         while (!self.should_stop.load(.seq_cst)) {
+            const session_start_ns = std.time.nanoTimestamp();
             log.info("hl_ob", "connecting wss://{s}{s} (n_symbols={d})", .{
                 self.host, HL_WS_PATH, self.n_entries,
             });
@@ -255,6 +257,14 @@ pub const Orderbook = struct {
 
             if (self.should_stop.load(.seq_cst)) break;
             _ = self.reconnect_count.fetchAdd(1, .seq_cst);
+
+            // A successful handshake is not necessarily a stable session.
+            // Preserve backoff for short-lived connections so a peer that
+            // closes every few seconds cannot force a permanent 1s loop.
+            const session_ns = std.time.nanoTimestamp() - session_start_ns;
+            if (connectionWasStable(session_ns)) {
+                self.reconnect_delay_ms = 1_000;
+            }
 
             log.warn("hl_ob", "reconnecting in {d}ms", .{self.reconnect_delay_ms});
             std.Thread.sleep(self.reconnect_delay_ms * std.time.ns_per_ms);
@@ -298,11 +308,12 @@ pub const Orderbook = struct {
                 return e;
             };
         }
-        // Reset backoff on successful connect+subscribe.
-        self.reconnect_delay_ms = 1_000;
         log.info("hl_ob", "subscribed to {d} HL l2Book channels", .{self.n_entries});
 
-        try client.readTimeout(5_000);
+        client.readTimeout(5_000) catch |e| {
+            log.warn("hl_ob", "read timeout setup failed after subscribe: {s}", .{@errorName(e)});
+            return e;
+        };
         const app_ping = "{\"method\":\"ping\"}";
         var ping_buf: [32]u8 = undefined;
         @memcpy(ping_buf[0..app_ping.len], app_ping);
@@ -320,7 +331,10 @@ pub const Orderbook = struct {
                 // Zig 0.15 TLS surfaces socket read timeouts as ReadFailed
                 // here. An idle HL book is not a broken connection.
                 error.ReadFailed => continue,
-                error.Closed => return,
+                error.Closed => {
+                    log.warn("hl_ob", "peer closed WebSocket connection", .{});
+                    return error.ConnectionClosed;
+                },
                 else => return err,
             } orelse continue;
 
@@ -330,7 +344,7 @@ pub const Orderbook = struct {
                 .text, .binary => self.handleMessage(message.data),
                 .close => {
                     log.warn("hl_ob", "server close frame received (bytes={d})", .{message.data.len});
-                    return;
+                    return error.ServerClose;
                 },
                 .ping => try client.writePong(message.data),
                 .pong => {},
@@ -479,6 +493,10 @@ fn sortAsks(slice: []Level) void {
     }.lt);
 }
 
+fn connectionWasStable(session_ns: i128) bool {
+    return session_ns >= STABLE_CONNECTION_NS;
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -590,4 +608,9 @@ test "hl_orderbook: parseLevels handles string and number prices" {
     try testing.expectEqual(@as(usize, 2), n);
     try testing.expectApproxEqAbs(@as(f64, 100.5), out[0].price, 1e-9);
     try testing.expectApproxEqAbs(@as(f64, 99.25), out[1].price, 1e-9);
+}
+
+test "hl_orderbook: short sessions preserve reconnect backoff" {
+    try testing.expect(!connectionWasStable(59 * std.time.ns_per_s));
+    try testing.expect(connectionWasStable(60 * std.time.ns_per_s));
 }
