@@ -434,25 +434,29 @@ pub const DB = struct {
                 log.err("db", "migration 006 table recreation failed: zig_err={s} sqlite_err={s}", .{ @errorName(err), sqlite_err });
                 return err;
             };
-            // Add gamma_id column and condition_id index to orderbooks (table may not exist yet)
-            const ob_alters = [_][:0]const u8{
-                "CREATE INDEX IF NOT EXISTS idx_orderbooks_market ON orderbooks(market);",
-                "ALTER TABLE orderbooks ADD COLUMN gamma_id TEXT DEFAULT NULL;",
-                "CREATE INDEX IF NOT EXISTS idx_orderbooks_gamma_id ON orderbooks(gamma_id);",
-            };
-
-            for (ob_alters) |sql| {
-                self.execZ(sql) catch |err| {
-                    const sqlite_err = std.mem.span(c.sqlite3_errmsg(self.handle));
-                    const duplicate_col = std.mem.indexOf(u8, sqlite_err, "duplicate column name") != null;
-                    const no_table = std.mem.indexOf(u8, sqlite_err, "no such table") != null;
-                    if (err == error.DBExecFailed and (duplicate_col or no_table)) {
-                        log.info("db", "migration 006: skipping orderbooks alter (table missing or column exists): {s}", .{sql});
-                    } else {
-                        log.err("db", "migration 006 orderbooks alter failed: zig_err={s} sqlite_err={s}", .{ @errorName(err), sqlite_err });
-                        return err;
-                    }
+            // Legacy databases may already have orderbooks. Fresh databases
+            // create it in migration 012, so do not execute these statements
+            // until the table exists; otherwise SQLite logs handled
+            // "no such table" errors that the health monitor treats as fatal.
+            if (self.tableExists("orderbooks")) {
+                const ob_alters = [_][:0]const u8{
+                    "CREATE INDEX IF NOT EXISTS idx_orderbooks_market ON orderbooks(market);",
+                    "ALTER TABLE orderbooks ADD COLUMN gamma_id TEXT DEFAULT NULL;",
+                    "CREATE INDEX IF NOT EXISTS idx_orderbooks_gamma_id ON orderbooks(gamma_id);",
                 };
+
+                for (ob_alters) |sql| {
+                    self.execZ(sql) catch |err| {
+                        const sqlite_err = std.mem.span(c.sqlite3_errmsg(self.handle));
+                        const duplicate_col = std.mem.indexOf(u8, sqlite_err, "duplicate column name") != null;
+                        if (err == error.DBExecFailed and duplicate_col) {
+                            log.info("db", "migration 006: skipping orderbooks alter (column exists): {s}", .{sql});
+                        } else {
+                            log.err("db", "migration 006 orderbooks alter failed: zig_err={s} sqlite_err={s}", .{ @errorName(err), sqlite_err });
+                            return err;
+                        }
+                    };
+                }
             }
             try self.execZ("INSERT OR IGNORE INTO schema_migrations(version)VALUES(6);");
         }
@@ -658,6 +662,15 @@ pub const DB = struct {
         }
         _ = c.sqlite3_finalize(stmt);
         return step_rc == c.SQLITE_ROW;
+    }
+
+    fn tableExists(self: DB, table: []const u8) bool {
+        const sql = "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1;" ++ &[_:0]u8{};
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, -1, &stmt, null) != c.SQLITE_OK) return false;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_text(stmt, 1, table.ptr, @intCast(table.len), null) != c.SQLITE_OK) return false;
+        return c.sqlite3_step(stmt) == c.SQLITE_ROW;
     }
 
     pub fn insertOrder(self: DB, id: []const u8, market_id: []const u8, client_order_id: []const u8, order_type: []const u8, side: []const u8, size: []const u8, price: []const u8, strategy_origin: ?[]const u8) !void {

@@ -2348,6 +2348,16 @@ test "db: migration 017 removes fixed LP cap and retains percentage sizing" {
     try testing.expectEqual(db.c.SQLITE_ROW, db.c.sqlite3_step(stmt));
 }
 
+test "db: fresh migrations create orderbooks without migration 006 errors" {
+    var database = try db.DB.open(":memory:");
+    defer database.close();
+    try database.runMigrations();
+
+    try testing.expect(migration013TableExists(&database, "orderbooks"));
+    try testing.expect(migration013HasColumn(&database, "orderbooks", "gamma_id"));
+    try testing.expect(migration013HasColumn(&database, "orderbooks", "asset_index"));
+}
+
 // ─── Phase 3: HL market data + Binance feed integration tests ───────────────
 
 test "phase3 db: migration 012 creates binance_prices and asset_index columns" {
